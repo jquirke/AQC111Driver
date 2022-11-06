@@ -1,0 +1,21 @@
+//
+//  AQC111.iig
+//  AQC111
+//
+//  Created by Jeremy Quirke on 11/6/22.
+//
+
+#ifndef AQC111_h
+#define AQC111_h
+
+#include <Availability.h>
+#include <DriverKit/IOService.iig>
+
+class AQC111: public IOService
+{
+public:
+    virtual kern_return_t
+    Start(IOService * provider) override;
+};
+
+#endif /* AQC111_h */
