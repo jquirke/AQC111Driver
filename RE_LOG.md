@@ -23,6 +23,78 @@ Tools: [Ghidra](https://ghidra-sre.org) (disassembly/decompilation), [Radare2](h
 
 ## Driver Methods
 
+### AqUsbHal::findEnpoints() (NB: typo in binary symbol — missing 'd')
+
+Discovers and opens the three required USB pipes from Config 1.
+
+```c
+// Uses two StandardUSB static helpers (external symbols in binary):
+//   StandardUSB::getEndpointAddress(EndpointDescriptor const*) → uint8_t
+//   StandardUSB::getNextEndpointDescriptor(ConfigurationDescriptor const*,
+//                                          InterfaceDescriptor const*,
+//                                          Descriptor const*) → Descriptor const*
+//
+// IOUSBHostInterface vtable entries used:
+//   vtable[0x9c0] — getInterfaceDescriptor() → InterfaceDescriptor const*
+//   vtable[0x9b8] — getConfigurationDescriptor() → ConfigurationDescriptor const*
+//   vtable[0xa80] — copyPipe(uint8_t endpointAddress) → IOUSBHostPipe*
+
+InterfaceDescriptor*    ifDesc  = hal[0x08]->vtable[0x9c0]();  // getInterfaceDescriptor
+if (ifDesc == null) return 0;   // fail
+
+ConfigurationDescriptor* cfgDesc = hal[0x08]->vtable[0x9b8](); // getConfigurationDescriptor
+
+// Iterate all endpoint descriptors in this interface
+Descriptor* epDesc = getNextEndpointDescriptor(cfgDesc, ifDesc, NULL);
+while (epDesc != NULL) {
+    uint8_t addr = getEndpointAddress(epDesc);       // bEndpointAddress
+    bool    in   = (epDesc->bEndpointAddress & 0x80) != 0;  // bit 7 = direction
+    uint8_t type = epDesc->bmAttributes & 0x03;      // bits [1:0] = transfer type
+
+    if (!in && type == 2) {
+        hal[0x28] = hal[0x08]->vtable[0xa80](addr);  // bulk OUT → TX pipe
+    } else if (in && type == 2) {
+        hal[0x20] = hal[0x08]->vtable[0xa80](addr);  // bulk IN  → RX pipe
+    } else if (in && type == 3) {
+        hal[0x30] = hal[0x08]->vtable[0xa80](addr);  // interrupt IN → status pipe
+    }
+
+    epDesc = getNextEndpointDescriptor(cfgDesc, ifDesc, epDesc);
+}
+
+if (hal[0x20] == null) return 0;                     // RX pipe mandatory
+return (hal[0x28] != null) && (hal[0x30] != null);   // need TX + interrupt too
+```
+
+Maps directly to device's Config 1 endpoints:
+- EP1 IN Interrupt 16B → hal[0x30] (status pipe)
+- EP2 IN Bulk 1024B   → hal[0x20] (RX pipe)
+- EP3 OUT Bulk 1024B  → hal[0x28] (TX pipe)
+
+### UsbHal::start(IOService* provider)
+
+```
+1. safeMetaCast(provider, IOUSBHostInterface) → store in hal[0x08]
+2. hal[0x08]->IOService::open(hal[0x00], 0, 0)
+   // interface->open(forClient=driver, options=0, arg=0)
+   // forClient=hal[0x00] (IOEthernetController* back-pointer, since forClient must be IOService*)
+3. hal[0x08]->IOUSBHostInterface::getDevice() — vtable[0xb80]; result (IOUSBHostDevice*) stored in hal[0x10]; null = fail
+   (Ghidra misidentified as getCapabilityDescriptors — confirmed via IOUSBHostFamily vtable lookup)
+4. hal[0x10]->IOUSBHostDevice::getConfigurationDescriptor() — vtable[0xa50]
+   check: if configDesc->bConfigurationValue != 1 → alternate path:
+       hal[0x10]->IOUSBHostDevice::setConfiguration(1, true) — vtable[0xb18], force config 1
+       hal[0x4b] = 1   // reconfigured flag
+5. (config 1 confirmed) hal[0x10]->IOUSBHostDevice::getDeviceDescriptor() — vtable[0xa38]; return value discarded (confirmed)
+6. AqUsbHal::findEnpoints(hal)  // see above; populates hal[0x20], hal[0x28], hal[0x30]
+   if findEndpoints fails → hal_start_fail
+7. read firmware version (3 bytes) → hal[0x40..0x42]; R15B = hal[0x40] (major)
+8. new(0x14); if (firmware_major >= 0x80) → FWPhyAccess::FWPhyAccess(obj, hal)
+              else                        → DirectPhyAccess::DirectPhyAccess(obj, hal)
+   hal[0x38] = obj
+9. hal[0x38]->vtable[0x10](1)  // 3rd virtual — likely init/start; both subclasses converge here
+   return success
+```
+
 ### getMinPacketSize() / getMaxPacketSize()
 
 Standard `IOEthernetController` overrides.
@@ -45,29 +117,72 @@ Called on driver load/device attach.
    (error) if 5, 6, or 7 fail → `IONetworkController::stop(provider)`, return error
 ```
 
-### enable(IONetworkInterface*)
-
-Standard `IOEthernetController` override — called when interface is brought up.
+### AqUsbHal::enable()
 
 ```
-1. UsbHal::enable():
-   if (hal[0x57] != 0):
-       call hal[0x28]()   // WoL enable handler
-   else:
-       read 6-byte permanent MAC (bRequest=0x20) → store in hal[0x45]
-       write MAC to register 0x0010 (setMacAddress)
-       write 0xff to register 0x0041 (1 byte) — suspected packet filter / RX enable
-       write 0x00 to register 0x00b1 (1 byte)
-       RMW register 0x0024: val &= 0xe0 (unconditional, clears bits [4:0])
-       RMW register 0x000b: if (val & 0x80) val &= 0x7f
-       RMW register 0x0022: if (val & 0x0100) val &= 0xfeff (disable link/TX if enabled)
-       RMW register 0x00b0: if (val & 0x01) val &= 0xfe
-       if (hal[0x38] != null) → call (*hal[0x38])[0x20]()  // delegate callback
-   hal[0x44] = 1   // enabled flag, set in both paths
-2. IONetworkInterface::startOutputThread(interface)  // start TX output thread
-3. <TODO: intermediate steps>
-4. Rx::enable()
-5. Itr::enable()
+if (hal[0x57] != 0):
+    call hal[0x38]->vtable[0x28](0)   // WoL resume: call 3rd virtual on PhyAccess obj with arg=0
+else:
+    call AqUsbHal::hwStart()          // normal bring-up sequence (see hwStart below)
+hal[0x44] = 1   // enabled flag, set in both paths; return 1
+```
+
+### AqUsbHal::hwStart()
+
+Contains the full hardware init sequence (to be documented):
+- reads permanent MAC (bRequest=0x20) → stores in hal[0x45]
+- writes MAC to register 0x0010
+- write 0xff to register 0x0041
+- write 0x00 to register 0x00b1
+- RMW register 0x0024: val &= 0xe0
+- RMW register 0x000b: if (val & 0x80) val &= 0x7f
+- RMW register 0x0022: if (val & 0x0100) val &= 0xfeff
+- RMW register 0x00b0: if (val & 0x01) val &= 0xfe
+- if (hal[0x38] != null) → call hal[0x38]->vtable[0x20]()  // PhyAccess callback
+
+### AqUsbHal::performUrb(To, void* context, IOMemoryDescriptor*, unsigned int size)
+
+Submits an async USB I/O request on the appropriate pipe.
+
+```c
+enum To { TX = 0, RX = 1, ITR = 2 };
+
+if (hal[0x44] == 0) return kIOReturnNotOpen;   // not enabled
+
+switch (direction) {
+    case TX:   pipe = hal[0x28]; callback = AqUsbHal::onTransmitComplete; break;
+    case RX:   pipe = hal[0x20]; callback = AqUsbHal::onReceiveComplete;  break;
+    case ITR:  pipe = hal[0x30]; callback = AqUsbHal::onItrComplete;      break;
+    default:   pipe = null; callback = null; break;
+}
+
+// Build IOUSBHostCompletion on stack: { owner=hal, action=callback, parameter=context }
+// Submit:
+pipe->vtable[0x258](pipe, memdesc, size, &completion, 0);
+// vtable[0x258] = IOUSBHostPipe::io(IOMemoryDescriptor*, uint32_t length,
+//                                   IOUSBHostCompletion*, uint32_t timeout)
+```
+
+Callers:
+- `Rx::refill()` — `performUrb(RX, entry, memdesc, 0x10000)`
+- `Itr::start()` — `performUrb(ITR, entry, memdesc, 8)`
+- `Tx::transmit(__mbuf*)` — `performUrb(TX, entry, memdesc, len)`
+
+### AqPacificDriver::enable(IONetworkInterface*)
+
+Standard `IOEthernetController` override — called when interface is brought up (ifconfig up).
+
+```
+1. AqUsbHal::enable()                                    // HAL enable (WoL or hwStart path)
+2. IONetworkInterface::startOutputThread(interface, 0)   // start TX software output thread
+3. IONetworkController::getOutputQueue() → queue         // vtable[0x918]; if non-null:
+       getOutputQueue() → queue                          //   fetch again (canonical ref)
+       IOOutputQueue::start()                            //   vtable[0x130]; start the HW output queue
+4. Rx::start()                                           // driver[0x158]->Rx::start(), if non-null
+5. IONetworkController::getSelectedMedium() → medium     // vtable[0x880]; if non-null:
+       IONetworkController::setSelectedMedium(medium)    //   vtable[0x978]; re-apply medium selection
+6. Itr::start()                                          // driver[0x160]->Itr::start()
+7. return kIOReturnSuccess
 ```
 
 ### hwStop
@@ -294,6 +409,22 @@ Size: 0x28 bytes
 
 | Offset | Field |
 |--------|-------|
+| 0x08   | `AqUsbHal*` — back-pointer to HAL |
+| 0x18   | `void*` — context/entry passed as `context` arg to `performUrb()` |
+| 0x20   | `IOMemoryDescriptor*` — interrupt receive buffer |
+
+### Itr::start()
+
+Posts a single pre-posted interrupt IN URB. One outstanding URB at a time (no ring).
+
+```c
+AqUsbHal::performUrb(itr[0x08], To=ITR, itr[0x18], itr[0x20], /*size=*/8);
+return 1;
+```
+
+Completion: `AqUsbHal::onItrComplete(void*, void*, int, unsigned int)` — re-posts URB and dispatches link status change.
+
+
 
 ## Rx Class
 
@@ -301,6 +432,81 @@ Size: 0x30 bytes
 
 | Offset | Field |
 |--------|-------|
+| 0x10   | `RxRing*` — pointer to ring buffer descriptor (see layout below) |
+| 0x18   | `AqUsbHal*` — back-pointer to HAL, used to call `performUrb()` |
+| 0x20   | `AqPacificDriver*` — back-pointer to driver, used in `clean()` for `onInputPacket()` |
+
+### RxRing layout
+
+Ring of 10 slots, each **0xb5 bytes**. Preceded by two DWORDs:
+
+| Offset | Field |
+|--------|-------|
+| `ring[0x00]` | DWORD: head index — next slot to consume in `clean()` |
+| `ring[0x04]` | DWORD: fill index — next slot to post in `refill()` |
+| `ring[8 + n*0xb5 + 0x00]` | mbuf chain pointer |
+| `ring[8 + n*0xb5 + 0x08]` | `IOMemoryDescriptor*` |
+| `ring[8 + n*0xb5 + 0xb0]` | DWORD: state (zeroed on init and after processing) |
+| `ring[8 + n*0xb5 + 0xb4]` | byte: flag |
+| `ring[8 + n*0xb5 + 0xb8]` | DWORD: transfer status / byte count (written by URB completion) |
+| `ring[8 + n*0xb5 + 0xbc]` | byte: completion flag — non-zero = URB complete, ready to process |
+
+### Rx::start()
+
+Calls `Rx::refill()` and returns 1.
+
+### Rx::refill()
+
+Pre-posts bulk IN URBs to fill the RX ring. Also called from `Rx::service()` after completions.
+
+```
+available = ring->capacity - ring->fill_index
+if available < 2: return  // ring sufficiently full
+
+for each available slot (up to 10 total):
+    allocate mbuf pair
+    map mbuf data via IOMemoryDescriptor::withAddress(ptr, len, 0x101, kernel_task)
+    entry[0x08] = mem_desc
+    mem_desc->vtable[0x1f0]()              // prepare / map descriptor
+    AqUsbHal::performUrb(hal, To=RX, entry, mem_desc, 0x10000)
+    if performUrb fails: release mem_desc, break
+    ring->fill_index = (fill_index + 1) % 10
+```
+
+### Rx::service(void*)
+
+Called on URB completion (interrupt context). Calls `Rx::clean()` then tail-calls `Rx::refill()`.
+
+### Rx::clean()
+
+Drains all completed ring entries and delivers packets to the network stack.
+
+```
+while ring[head*0xb5 + 0xbc] != 0:   // completion flag set
+    entry = ring[head]
+    memdesc = entry[0x10]
+    memdesc->vtable[0x1f8]()           // complete / unmap descriptor
+
+    parse RX_PACKET_DESC from entry[0xb8]:
+        pkt_len   = status & 0x1fff    // bits [12:0] = ethernet frame length
+        pkt_count = status >> 0xd      // bits [31:13] = number of frames
+
+    if pkt_len == 0: skip (drop)
+
+    mbuf = entry[0x00]
+    if mbuf != null:
+        alloc new mbuf of size (pkt_len + 7) & 0x7ff8  // aligned
+        Rx::setChecksum(mbuf, RX_PACKET_DESC&)          // apply HW checksum offload
+        if flag & 4: set VLAN tag on mbuf
+        AqPacificDriver::onInputPacket(driver, mbuf, pkt_len - header_offset - 2, 1, 0)
+                                        // deliver to IONetworkInterface
+
+    ring->head = (head + 1) % 10
+    release IOMemoryDescriptor (vtable[0x28])
+    clear entry[0x00], entry[0x08], entry[0xb0], entry[0xbc]
+
+AqPacificDriver::flushInputQueue()      // flush batch to network stack
+```
 
 ## Tx Class
 
@@ -316,12 +522,18 @@ Size: 0x60 bytes
 | Offset | Field |
 |--------|-------|
 | 0x00   | `driver*` (back pointer to parent driver object) |
+| 0x08   | `IOUSBHostInterface*` (stored in UsbHal::start after safeMetaCast of provider) |
+| 0x10   | `IOUSBHostDevice*` — parent device, obtained via `hal[0x08]->getDevice()` in UsbHal::start |
 | 0x18   | `os_log_t` (HAL-specific log handle from `_os_log_create`) |
-| 0x28   | `fn_ptr` — function pointer, called from driver enable() when hal[0x57] (WoL flag) is non-zero |
-| 0x38   | `void*` — pointer to an object with function pointers; if non-null, `(*obj)[0x20]()` is called during enable() and hwStop. Delegate/callback interface. |
+| 0x20   | `IOUSBHostPipe*` bulk IN — RX pipe (EP2 IN Bulk 1024B), opened in findEnpoints() |
+| 0x28   | `IOUSBHostPipe*` bulk OUT — TX pipe (EP3 OUT Bulk 1024B), opened in findEnpoints() |
+| 0x30   | `IOUSBHostPipe*` interrupt IN — status pipe (EP1 IN Interrupt 16B), opened in findEnpoints() |
+| 0x38   | `DirectPhyAccess*` or `FWPhyAccess*` (0x14 bytes) — polymorphic PHY accessor; selected by firmware major version: < 0x80 → `DirectPhyAccess` (direct USB vendor cmds), >= 0x80 → `FWPhyAccess` (firmware-mediated); `(*obj)[0x20]()` called during enable() |
+| 0x40   | `uint8_t[3]` firmware version (3 bytes LE, read via bRequest=0x01 wValue=0x00da during UsbHal::start) |
+| 0x43   | (gap/padding) |
 | 0x44   | `uint8_t` enabled flag (set to 1 in UsbHal::enable(), both WoL and normal paths) |
 | 0x45   | `uint8_t[6]` MAC address (read from EEPROM via bRequest=0x20 during enable) |
-| 0x4b   | `uint8_t` (unknown) |
+| 0x4b   | `uint8_t` reconfigured flag (set to 1 if setConfiguration(1) was called during UsbHal::start) |
 | 0x4c   | `uint8_t` multicast filter active flag (cleared when list > 0x40 entries) |
 | 0x4d   | `uint8_t` promiscuous mode flag |
 | 0x4e   | `uint8_t[8]` multicast hash filter bitmap — 64-bit hash table, see algorithm below |
