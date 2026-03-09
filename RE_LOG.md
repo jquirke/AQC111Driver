@@ -129,16 +129,54 @@ hal[0x44] = 1   // enabled flag, set in both paths; return 1
 
 ### AqUsbHal::hwStart()
 
-Contains the full hardware init sequence (to be documented):
-- reads permanent MAC (bRequest=0x20) → stores in hal[0x45]
-- writes MAC to register 0x0010
-- write 0xff to register 0x0041
-- write 0x00 to register 0x00b1
-- RMW register 0x0024: val &= 0xe0
-- RMW register 0x000b: if (val & 0x80) val &= 0x7f
-- RMW register 0x0022: if (val & 0x0100) val &= 0xfeff
-- RMW register 0x00b0: if (val & 0x01) val &= 0xfe
-- if (hal[0x38] != null) → call hal[0x38]->vtable[0x20]()  // PhyAccess callback
+Full hardware init sequence executed on normal enable() (non-WoL path):
+
+```
+1. phyAccess->lowPower(false)              // vtable[0x18](0) — exit low-power mode
+
+2. Read permanent MAC (bRequest=0x20, IN, 6 bytes) → hal[0x45..0x4a]
+
+3. Write MAC to reg 0x0010 (bRequest=0x01 OUT, wLength=6, data=hal[0x45])
+
+4. Write 0xff → reg 0x0041 (1 byte)
+
+5. Write 0x00 → reg 0x00b1 (1 byte)
+
+6. RMW reg 0x0024 (1 byte): val &= 0xe0               // clear bits [4:0]
+
+7. RMW reg 0x000b (1 byte): if (val & 0x80) val &= 0x7f  // clear bit 7 if set
+
+8. RMW reg 0x0022 (2 bytes): if (val & 0x0100) val &= 0xfeff  // clear bit 8 if set
+
+9. RMW reg 0x00b0 (1 byte): if (val & 0x01) val &= 0xfe   // clear bit 0 if set
+
+10. if (hal[0x58] == 0): hal[0x58] = 0x3f    // default: advertise all speeds
+
+11. phyAccess->advertise(&hal[0x58])          // vtable[0x20] — configure AN advertisement
+```
+
+#### MediumFlags / hal[0x58]
+
+`hal[0x58]` is a 1-byte speed advertisement bitmask passed to `advertise()`:
+
+| bit | meaning |
+|-----|---------|
+| 0   | advertise 100 Mbps |
+| 1   | advertise 1 Gbps |
+| 2   | advertise 2.5 Gbps |
+| 3   | advertise 5 Gbps |
+| 4   | passed to FWPhyAccess fw[0x12] bit 0 |
+| 5   | passed to FWPhyAccess fw[0x12] bit 1 |
+
+Default value `0x3f` = all bits set = advertise all supported speeds.
+
+For **FWPhyAccess** with `hal[0x58] = 0x3f`, the 4-byte firmware control struct sent via `bRequest=0x61` is:
+```
+fw[0x10] = 0x3f & 0x0f = 0x0f      // speed flags nibble
+fw[0x11] = 0x00
+fw[0x12] |= 0x20 | 0x01 | 0x02     // always-set bit + bits from MediumFlags[5:4]
+fw[0x13]  = (fw[0x13] & 0xf0) | 0x07
+```
 
 ### AqUsbHal::performUrb(To, void* context, IOMemoryDescriptor*, unsigned int size)
 
@@ -940,7 +978,7 @@ Size: 0x60 bytes
 | 0x4e   | `uint8_t[8]` multicast hash filter bitmap — 64-bit hash table, see algorithm below |
 | 0x56   | `uint8_t` all-multicast flag (set to 1 when multicast list > 0x40 entries) |
 | 0x57   | `uint8_t` (suspected wake-on-magic-packet flag) |
-| 0x58   | `uint8_t` (unknown, observed value: 0xc0) |
+| 0x58   | `uint8_t` speed advertisement flags (MediumFlags) — default `0x3f` (all speeds); bits [3:0] = per-speed enable, bits [5:4] = FWPhyAccess extended flags |
 | 0x5c   | `uint32_t` (MTU, value 0x5ea = 1514 = standard Ethernet MTU) |
 
 ### Multicast Hash Filter Algorithm
