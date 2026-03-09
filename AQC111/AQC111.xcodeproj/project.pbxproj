@@ -152,6 +152,7 @@
 				9BB87CA12F5D383C000790E9 /* Sources */,
 				9BB87CA22F5D383C000790E9 /* Frameworks */,
 				9BB87CA32F5D383C000790E9 /* Resources */,
+				9BB87CC12F5D400000000002 /* Re-sign with full entitlements */,
 			);
 			buildRules = (
 			);
@@ -264,6 +265,28 @@
 		};
 /* End PBXShellScriptBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		9BB87CC12F5D400000000002 /* Re-sign with full entitlements */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(CODESIGNING_FOLDER_PATH)",
+			);
+			name = "Re-sign dext with full entitlements (SIP-off workaround)";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\nFULL_ENT=\"${SRCROOT}/AQC111/AQC111Driver_full.entitlements\"\necho \"Re-signing ${CODESIGNING_FOLDER_PATH} with full entitlements\"\ncodesign --force --sign \"${CODE_SIGN_IDENTITY}\" --entitlements \"${FULL_ENT}\" \"${CODESIGNING_FOLDER_PATH}\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		9BB87CA12F5D383C000790E9 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -310,7 +333,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = au.com.jquirke.AQC111Driver;
 				PRODUCT_NAME = "$(inherited)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
-				"PROVISIONING_PROFILE_SPECIFIER[sdk=driverkit*]" = "";
+				"PROVISIONING_PROFILE_SPECIFIER[sdk=driverkit*]" = "DriverKit AQC111";
 				RUN_CLANG_STATIC_ANALYZER = YES;
 				SKIP_INSTALL = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
