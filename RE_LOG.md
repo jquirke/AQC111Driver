@@ -134,9 +134,9 @@ Full hardware init sequence executed on normal enable() (non-WoL path):
 ```
 1. phyAccess->lowPower(false)              // vtable[0x18](0) — exit low-power mode
 
-2. Read permanent MAC (bRequest=0x20, IN, 6 bytes) → hal[0x45..0x4a]
+2. Read permanent MAC (bRequest=AQ_FLASH_PARAMETERS, IN, 6 bytes) → hal[0x45..0x4a]
 
-3. Write MAC to reg 0x0010 (bRequest=0x01 OUT, wLength=6, data=hal[0x45])
+3. Write MAC to reg 0x0010 (bRequest=AQ_ACCESS_MAC OUT, wLength=6, data=hal[0x45])
 
 4. Write 0xff → reg 0x0041 (1 byte)
 
@@ -170,7 +170,7 @@ Full hardware init sequence executed on normal enable() (non-WoL path):
 
 Default value `0x3f` = all bits set = advertise all supported speeds.
 
-For **FWPhyAccess** with `hal[0x58] = 0x3f`, the 4-byte firmware control struct sent via `bRequest=0x61` is:
+For **FWPhyAccess** with `hal[0x58] = 0x3f`, the 4-byte firmware control struct sent via `bRequest=AQ_PHY_OPS` is:
 ```
 fw[0x10] = 0x3f & 0x0f = 0x0f      // speed flags nibble
 fw[0x11] = 0x00
@@ -323,19 +323,59 @@ the `Tx::transmit()` logic needs to be replicated.
 
 ## Vendor Commands
 
+### Named Constants
+
+```c
+// bRequest values
+#define AQ_ACCESS_MAC        0x01   // MAC register read/write (bulk, multi-byte)
+#define AQ_FLASH_PARAMETERS  0x20   // Read flash/EEPROM parameters (MAC address)
+#define AQ_PHY_POWER         0x31   // Direct PHY power control (DirectPhyAccess only)
+#define AQ_WOL_CFG           0x60   // Wake-on-LAN configuration
+#define AQ_PHY_OPS           0x61   // Firmware-mediated PHY operations (FWPhyAccess only)
+
+// AQ_ACCESS_MAC register addresses (wValue)
+#define AQ_FW_VER_MAJOR      0xDA   // Firmware version major byte
+#define AQ_FW_VER_MINOR      0xDB   // Firmware version minor byte
+#define AQ_FW_VER_REV        0xDC   // Firmware version revision byte
+
+// MediumFlags — 32-bit bitmask stored at hal[0x58]; sent verbatim as AQ_PHY_OPS payload
+#define AQ_ADV_100M          BIT(0)
+#define AQ_ADV_1G            BIT(1)
+#define AQ_ADV_2G5           BIT(2)
+#define AQ_ADV_5G            BIT(3)
+#define AQ_ADV_MASK          0x0F
+
+#define AQ_PAUSE             BIT(16)
+#define AQ_ASYM_PAUSE        BIT(17)
+#define AQ_LOW_POWER         BIT(18)   // FWPhyAccess fw[0x12] bit 2
+#define AQ_PHY_POWER_EN      BIT(19)   // FWPhyAccess fw[0x12] bit 3
+#define AQ_WOL               BIT(20)   // FWPhyAccess fw[0x12] bit 4
+#define AQ_DOWNSHIFT         BIT(21)   // FWPhyAccess fw[0x12] bit 5
+
+#define AQ_DSH_RETRIES_SHIFT 0x18      // downshift retry count field shift (bits 24-27)
+#define AQ_DSH_RETRIES_MASK  0xF000000
+
+// WoL flags (used with AQ_WOL_CFG)
+#define AQ_WOL_FLAG_MP       0x2       // magic packet
+```
+
+`0x21` and `0x32` appear in the binary but lack confirmed names:
+- `0x21` — write flash/EEPROM parameter (write counterpart to `AQ_FLASH_PARAMETERS`)
+- `0x32` — Clause 45 MDIO read/write (used by `DirectPhyAccess` for PHY register access)
+
 ### Protocol Pattern
 
-| bRequest | Direction | Description |
-|----------|-----------|-------------|
-| `0x01`   | IN (0xc0)  | Read register — `wValue` = register address, `wLength` = byte count |
-| `0x01`   | OUT (0x40) | Write register — `wValue` = register address, `wLength` = byte count, data in buffer |
-| `0x20`   | IN (0xc0)  | Read permanent MAC address from EEPROM — returns 6 bytes |
+| bRequest | Name | Direction | Description |
+|----------|------|-----------|-------------|
+| `0x01`   | `AQ_ACCESS_MAC` | IN (0xc0)  | Read MAC register — `wValue` = reg addr, `wLength` = byte count |
+| `0x01`   | `AQ_ACCESS_MAC` | OUT (0x40) | Write MAC register — `wValue` = reg addr, `wLength` = byte count, data in buffer |
+| `0x20`   | `AQ_FLASH_PARAMETERS` | IN (0xc0) | Read flash/EEPROM — firmware version, MAC address |
+| `0x31`   | `AQ_PHY_POWER` | OUT (0x40) | Direct PHY power byte (DirectPhyAccess) |
+| `0x32`   | —  | IN/OUT | Clause 45 MDIO read/write (DirectPhyAccess PHY register access) |
+| `0x60`   | `AQ_WOL_CFG` | OUT (0x40) | Wake-on-LAN configuration |
+| `0x61`   | `AQ_PHY_OPS` | OUT (0x40) | Firmware PHY control struct, 4 bytes (FWPhyAccess) |
 
-`wIndex` observed values: `0x0001`, `0x0002`, `0x0003` — purpose unknown, may indicate register bank or endpoint.
-| `0x32`   | IN (0xc0)  | Read PHY value — `wValue` = arg1, `wIndex` = arg2, returns 2 bytes |
-| `0x32`   | OUT (0x40) | Write PHY value — `wValue` = arg1, `wIndex` = arg2, sends 2 bytes |
-
-`wIndex` purpose unknown — observed values: `0x0002`, `0x0003`.
+`wIndex` in `AQ_ACCESS_MAC` calls: observed values `0x0002`, `0x0008`, `0x0020` — appears to be a secondary length or bank field, not yet fully understood.
 
 
 
@@ -344,7 +384,7 @@ the `Tx::transmit()` logic needs to be replicated.
 ```c
 StandardUSB::DeviceRequest req = {
     .bmRequestType = 0xc0,  // IN | Vendor | Device
-    .bRequest      = 0x32,  // PHY read
+    .bRequest      = AQ_MDIO,  // PHY read
     .wValue        = arg1,
     .wIndex        = arg2,
     .wLength       = 0x0002, // 2-byte response → *out
@@ -356,7 +396,7 @@ StandardUSB::DeviceRequest req = {
 ```c
 StandardUSB::DeviceRequest req = {
     .bmRequestType = 0x40,  // OUT | Vendor | Device
-    .bRequest      = 0x32,  // PHY write
+    .bRequest      = AQ_MDIO,  // PHY write
     .wValue        = arg1,
     .wIndex        = arg2,
     .wLength       = 0x0002, // 2 bytes to write
@@ -372,7 +412,7 @@ Response is 3 bytes, little-endian.
 StandardUSB::DeviceRequest req = {
     .bmRequestType = 0xc0,   // IN | Vendor | Device
     .bRequest      = 0x01,   // read register
-    .wValue        = 0x00da, // register address
+    .wValue        = AQ_FW_VER_MAJOR,  // 0xDA — reads 3 bytes: major+minor+rev
     .wIndex        = 0x0003,
     .wLength       = 0x0003, // 3-byte LE firmware version
 };
@@ -395,7 +435,7 @@ if (hal[0x5c] < 0x5eb) {
     read_mtu = set;      // jumbo MTU — enable jumbo
 }
 // then write read_mtu back to register 0x0022
-// write command: 0x0002000200220140 (bRequest=0x01 OUT, wValue=0x0022, wLength=2)
+// write command: 0x0002000200220140 (bRequest=AQ_ACCESS_MAC OUT, wValue=0x0022, wLength=2)
 ```
 
 Then a tiered mapping of hal[0x5c] (MTU) to a buffer size value (written to unknown register, TBD):
@@ -460,7 +500,7 @@ StandardUSB::DeviceRequest req = {
 // raw: 0x0006000600100140
 ```
 
-Note: uses generic write register (bRequest=0x01), unlike read which uses dedicated bRequest=0x20.
+Note: uses generic write register (bRequest=AQ_ACCESS_MAC), unlike read which uses dedicated bRequest=AQ_FLASH_PARAMETERS.
 Likely writes to operational/current MAC register, while read returns value from EEPROM.
 
 ### Read Permanent MAC Address
@@ -468,7 +508,7 @@ Likely writes to operational/current MAC register, while read returns value from
 ```c
 StandardUSB::DeviceRequest req = {
     .bmRequestType = 0xc0,   // IN | Vendor | Device
-    .bRequest      = 0x20,   // 32 — read MAC command
+    .bRequest      = AQ_FLASH_PARAMETERS,
     .wValue        = 0x0000,
     .wIndex        = 0x0000,
     .wLength       = 0x0006, // 6-byte MAC address response
@@ -528,17 +568,17 @@ wLength       = wLength;
 
 #### phyPower(bool on)
 
-New vendor command `bRequest=0x31` — direct PHY power control:
+New vendor command `bRequest=AQ_PHY_POWER` — direct PHY power control:
 
 ```c
 uint8_t data = on ? 0x02 : 0x00;
-vendorCmd(hal, /*cmd=*/0x31, /*OUT*/0, /*wValue=*/0, /*wIndex=*/0, /*wLength=*/1, &data);
+vendorCmd(hal, /*cmd=*/AQ_PHY_POWER, /*OUT*/0, /*wValue=*/0, /*wIndex=*/0, /*wLength=*/1, &data);
 if (!on) IOSleep(200);   // 200ms delay on power-down
 ```
 
 #### lowPower(bool on)
 
-Read-modify-write Clause 22 PHY register 0x1e (via `readPhyValue`/`writePhyValue`, bRequest=0x32):
+Read-modify-write Clause 22 PHY register 0x1e (via `readPhyValue`/`writePhyValue`, bRequest=AQ_MDIO):
 
 ```c
 uint16_t val;
@@ -549,7 +589,7 @@ writePhyValue(hal, 0, 0x1e, &val);
 
 #### advertise(MediumFlags&)
 
-Programs Clause 45 PHY registers for multi-rate speed advertisement. All calls via `writePhyValue`/`readPhyValue` (bRequest=0x32, wValue=devad, wIndex=regaddr):
+Programs Clause 45 PHY registers for multi-rate speed advertisement. All calls via `writePhyValue`/`readPhyValue` (bRequest=AQ_MDIO, wValue=devad, wIndex=regaddr):
 
 ```c
 // MMD device 7 (Auto-Negotiation) registers:
@@ -582,24 +622,31 @@ No-op — returns `true` immediately. `DirectPhyAccess` does not implement sleep
 All operations modify a 4-byte control struct at `fw[0x10..0x13]` then send it atomically via a single firmware command:
 
 ```c
-// bRequest=0x61, OUT, wValue=0, wIndex=0, wLength=4, data=fw[0x10..0x13]
-vendorCmd(hal, /*cmd=*/0x61, /*OUT*/0, 0, 0, /*len=*/4, &fw[0x10]);
+// bRequest=AQ_PHY_OPS, OUT, wValue=0, wIndex=0, wLength=4, data=fw[0x10..0x13]
+vendorCmd(hal, /*cmd=*/AQ_PHY_OPS, /*OUT*/0, 0, 0, /*len=*/4, &fw[0x10]);
 ```
 
-Control struct bit layout (`fw[0x12]`):
+The 4-byte payload is the **MediumFlags dword sent verbatim** (little-endian). Each method RMWs the relevant bit(s) in the locally-held `fw[0x10..0x13]` copy before sending all 4 bytes to firmware.
 
-| bit | set by |
-|-----|--------|
-| 0   | `advertise()` — from `MediumFlags[0]` bit 4 |
-| 1   | `advertise()` — from `MediumFlags[0]` bit 5 |
-| 2   | `lowPower(bool)` flag |
-| 3   | `phyPower(bool)` flag |
-| 4   | `sleep(bool)` flag |
-| 5   | `advertise()` — always set (`\| 0x20`) |
+Bit layout mapping (MediumFlags → fw struct byte offsets):
 
-`fw[0x13]` bits[3:0] = `0x07` (set in `advertise()`); `fw[0x10]` bits[3:0] = `MediumFlags[0] & 0x0f`.
+| MediumFlags bit | Constant | fw byte | bit | Set by |
+|----------------|----------|---------|-----|--------|
+| 0  | `AQ_ADV_100M`     | fw[0x10] | 0 | `advertise()` |
+| 1  | `AQ_ADV_1G`       | fw[0x10] | 1 | `advertise()` |
+| 2  | `AQ_ADV_2G5`      | fw[0x10] | 2 | `advertise()` |
+| 3  | `AQ_ADV_5G`       | fw[0x10] | 3 | `advertise()` |
+| 16 | `AQ_PAUSE`        | fw[0x12] | 0 | `advertise()` |
+| 17 | `AQ_ASYM_PAUSE`   | fw[0x12] | 1 | `advertise()` |
+| 18 | `AQ_LOW_POWER`    | fw[0x12] | 2 | `lowPower(bool)` |
+| 19 | `AQ_PHY_POWER_EN` | fw[0x12] | 3 | `phyPower(bool)` |
+| 20 | `AQ_WOL`          | fw[0x12] | 4 | `sleep(bool)` / WoL path |
+| 21 | `AQ_DOWNSHIFT`    | fw[0x12] | 5 | `advertise()` |
+| 24-27 | `AQ_DSH_RETRIES` | fw[0x13] | 0-3 | `advertise()` — downshift retry count |
 
-FWPhyAccess persists this struct (`fw[0x10]`) in the object so each call RMWs the relevant bit before sending the full 4 bytes to firmware.
+`fw[0x13]` bits[3:0] = `0x07` observed as default downshift retries in `advertise()`.
+
+FWPhyAccess persists this struct in the object so each call is a RMW; no field is ever reconstructed from scratch.
 
 ### Vendor commands discovered via PhyAccess
 
@@ -1025,17 +1072,17 @@ Size: 0x60 bytes
 | 0x28   | `IOUSBHostPipe*` bulk OUT — TX pipe (EP3 OUT Bulk 1024B), opened in findEnpoints() |
 | 0x30   | `IOUSBHostPipe*` interrupt IN — status pipe (EP1 IN Interrupt 16B), opened in findEnpoints() |
 | 0x38   | `DirectPhyAccess*` or `FWPhyAccess*` (0x14 bytes) — polymorphic PHY accessor; selected by firmware major version: < 0x80 → `DirectPhyAccess` (direct USB vendor cmds), >= 0x80 → `FWPhyAccess` (firmware-mediated); `(*obj)[0x20]()` called during enable() |
-| 0x40   | `uint8_t[3]` firmware version (3 bytes LE, read via bRequest=0x01 wValue=0x00da during UsbHal::start) |
+| 0x40   | `uint8_t[3]` firmware version (3 bytes LE, read via bRequest=AQ_ACCESS_MAC wValue=AQ_FW_VER_MAJOR during UsbHal::start) |
 | 0x43   | (gap/padding) |
 | 0x44   | `uint8_t` enabled flag (set to 1 in UsbHal::enable(), both WoL and normal paths) |
-| 0x45   | `uint8_t[6]` MAC address (read from EEPROM via bRequest=0x20 during enable) |
+| 0x45   | `uint8_t[6]` MAC address (read from EEPROM via bRequest=AQ_FLASH_PARAMETERS during enable) |
 | 0x4b   | `uint8_t` reconfigured flag (set to 1 if setConfiguration(1) was called during UsbHal::start) |
 | 0x4c   | `uint8_t` multicast filter active flag (cleared when list > 0x40 entries) |
 | 0x4d   | `uint8_t` promiscuous mode flag |
 | 0x4e   | `uint8_t[8]` multicast hash filter bitmap — 64-bit hash table, see algorithm below |
 | 0x56   | `uint8_t` all-multicast flag (set to 1 when multicast list > 0x40 entries) |
 | 0x57   | `uint8_t` (suspected wake-on-magic-packet flag) |
-| 0x58   | `uint8_t` speed advertisement flags (MediumFlags) — default `0x3f` (all speeds); bits [3:0] = per-speed enable, bits [5:4] = FWPhyAccess extended flags |
+| 0x58   | `uint32_t` MediumFlags — 32-bit bitmask; default lower byte `0x0f` (AQ_ADV_MASK, all speeds); upper bits control PAUSE/LOW_POWER/PHY_POWER_EN/WOL/DOWNSHIFT; sent verbatim as 4-byte AQ_PHY_OPS payload |
 | 0x5c   | `uint32_t` (MTU, value 0x5ea = 1514 = standard Ethernet MTU) |
 
 ### Multicast Hash Filter Algorithm
@@ -1174,9 +1221,9 @@ else
 ```c
 // 1. Read-modify-write register 0x0022: clear bit 8 (TX/link enable)
 uint16_t reg22;
-vendorCmd_read(bRequest=0x01, wValue=0x0022, wIndex=0x0002, data=&reg22, len=2);
+vendorCmd_read(bRequest=AQ_ACCESS_MAC, wValue=0x0022, wIndex=0x0002, data=&reg22, len=2);
 reg22 &= ~0x0100;   // clear bit 8 (byte[1] bit 0)
-vendorCmd_write(bRequest=0x01, wValue=0x0022, wIndex=0x0002, data=&reg22, len=2);
+vendorCmd_write(bRequest=AQ_ACCESS_MAC, wValue=0x0022, wIndex=0x0002, data=&reg22, len=2);
 
 // 2. Withdraw speed advertisements (PHY stops trying to link)
 uint8_t zero = 0;
@@ -1188,7 +1235,7 @@ phy->lowPower(true);     // PhyAccess::lowPower — vtable[0x18]
 
 Register 0x0022 is one of the initialization registers written during `hwStart()`. Bit 8 appears to be a TX/link-enable flag; clearing it quiesces the device-side data path before withdrawing the PHY advertisement.
 
-The `vendorCmd_read`/`vendorCmd_write` here both use `bRequest=0x01` (bulk register access, same as hwSetFilters), not the single-register `bRequest=0x20`/`0x21` form used by `readReg`/`writeReg`.
+The `vendorCmd_read`/`vendorCmd_write` here both use `bRequest=AQ_ACCESS_MAC` (bulk register access, same as hwSetFilters), not the single-register `bRequest=AQ_FLASH_PARAMETERS`/`0x21` form used by `readReg`/`writeReg`.
 
 ### AqPacificDriver::willTerminate(IOService* provider, IOOptionBits options)
 
@@ -1426,14 +1473,14 @@ uint16_t filter = 0x0288;     // default: unicast + broadcast + directed multica
 if (hal[0x4c]) {
     // Hash multicast filter enabled — upload 8-byte hash table first
     filter = 0x0298;           // bit[4] set = hash filter enable
-    vendorCmd(bRequest=0x01, wValue=0x0016, wIndex=0x0008,
+    vendorCmd(bRequest=AQ_ACCESS_MAC, wValue=0x0016, wIndex=0x0008,
               data=&hal[0x4e], len=8);   // write multicast hash table
 }
 if (hal[0x4d]) filter |= 0x01;   // bit[0] = promiscuous
 if (hal[0x56]) filter |= 0x02;   // bit[1] = all-multicast
 
 // Write RX filter mode register
-vendorCmd(bRequest=0x01, wValue=0x000b, wIndex=0x0020,
+vendorCmd(bRequest=AQ_ACCESS_MAC, wValue=0x000b, wIndex=0x0020,
           data=&filter, len=2);
 ```
 
@@ -1444,7 +1491,7 @@ Filter mode bits (register at wValue=0x000b):
 | 1   | All-multicast (receive all multicast frames) |
 | 4   | Multicast hash filter enable (use 64-bit hash table at wValue=0x0016) |
 
-Vendor command bRequest=0x01 is a bulk register write (distinct from bRequest=0x21 single-register write).
+Vendor command bRequest=AQ_ACCESS_MAC is a bulk register write (distinct from bRequest=0x21 single-register write).
 
 Also called from `hwOnLinkChange()` after link-up, to re-apply filter state on each link event.
 
