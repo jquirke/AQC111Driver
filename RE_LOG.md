@@ -968,6 +968,42 @@ for each available slot (up to 10 total):
 
 Called on URB completion (interrupt context). Calls `Rx::clean()` then tail-calls `Rx::refill()`.
 
+### RX Bulk IN Buffer Layout
+
+Each 64KB bulk IN URB receives a variable-length buffer structured as:
+
+```
+[4-byte RX Descriptor Header]
+[packet 0: 2-byte HW pad + payload]
+[packet 1: 2-byte HW pad + payload]
+...
+[packet N-1: 2-byte HW pad + payload]
+[N × 8-byte RX Packet Descriptors]   ← at byte offset desc_offset from buffer start
+```
+
+**RX Descriptor Header** (first 4 bytes of buffer):
+
+| Bits | Mask | Description |
+|------|------|-------------|
+| 12:0 | `0x1FFF` | Packet count — number of packets in this transfer |
+| 31:13 | `0xFFFFE000` >> 13 | Descriptor offset — byte offset to the packet descriptor array |
+
+**RX Packet Descriptor** (8 bytes per packet, at desc_offset):
+
+| Bits | Description |
+|------|-------------|
+| 0 | L4 checksum error |
+| 1 | L3 checksum error |
+| 4:2 | L4 type: `0x04`=UDP, `0x10`=TCP |
+| 6:5 | L3 type: `0x20`=IPv4, `0x40`=IPv6 |
+| 10 | VLAN tag present |
+| 11 | RX OK — packet received without errors |
+| 30:16 | Packet length (mask `0x7FFF0000` >> 16) |
+| 31 | Drop — discard this packet |
+| 63:32 | VLAN tag (16-bit 802.1Q tag, shift `0x20`) |
+
+`AQ_RX_HW_PAD = 0x02` — 2-byte pad prepended by hardware to each packet to align the IP header to a 4-byte boundary within the buffer.
+
 ### Rx::clean()
 
 Drains all completed ring entries and delivers packets to the network stack.
@@ -975,22 +1011,29 @@ Drains all completed ring entries and delivers packets to the network stack.
 ```
 while ring[head*0xb5 + 0xbc] != 0:   // completion flag set
     entry = ring[head]
-    memdesc = entry[0x10]
+    memdesc = entry[0x08]
     memdesc->vtable[0x1f8]()           // complete / unmap descriptor
 
-    parse RX_PACKET_DESC from entry[0xb8]:
-        pkt_len   = status & 0x1fff    // bits [12:0] = ethernet frame length
-        pkt_count = status >> 0xd      // bits [31:13] = number of frames
+    // Parse RX Descriptor Header from start of buffer
+    uint32_t header = *(uint32_t*)buffer;
+    pkt_count   = header & 0x1FFF;          // number of packets
+    desc_offset = (header & 0xFFFFE000) >> 13;  // offset to descriptor array
 
-    if pkt_len == 0: skip (drop)
+    if pkt_count == 0: skip (drop)
 
-    mbuf = entry[0x00]
-    if mbuf != null:
-        alloc new mbuf of size (pkt_len + 7) & 0x7ff8  // aligned
-        Rx::setChecksum(mbuf, RX_PACKET_DESC&)          // apply HW checksum offload
-        if flag & 4: set VLAN tag on mbuf
-        AqPacificDriver::onInputPacket(driver, mbuf, pkt_len - header_offset - 2, 1, 0)
-                                        // deliver to IONetworkInterface
+    // Walk each packet using its RX Packet Descriptor
+    for i in range(pkt_count):
+        uint64_t pd = *(uint64_t*)(buffer + desc_offset + i*8);
+        if pd & AQ_RX_PD_DROP: continue
+        if !(pd & AQ_RX_PD_RX_OK): continue
+        pkt_len = (pd & 0x7FFF0000) >> 16;
+
+        mbuf = entry[0x00]
+        if mbuf != null:
+            Rx::setChecksum(mbuf, pd)           // apply HW checksum offload info
+            if pd & AQ_RX_PD_VLAN: set VLAN tag on mbuf from pd[63:32]
+            AqPacificDriver::onInputPacket(driver, mbuf, pkt_len - 2, 1, 0)
+                                                // -2 for AQ_RX_HW_PAD
 
     ring->head = (head + 1) % 10
     release IOMemoryDescriptor (vtable[0x28])
