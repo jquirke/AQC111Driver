@@ -1664,3 +1664,85 @@ phy->advertise(&hal[0x58]);   // PhyAccess::advertise — vtable[0x20]
 
 This allows runtime speed changes (e.g., user forces 1G in Network preferences) to take effect immediately without a full restart.
 
+---
+
+## Checksum Offload
+
+### AqPacificDriver::getChecksumSupport(uint32_t* checksumMask, uint32_t checksumFamily, bool isOutput)
+
+Address: `0x2b7e` (kext binary).
+
+```c
+if (checksumFamily != kChecksumFamilyInet) {
+    return kIOReturnUnsupported;
+}
+*checksumMask |= 0x67;   // kChecksumIP | kChecksumTCP | kChecksumUDP |
+                         //   kChecksumTCPIPv6 | kChecksumUDPIPv6
+return kIOReturnSuccess;
+```
+
+The same mask `0x67` is returned for both TX (`isOutput=true`) and RX (`isOutput=false`). The `isOutput` parameter is not checked — behaviour is identical for both directions.
+
+IOKit checksum capability flags (IOChecksumFamily / IOChecksumOperation):
+
+| Value  | Constant            | Meaning               |
+|--------|---------------------|-----------------------|
+| `0x01` | `kChecksumIP`       | IPv4 header checksum  |
+| `0x02` | `kChecksumTCP`      | TCP over IPv4         |
+| `0x04` | `kChecksumUDP`      | UDP over IPv4         |
+| `0x20` | `kChecksumTCPIPv6`  | TCP over IPv6         |
+| `0x40` | `kChecksumUDPIPv6`  | UDP over IPv6         |
+
+Sum: `0x01|0x02|0x04|0x20|0x40 = 0x67`.
+
+Note: ICMP (`kChecksumICMP`) and ICMPv6 are supported by the hardware SFR (`SFR_RXCOE_CTL` bits 3,7) but are **not** advertised here and not verified in software. The kext does not touch ICMP checksum status.
+
+---
+
+### Rx::setChecksum(__mbuf* mbuf, uint64_t rx_pd)
+
+Address: `0x22e4` (kext binary). Called from `Rx::clean()` for every received packet.
+
+The lower 16 bits of the RX packet descriptor (`rx_pd & 0xFFFF`) encode L3/L4 type and error status:
+
+| Bits | Field       | Meaning                                        |
+|------|-------------|------------------------------------------------|
+| 1:0  | `L4_ERR`, `L3_ERR` | Checksum error flags (1 = error detected) |
+| 4:2  | L4 type     | `1`=UDP, `4`=TCP, others=unknown/not checked   |
+| 6:5  | L3 type     | `1`=IPv4, `2`=IPv6                             |
+
+Logic (pseudocode):
+
+```c
+uint16_t pd16 = rx_pd & 0xFFFF;
+bool     L3_ERR = (pd16 >> 1) & 1;
+bool     L4_ERR = (pd16 >> 0) & 1;
+uint8_t  l4_type = (pd16 >> 2) & 7;   // 1=UDP, 4=TCP
+uint8_t  l3_type = (pd16 >> 5) & 3;   // 1=IPv4, 2=IPv6
+bool     is_ipv6 = (l3_type == 2);
+
+uint32_t checked = 0, valid = 0;
+
+if (l3_type == 1 /* IPv4 */) {
+    checked |= kChecksumIP;              // 0x01
+    if (!L3_ERR) valid |= kChecksumIP;
+}
+
+if (l4_type == 1 /* UDP */) {
+    uint32_t bit = is_ipv6 ? kChecksumUDPIPv6 : kChecksumUDP;   // 0x40 or 0x04
+    checked |= bit;
+    if (!L4_ERR) valid |= bit;
+} else if (l4_type == 4 /* TCP */) {
+    uint32_t bit = is_ipv6 ? kChecksumTCPIPv6 : kChecksumTCP;   // 0x20 or 0x02
+    checked |= bit;
+    if (!L4_ERR) valid |= bit;
+}
+
+// vtable[0x960] on the controller object
+setChecksumResult(mbuf, kChecksumFamilyInet, checked, valid, 0, 0);
+```
+
+`checked` is the set of checksums the hardware examined; `valid` is the subset that passed. The IOKit stack uses this to skip software re-verification of valid checksums.
+
+IPv6 IP-header checksum (`kChecksumIP`) is never added to `checked` for IPv6 frames — correct, since IPv6 has no header checksum.
+
