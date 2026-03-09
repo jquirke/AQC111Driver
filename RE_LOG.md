@@ -11,7 +11,7 @@ Tools: [Ghidra](https://ghidra-sre.org) (disassembly/decompilation), [Radare2](h
 | Offset | Field |
 |--------|-------|
 | 0x000  | `vtable*` → `__ZTV20IOEthernetController` (0x161c8) — IOEthernetController vtable pointer |
-| 0x118  | unknown |
+| 0x118  | `IONetworkInterface*` (populated by `attachInterface()` during start()) |
 | 0x120  | `UsbHal*` (instance pointer, see UsbHal class below) |
 | 0x128  | `_os_log_create` pointer |
 | 0x130  | `OSDictionary*` Medium dictionary (stored during start()) |
@@ -39,8 +39,10 @@ Called on driver load/device attach.
 2. UsbHal::start(provider)
 3. Tx::start()
 4. store Medium dictionary → driver[0x130]
-5. `this->IONetworkController::attachInterface(interface**, false)` — vtable[0x9c0], doActivate=false (activate manually later)
-6-9. <3 more vtable calls — TBD>
+5. `this->IONetworkController::attachInterface(interface**, false)` — vtable[0x9c0], doActivate=false; result stored at driver[0x118]
+6. `IONetworkController::publishMediumDictionary(driver[0x130])` — publish supported media types to IOKit registry
+7. `driver[0x118]->IOService::registerService(0)` — vtable[0x5b0], register network interface in IOKit registry
+   (error) if 5, 6, or 7 fail → `IONetworkController::stop(provider)`, return error
 ```
 
 ### enable(IONetworkInterface*)
