@@ -422,7 +422,124 @@ AqUsbHal::performUrb(itr[0x08], To=ITR, itr[0x18], itr[0x20], /*size=*/8);
 return 1;
 ```
 
-Completion: `AqUsbHal::onItrComplete(void*, void*, int, unsigned int)` — re-posts URB and dispatches link status change.
+### Itr::onItrComplete(void* context, int status, unsigned int bytes)
+
+URB completion handler — re-posts URB and dispatches link status.
+
+```c
+if (status != 0) return;   // error — drop silently, do NOT re-post
+
+AqUsbHal::onInterruptEvent(itr[0x08], itr[0x18]);   // process 8-byte ItrData
+
+// Tail-call: re-post the same interrupt URB to keep it running
+performUrb(itr[0x08], To=ITR, itr[0x18], itr[0x20], 8);
+```
+
+### Interrupt dispatch chain
+
+```
+IOUSBHostPipe completion
+  → onCompleteAction<AqUsbHal, &AqUsbHal::onItrComplete>()
+  → AqUsbHal::onItrComplete(ctx, status, bytes)
+       if hal[0x44]==0: return   // not enabled, drop
+       load hal[0x00] (driver*)
+       → AqPacificDriver::onItrComplete(driver, status, bytes)
+           load driver[0x160] (Itr*)
+           → Itr::onItrComplete(itr, status, bytes)    // see above
+```
+
+### ItrData layout (8 bytes, filled by interrupt IN URB)
+
+| Byte | Field |
+|------|-------|
+| `[0]` | unknown |
+| `[1]` | link status byte: `0` = link down; `0x8f`=5Gbps, `0x90`=2.5Gbps, `0x91`=1Gbps, `0x93`=100Mbps; bit 7 set = link up |
+| `[2]` | feature flags: bits[1:0] = flow control active (3 = TX+RX FC) |
+| `[3]`–`[7]` | unknown |
+
+`hal[0x43]` = last-seen `ItrData[1]` (change detection — no-op if same as previous).
+
+### AqUsbHal::onInterruptEvent(AqUsbHal* hal, ItrData* data)
+
+```c
+if (data[1] == hal[0x43]) return;   // no link state change — early exit
+
+hal[0x43] = data[1];                // record new state
+
+// Decode link speed from data[1]:
+//   (data[1] + 0x71) mod 256 → index into speed/medium tables
+//   index 0 → 5000 Mbps, medium_index=4 ("5000BaseT-Full")
+//   index 1 → 2500 Mbps, medium_index=3 ("2500BaseT-Full")
+//   index 2 → 1000 Mbps, medium_index=2 ("1000BaseT-Full")
+//   index 3 → 0 Mbps    (reserved / not used)
+//   index 4 → 100 Mbps,  medium_index=1 ("100BaseTX-Full")
+//   index >4 → unhandled (speed = 0, medium_index = 0)
+uint8_t idx = (uint8_t)(data[1] + 0x71);
+uint32_t speed_mbps    = (idx <= 4) ? speed_table[idx]  : 0;  // table at 0x3fa0
+uint32_t medium_index  = (idx <= 4) ? medium_table[idx] : 0;  // table at 0x3fc0
+
+hwOnLinkChange(hal, data, speed_mbps);   // program hardware for new speed
+
+// Decode flow control from data[2] bits [1:0]:
+uint32_t link = medium_index;
+if ((data[2] & 3) == 3) link = medium_index + 5;  // +5 → FC variant in medium dict
+
+bool up = (data[1] > 0);   // non-zero = link up (bit 7 set)
+
+// Notify driver → IONetworkInterface
+AqPacificDriver::onLinkStatusChanged(driver, link, up);   // tail-call
+```
+
+Speed/medium tables (at 0x3fa0 / 0x3fc0, 5 × uint32_t each):
+
+| idx | speed_mbps | medium_index | ItrData[1] value |
+|-----|-----------|--------------|------------------|
+| 0   | 5000      | 4            | `0x8f`           |
+| 1   | 2500      | 3            | `0x90`           |
+| 2   | 1000      | 2            | `0x91`           |
+| 3   | 0         | 0            | `0x92` (unused?) |
+| 4   | 100       | 1            | `0x93`           |
+
+### AqUsbHal::hwOnLinkChange(AqUsbHal* hal, ItrData* data, uint32_t speed_mbps)
+
+Programs hardware registers for the new link speed. Only entered when `data[1] < 0` (link up, bit 7 set — link down path skips straight to return at 0x17dd).
+
+Register write sequence on link-up (via `IOUSBHostInterface::deviceRequest`, vtable[0xa98], timeout=10s):
+
+| Register | Bytes | Notes |
+|----------|-------|-------|
+| `0x000d` | 1     | `0x05` if speed_mbps==5000 (`0x1388`), else `0x00` |
+| `0x00b2` | 3     | speed-dependent 3-byte PHY config |
+| `0x002e` | 5     | 5-byte PHY config: byte[0]=`0xa0` (100M) or `0xff` (other), byte[1]=`0x1f`, byte[2]=`0x00`, byte[3]=`0xff`; 100M variant sets [4]=`0x4fb` |
+| `0x000b` | 2     | written to `0x0000` (reset?) |
+| `0x00b7` | 1     | written to `1` |
+| `0x00b9` | 1     | written to `2` |
+| `0x0022` | 2     | MTU/link-enable register (RMW — see Vendor Commands) |
+| `0x0022` | 2     | second write to same register |
+| `0x002b` | 1     | written to `0x10` |
+| `0x0046` | 1     | speed-dependent |
+| `0x009e` | 1     | speed-dependent |
+| `0x000b` | 2     | second write |
+
+### AqPacificDriver::onLinkStatusChanged(AqPacificDriver* drv, uint32_t link_medium_idx, bool up)
+
+```c
+driver[0x148] = up;   // store link-up flag
+
+if (up) {
+    IONetworkMedium* medium = OSDictionary_lookup(driver[0x130], link_medium_idx);
+    // esi = kIONetworkLinkValid | kIONetworkLinkActive = 3, edx = medium*
+} else {
+    medium = null;
+    // esi = kIONetworkLinkValid = 1, edx = null
+}
+
+// vtable[0x980] on driver = setLinkStatus(state, medium, speed=0, ...)
+driver->vtable[0x980](esi, medium, 0, 0);  // → IONetworkInterface::setLinkStatus
+```
+
+Additional driver ivars discovered:
+- `driver[0x148]` = `uint8_t` link-up flag (1=up, 0=down)
 
 
 
