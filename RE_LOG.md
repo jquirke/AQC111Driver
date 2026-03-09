@@ -149,24 +149,63 @@ enum To { TX = 0, RX = 1, ITR = 2 };
 
 if (hal[0x44] == 0) return kIOReturnNotOpen;   // not enabled
 
-switch (direction) {
-    case TX:   pipe = hal[0x28]; callback = AqUsbHal::onTransmitComplete; break;
-    case RX:   pipe = hal[0x20]; callback = AqUsbHal::onReceiveComplete;  break;
-    case ITR:  pipe = hal[0x30]; callback = AqUsbHal::onItrComplete;      break;
-    default:   pipe = null; callback = null; break;
+// Each To value selects a pipe and a statically-instantiated completion wrapper:
+//   TX  → hal[0x28] (bulk OUT),  onCompleteAction<AqUsbHal, &onTransmitComplete>  @ 0x1161
+//   RX  → hal[0x20] (bulk IN),   onCompleteAction<AqUsbHal, &onReceiveComplete>   @ 0x1176
+//   ITR → hal[0x30] (intr IN),   onCompleteAction<AqUsbHal, &onItrComplete>       @ 0x118b
+switch (To) {
+    case TX:  pipe = hal[0x28]; action = &onCompleteAction_TX;  break;
+    case RX:  pipe = hal[0x20]; action = &onCompleteAction_RX;  break;
+    case ITR: pipe = hal[0x30]; action = &onCompleteAction_ITR; break;
 }
 
-// Build IOUSBHostCompletion on stack: { owner=hal, action=callback, parameter=context }
-// Submit:
-pipe->vtable[0x258](pipe, memdesc, size, &completion, 0);
+// Build IOUSBHostCompletion on the stack (24 bytes, 3 QWORDs):
+IOUSBHostCompletion completion = {
+    .owner     = hal,      // [+0x00] passed back as arg1 to action
+    .action    = action,   // [+0x08] static fn ptr — the onCompleteAction wrapper
+    .parameter = context,  // [+0x10] caller-supplied context, passed back as arg2
+};
+
+// IOUSBHostPipe::io() copies the completion struct internally — safe to pass stack ptr.
+pipe->vtable[0x258](pipe, memdesc, size, &completion, /*timeout=*/0);
 // vtable[0x258] = IOUSBHostPipe::io(IOMemoryDescriptor*, uint32_t length,
 //                                   IOUSBHostCompletion*, uint32_t timeout)
 ```
 
+#### onCompleteAction wrapper (template instantiation — identical body for all three)
+
+When the USB transfer completes, the framework calls `action(owner, parameter, status, bytes)`.
+The wrapper re-routes this into the driver's object hierarchy:
+
+```c
+// Signature: void onCompleteAction(void* owner, void* parameter, int status, uint32_t bytes)
+// owner = hal (AqUsbHal*), parameter = caller context
+if (hal[0x44] == 0) return;           // not enabled — drop silently
+void* driver = hal[0x00];             // back-pointer to AqPacificDriver*
+// Tail-call the driver-level handler (rdi replaced, rsi/rdx/rcx forwarded as-is):
+AqPacificDriver::on{Itr,Receive,Transmit}Complete(driver, parameter, status, bytes);
+```
+
+The driver-level handler then loads the relevant subsystem object from the driver struct
+(e.g. `driver[0x160]` = Itr*) and tail-calls into it.
+
+Full wiring for ITR as example:
+```
+io() completes
+  → onCompleteAction_ITR(hal, context=itr[0x18], status, bytes)
+      check hal[0x44]; load hal[0x00]=driver*
+      → AqPacificDriver::onItrComplete(driver*, context, status, bytes)
+          load driver[0x160]=Itr*
+          → Itr::onItrComplete(itr*, context, status, bytes)
+              if status != 0: return   // error — drop, no re-post
+              AqUsbHal::onInterruptEvent(itr[0x08], itr[0x18])
+              → performUrb(ITR, itr[0x18], itr[0x20], 8)  // re-post (tail-call)
+```
+
 Callers:
 - `Rx::refill()` — `performUrb(RX, entry, memdesc, 0x10000)`
-- `Itr::start()` — `performUrb(ITR, entry, memdesc, 8)`
-- `Tx::transmit(__mbuf*)` — `performUrb(TX, entry, memdesc, len)`
+- `Itr::start()` — `performUrb(ITR, itr[0x18], itr[0x20], 8)`
+- `Tx::transmit(__mbuf*)` — `performUrb(TX, entry, memdesc, total_len)`
 
 ### AqPacificDriver::enable(IONetworkInterface*)
 
