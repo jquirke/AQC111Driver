@@ -1695,7 +1695,7 @@ IOKit checksum capability flags (IOChecksumFamily / IOChecksumOperation):
 
 Sum: `0x01|0x02|0x04|0x20|0x40 = 0x67`.
 
-Note: ICMP (`kChecksumICMP`) and ICMPv6 are supported by the hardware SFR (`SFR_RXCOE_CTL` bits 3,7) but are **not** advertised here and not verified in software. The kext does not touch ICMP checksum status.
+Note: ICMP (`kChecksumICMP`) and ICMPv6 are supported by the hardware SFR (`SFR_RXCOE_CTL` bits 3,7) but are **not** advertised here and not verified in software. The kext does not touch ICMP checksum status. **DriverKit impl: skip ICMP offload** — ICMP traffic volume is negligible and the original vendor didn't bother; not worth the complexity.
 
 ---
 
