@@ -262,6 +262,63 @@ Standard `IOEthernetController` override — called when interface is brought up
 7. return kIOReturnSuccess
 ```
 
+### TX Output Thread
+
+The kext uses two complementary TX paths, both feeding `Tx::transmit()`:
+
+#### Path 1 — IONetworkingFamily output thread (`outputStart`)
+
+`startOutputThread(interface, 0)` in `enable()` causes IONetworkingFamily to spawn a kernel
+thread that calls `outputStart()` in a drain loop:
+
+```c
+// AqPacificDriver::outputStart(IONetworkInterface*, unsigned int flags)
+if (driver[0x148] == 0)                // link down
+    return kIOReturnNotReady;          //   thread stalls immediately
+
+int rc = Tx::transmit(driver[0x150]); // pull from output queue, build SG, submit URB
+// rc: 0=success/continue, 1=ring full, 2=alloc failed
+if (rc == 0) return 0;                // thread loops and calls outputStart again
+return kIOReturnNotReady;             // ring full or alloc fail — thread stalls
+```
+
+#### Path 2 — IOBasicOutputQueue (`outputPacket`)
+
+`IOBasicOutputQueue` (created in `createOutputQueue()`) calls `outputPacket()` per-packet:
+
+```c
+// AqPacificDriver::outputPacket(__mbuf* mbuf, void* param)
+if (driver[0x148] == 0) { mbuf_freem(mbuf); return 1; }  // link down → drop
+
+int rc = Tx::transmit(driver[0x150], mbuf);
+// rc 0 → return 0        (success)
+// rc 1 → return 0x102    (kIOReturnOutputStall — queue stalls)
+// rc 2 → mbuf_freem(mbuf); return 1  (alloc fail → drop)
+```
+
+#### Stall / unstall cycle
+
+Every `Tx::onComplete()` tail-calls `onUnstallTxQueue()`:
+
+```c
+// AqPacificDriver::onUnstallTxQueue()
+IOOutputQueue* queue = getOutputQueue();   // vtable[0x918]
+if (queue != null) {
+    if (queue->vtable[0x238]() & 2)        // queue is stalled?
+        queue->vtable[0x140](1);           // IOOutputQueue::start() — restart it
+}
+signalOutputThread(driver[0x118]);         // wake the output thread (IONetworkInterface*)
+```
+
+`signalOutputThread()` calls `IONetworkInterface::vtable[0](interface, 0)` to wake the
+stalled output thread so it re-enters `outputStart()`.
+
+#### DriverKit note
+
+NetworkingDriverKit replaces this entire mechanism with `txPacketsAvailable()`. The thread,
+`IOBasicOutputQueue`, stall/unstall, and `signalOutputThread` are all kext-specific. Only
+the `Tx::transmit()` logic needs to be replicated.
+
 ### hwStop
 
 ## Vendor Commands
