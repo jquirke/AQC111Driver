@@ -1171,7 +1171,24 @@ else
 
 ### AqUsbHal::hwStop()
 
-Undocumented detail; issues vendor commands to quiesce the device (stop TX/RX DMA, disable PHY). Full sequence TBD from disassembly.
+```c
+// 1. Read-modify-write register 0x0022: clear bit 8 (TX/link enable)
+uint16_t reg22;
+vendorCmd_read(bRequest=0x01, wValue=0x0022, wIndex=0x0002, data=&reg22, len=2);
+reg22 &= ~0x0100;   // clear bit 8 (byte[1] bit 0)
+vendorCmd_write(bRequest=0x01, wValue=0x0022, wIndex=0x0002, data=&reg22, len=2);
+
+// 2. Withdraw speed advertisements (PHY stops trying to link)
+uint8_t zero = 0;
+phy->advertise(&zero);   // PhyAccess::advertise — vtable[0x20]
+
+// 3. Put PHY into low-power mode
+phy->lowPower(true);     // PhyAccess::lowPower — vtable[0x18]
+```
+
+Register 0x0022 is one of the initialization registers written during `hwStart()`. Bit 8 appears to be a TX/link-enable flag; clearing it quiesces the device-side data path before withdrawing the PHY advertisement.
+
+The `vendorCmd_read`/`vendorCmd_write` here both use `bRequest=0x01` (bulk register access, same as hwSetFilters), not the single-register `bRequest=0x20`/`0x21` form used by `readReg`/`writeReg`.
 
 ### AqPacificDriver::willTerminate(IOService* provider, IOOptionBits options)
 
@@ -1295,7 +1312,7 @@ Functions exported (symbolicated) in the binary. ✅ = documented above. ⬜ = n
 | `AqUsbHal::enable(IONetworkInterface*)` | ✅ |
 | `AqUsbHal::disable(IONetworkInterface*)` | ✅ |
 | `AqUsbHal::hwStart()` | ✅ |
-| `AqUsbHal::hwStop()` | ⬜ detail TBD |
+| `AqUsbHal::hwStop()` | ✅ |
 | `AqUsbHal::hwOnLinkChange(uint8_t)` | ✅ |
 | `AqUsbHal::hwPrepareSleep()` | ⬜ (WoL path, lower priority) |
 | `AqUsbHal::hwFinishSleep()` | ⬜ (WoL path, lower priority) |
