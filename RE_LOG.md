@@ -514,6 +514,132 @@ Size: 0x30 bytes
 
 | Offset | Field |
 |--------|-------|
+| 0x10   | `TxRing*` — pointer to TX ring descriptor (see layout below) |
+| 0x18   | `AqUsbHal*` — back-pointer to HAL, used to call `performUrb()` |
+| 0x20   | `AqPacificDriver*` — back-pointer to driver, used for `dequeueOutputPackets()` |
+
+### TxRing layout
+
+Ring of **32 slots** (0x20, wrap mod 0x20). Each entry is **0x18 bytes** (24 bytes). Preceded by two DWORDs:
+
+| Offset | Field |
+|--------|-------|
+| `ring[0x00]` | DWORD: head index — next slot to free in `onComplete()` |
+| `ring[0x04]` | DWORD: fill index — next slot to use in `transmit()` |
+| `ring[8 + n*0x18 + 0x00]` | pre-allocated DMA/bounce buffer ptr — allocated during `init()`, one 0x4000-byte region per slot |
+| `ring[8 + n*0x18 + 0x08]` | `IOMemoryDescriptor*` — per-frame descriptor, created by `withAddressRanges()` in `transmit()` |
+| `ring[8 + n*0x18 + 0x10]` | `__mbuf*` — mbuf being transmitted; released in `onComplete()` |
+
+`init()` pre-allocates 32 × 0x4000-byte (16 KB) DMA buffers and stores them in entry[0x00]. Confirms TX ring is separate from free-list allocation; entries are recycled in-place.
+
+### Tx::start()
+
+One-liner — returns 1 immediately (no URBs pre-posted; TX is demand-driven).
+
+### Tx::transmit(__mbuf*)
+
+Called from `AqPacificDriver::outputPacket(__mbuf*, void*)` and `AqPacificDriver::outputStart(IONetworkInterface*, unsigned int)`.
+
+```c
+// Return codes (stored in retval throughout):
+//   0 = success / keep sending
+//   1 = no ring space (TX ring full)
+//   2 = IOMemoryDescriptor alloc failed
+
+TxRing* ring = tx[0x10];
+
+// Check available ring space: head - fill + 32 (mod 32)
+uint32_t available = (ring->head - ring->fill + 0x20) % 0x20;
+if (available < 2) return 1;   // ring full
+
+TxEntry* entry = &ring->entries[ring->fill];
+
+// Build scatter-gather list from mbuf chain
+// (stack-local array of { ptr, len } pairs, each 0x10 bytes, max 29 entries)
+uint32_t total_len = 0;
+uint32_t sg_count  = 0;
+bool fits_in_slot  = true;     // r13b
+__mbuf* seg = mbuf;
+while (seg != null) {
+    uintptr_t seg_data = mbuf_data(seg);
+    uint32_t  seg_len  = mbuf_len(seg);
+    if (fits_in_slot) {
+        uint32_t so_far = total_bytes_in_current_slot + seg_len;
+        if (so_far > 0x4000) {        // segment crosses 16 KB slot boundary
+            fits_in_slot = false;     // fall to scatter path
+        }
+    }
+    if (!fits_in_slot) {
+        // append to SG list entry (scatter across pre-alloc slot)
+        sg_list[sg_count] = { seg_data + offset_in_slot, seg_len };
+        total_len += seg_len;
+    } else {
+        if (sg_count >= 0x1d) break;  // max 29 SG entries
+        sg_list[sg_count++] = { seg_data, seg_len };
+        total_len += seg_len;
+    }
+    seg = mbuf_next(seg);
+}
+
+// Build frame header (packet count + some metadata) into entry's DMA buffer slot
+// (RMW of a DWORD in the pre-alloc buffer region; embeds mbuf_pkthdr_len bits)
+
+// Fetch VLAN tag if present
+uint16_t vlan_tag = 0;
+mbuf_get_vlan_tag(mbuf, &vlan_tag_flags, &vlan_tag);
+if (vlan_tag_flags != 0) {
+    entry->dma_buf[3] |= 0x20;        // set VLAN present flag in header
+    entry->dma_buf[6] = vlan_tag & 0x7fff;
+}
+
+// Create IOMemoryDescriptor over the SG list (mbuf data in-place, no copy)
+IOMemoryDescriptor* memdesc = IOMemoryDescriptor::withAddressRanges(sg_list, sg_count, 0, kernel_task);
+if (memdesc == null) {
+    mbuf_freem(mbuf);
+    return 2;
+}
+entry->memdesc = memdesc;
+entry->mbuf    = dequeued_mbuf;
+
+// Map descriptor for DMA
+memdesc->vtable[0x1f0](memdesc, 0);  // prepare()
+
+// Advance fill index (wrap at 32)
+ring->fill = (ring->fill + 1) % 0x20;
+
+// Submit USB bulk OUT URB
+AqUsbHal::performUrb(tx[0x18], To=TX, entry, memdesc, total_len);
+
+// Continue loop while ring has space (ja 0x36b8)
+return 0;
+```
+
+### Tx::onComplete(void* entry)
+
+Called from `AqPacificDriver::onTransmitComplete()` on URB completion.
+
+```c
+// Unmap and release the per-frame IOMemoryDescriptor
+IOMemoryDescriptor* memdesc = entry[0x08];
+memdesc->vtable[0x1f8](memdesc, 0);  // complete() / unmap
+memdesc->vtable[0x28](memdesc);      // release()
+entry[0x08] = null;
+
+// Release the transmitted mbuf
+mbuf_freem(entry[0x10]);
+entry[0x10] = null;
+
+// Advance head (wrap at 32)
+TxRing* ring = tx[0x10];
+ring->head = (ring->head + 1) % 0x20;
+
+// Notify driver that TX queue slot freed — tail-call
+AqPacificDriver::onUnstallTxQueue(tx[0x20]);
+```
+
+### Tx::service(void*)
+
+One-liner — returns immediately (no-op; TX is completion-driven via `onComplete()`).
 
 ## UsbHal Class
 
