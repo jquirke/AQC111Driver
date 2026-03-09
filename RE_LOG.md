@@ -396,6 +396,125 @@ struct DeviceRequest {
 };
 ```
 
+## PhyAccess Classes
+
+Two polymorphic PHY accessor classes selected by firmware major version (hal[0x40]):
+- `firmware_major < 0x80` → `DirectPhyAccess` — direct USB vendor commands to PHY registers
+- `firmware_major >= 0x80` → `FWPhyAccess` — single firmware control struct, firmware mediates PHY
+
+Both are allocated `new(0x14)` (0x14 bytes) in `UsbHal::start()`.
+
+### Vtable layout (identical offsets for both classes)
+
+Object layout (both): `[0x00]` vtable*, `[0x08]` AqUsbHal*, `[0x10..0x13]` FWPhyAccess state (FW only).
+
+| vtable offset | Method | Called from |
+|---------------|--------|-------------|
+| 0x00 | `~PhyAccess()` (non-deleting) | |
+| 0x08 | `~PhyAccess()` (deleting) | |
+| 0x10 | `phyPower(bool on)` | `UsbHal::start()` → `phyPower(true)` (power on PHY after pipe setup) |
+| 0x18 | `lowPower(bool on)` | (power management path, not traced fully) |
+| 0x20 | `advertise(MediumFlags&)` | `AqUsbHal::hwStart()` — configure speed advertisement |
+| 0x28 | `sleep(bool sleep)` | `AqUsbHal::enable()` WoL path → `sleep(false)` (wake from WoL) |
+
+### AqUsbHal::vendorCmd(AqUsbHal*, uint8_t cmd, int dir, uint16_t wValue, uint16_t wIndex, uint16_t wLength, void* data)
+
+Internal helper used by both PhyAccess classes. Builds a `StandardUSB::DeviceRequest` and calls `IOUSBHostInterface::deviceRequest` (vtable[0xa98], timeout=10s):
+
+```c
+bmRequestType = (dir != 0) ? 0xc0 : 0x40;  // IN or OUT | Vendor | Device
+bRequest      = cmd;
+wValue        = wValue;
+wIndex        = wIndex;
+wLength       = wLength;
+```
+
+### DirectPhyAccess
+
+#### phyPower(bool on)
+
+New vendor command `bRequest=0x31` — direct PHY power control:
+
+```c
+uint8_t data = on ? 0x02 : 0x00;
+vendorCmd(hal, /*cmd=*/0x31, /*OUT*/0, /*wValue=*/0, /*wIndex=*/0, /*wLength=*/1, &data);
+if (!on) IOSleep(200);   // 200ms delay on power-down
+```
+
+#### lowPower(bool on)
+
+Read-modify-write Clause 22 PHY register 0x1e (via `readPhyValue`/`writePhyValue`, bRequest=0x32):
+
+```c
+uint16_t val;
+readPhyValue(hal, /*arg1=*/0, /*reg=*/0x1e, &val);
+val = on ? (val | 0x8000) : (val & 0x7fff);  // bit 15 = power-down
+writePhyValue(hal, 0, 0x1e, &val);
+```
+
+#### advertise(MediumFlags&)
+
+Programs Clause 45 PHY registers for multi-rate speed advertisement. All calls via `writePhyValue`/`readPhyValue` (bRequest=0x32, wValue=devad, wIndex=regaddr):
+
+```c
+// MMD device 7 (Auto-Negotiation) registers:
+writePhyValue(hal, /*devad=*/7, /*reg=*/0x0000, {0x2000});  // clear standard AN advert
+writePhyValue(hal, 7, 0xc400, {0x9c53});  // 2.5G/5G BASE-T advertisement bits
+writePhyValue(hal, 7, 0x0020, {0x0181});  // MMD7 extended advertisement
+
+uint16_t val;
+readPhyValue(hal, 7, 0x0010, &val);
+writePhyValue(hal, 7, 0x0010, {val | 0x0c00});  // set additional capability bits
+
+writePhyValue(hal, 7, 0x0000, {0x3200});  // restart auto-negotiation with multi-rate
+
+// MMD device 0x1e (Aquantia vendor-specific) registers:
+writePhyValue(hal, 0x1e, 0xc430, {0x400f});
+writePhyValue(hal, 0x1e, 0xc431, {0x4060});
+writePhyValue(hal, 0x1e, 0xc432, {0x8000});
+```
+
+Register 0x07 = IEEE Clause 45 device 7 (AN MMD); registers 0xc400/0xc431/0xc432 are Aquantia-proprietary extensions for 2.5G/5G advertisement. PHY registers accessed via USB vendor command 0x32 (firmware translates to MDIO).
+
+#### sleep(bool)
+
+No-op — returns `true` immediately. `DirectPhyAccess` does not implement sleep/wake (handled by `phyPower`).
+
+---
+
+### FWPhyAccess
+
+All operations modify a 4-byte control struct at `fw[0x10..0x13]` then send it atomically via a single firmware command:
+
+```c
+// bRequest=0x61, OUT, wValue=0, wIndex=0, wLength=4, data=fw[0x10..0x13]
+vendorCmd(hal, /*cmd=*/0x61, /*OUT*/0, 0, 0, /*len=*/4, &fw[0x10]);
+```
+
+Control struct bit layout (`fw[0x12]`):
+
+| bit | set by |
+|-----|--------|
+| 0   | `advertise()` — from `MediumFlags[0]` bit 4 |
+| 1   | `advertise()` — from `MediumFlags[0]` bit 5 |
+| 2   | `lowPower(bool)` flag |
+| 3   | `phyPower(bool)` flag |
+| 4   | `sleep(bool)` flag |
+| 5   | `advertise()` — always set (`\| 0x20`) |
+
+`fw[0x13]` bits[3:0] = `0x07` (set in `advertise()`); `fw[0x10]` bits[3:0] = `MediumFlags[0] & 0x0f`.
+
+FWPhyAccess persists this struct (`fw[0x10]`) in the object so each call RMWs the relevant bit before sending the full 4 bytes to firmware.
+
+### Vendor commands discovered via PhyAccess
+
+| bRequest | Dir | wValue | wIndex | wLength | Description |
+|----------|-----|--------|--------|---------|-------------|
+| `0x31`   | OUT | `0x0000` | `0x0000` | 1 | `DirectPhyAccess`: PHY power — data `0x02`=on, `0x00`=off |
+| `0x32`   | OUT | devad  | regaddr | 2 | `DirectPhyAccess`: write Clause 45 PHY register |
+| `0x32`   | IN  | devad  | regaddr | 2 | `DirectPhyAccess`: read Clause 45 PHY register |
+| `0x61`   | OUT | `0x0000` | `0x0000` | 4 | `FWPhyAccess`: write 4-byte firmware control struct |
+
 ## IOService vtable (as seen by driver)
 
 | Offset | Symbol |
