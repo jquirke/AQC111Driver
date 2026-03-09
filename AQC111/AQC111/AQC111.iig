@@ -53,16 +53,16 @@ public:
 
     // Deprecated LOCAL pure-virtual overrides (not IPC-dispatched)
     virtual kern_return_t
-    SetMTU(uint32_t mtu) override LOCALONLY;
+    SetMTU(uint32_t mtu) override LOCAL;
 
     virtual kern_return_t
-    GetMaxTransferUnit(uint32_t *mtu) override LOCALONLY;
+    GetMaxTransferUnit(uint32_t *mtu) override LOCAL;
 
     virtual kern_return_t
-    SetHardwareAssists(uint32_t hardwareAssists) override LOCALONLY;
+    SetHardwareAssists(uint32_t hardwareAssists) override LOCAL;
 
     virtual kern_return_t
-    GetHardwareAssists(uint32_t *hardwareAssists) override LOCALONLY;
+    GetHardwareAssists(uint32_t *hardwareAssists) override LOCAL;
 };
 
 #endif /* AQC111_h */
