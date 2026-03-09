@@ -1023,6 +1023,20 @@ Ring of **32 slots** (0x20, wrap mod 0x20). Each entry is **0x18 bytes** (24 byt
 
 `init()` pre-allocates 32 × 0x4000-byte (16 KB) DMA buffers and stores them in entry[0x00]. Confirms TX ring is separate from free-list allocation; entries are recycled in-place.
 
+### TX Packet Descriptor
+
+An 8-byte header prepended to each outgoing packet at the start of the 16 KB DMA buffer, before the payload:
+
+| Bits | Description |
+|------|-------------|
+| 20:0 | Packet byte length (mask `0x1FFFFF`) |
+| 28 | Drop padding — strip pad bytes before transmit |
+| 29 | VLAN tag present — 802.1Q tag in bits 63:48 |
+| 46:32 | MSS — TCP segment size for firmware TSO (15 bits, shift `0x20`) |
+| 63:48 | VLAN tag — 16-bit 802.1Q tag (shift `0x30`) |
+
+The length field covers the payload only. MSS non-zero signals the device to perform TCP segmentation offload in firmware.
+
 ### Tx::start()
 
 One-liner — returns 1 immediately (no URBs pre-posted; TX is demand-driven).
