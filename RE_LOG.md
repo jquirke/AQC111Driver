@@ -1065,3 +1065,272 @@ After processing all entries: `hal[0x4c] = 1` (multicast filter active).
 
 Note: fields 0x44–0x58 appear unaligned — suspected packed USB vendor command/packet structure laid out on-wire. TODO: correlate with AQC111 vendor command spec.
 
+---
+
+## AsyncThreadObject Class
+
+Base class shared by `Rx` and `Tx`. Wraps a kernel `thread_call_t` to allow deferred work items to be scheduled off interrupt context.
+
+Size: 0x10 bytes
+
+| Offset | Field |
+|--------|-------|
+| 0x00   | `vtable*` |
+| 0x08   | `thread_call_t` — allocated in constructor |
+
+### Vtable
+
+| Slot     | Method |
+|----------|--------|
+| vtable[0x10] | `schedule()` |
+| vtable[0x18] | `cancel()` |
+| vtable[0x20] | `run()` → `jmp vtable[0x28]` (abstract dispatch) |
+| vtable[0x28] | `service()` — abstract; overridden by `Rx` and `Tx` |
+
+### Constructor
+
+```c
+// thread_call_allocate_with_options(func, param, pri, flags)
+self[0x08] = thread_call_allocate_with_options(run_fn, self, 0, 1);
+```
+
+`run_fn` is a static trampoline: `AsyncThreadObject::run(thread_call_param_t param0, thread_call_param_t param1)` — ignores both params, casts `param0` back to `AsyncThreadObject*` and tail-calls `vtable[0x28]` (`service()`).
+
+### schedule()
+
+```c
+thread_call_enter(self[0x08]);
+```
+
+Called from `Rx::onRxComplete()` (completion callback, interrupt context) to defer `Rx::service()` onto a kernel thread.
+
+Also called from `Tx::onComplete()` indirectly via `onUnstallTxQueue()`.
+
+### cancel()
+
+```c
+thread_call_cancel(self[0x08]);
+```
+
+Called during teardown (`Rx::stop()`, `Tx::stop()`).
+
+### Abort detection in completion callbacks
+
+Before calling `schedule()`, completion callbacks check the URB status:
+```c
+if (status == 0xe00002eb)   // kIOReturnAborted
+    return;                 // do not reschedule; teardown in progress
+```
+
+### DriverKit note
+
+DriverKit has dispatch queues (`IODispatchQueue`) — `AsyncThreadObject` is **not** needed. Rx/Tx completion blocks run on the driver's dispatch queue by default. Use `ivars->queue->DispatchAsync(^{ ... })` to defer work if needed.
+
+---
+
+## Teardown Chain
+
+Teardown is triggered by USB device removal or OS shutdown. The call sequence is:
+
+```
+disable() → willTerminate() → didTerminate() → stop()
+```
+
+### AqPacificDriver::disable(IONetworkInterface*)
+
+```c
+// 1. Stop output queue (no more outputPacket calls)
+IOOutputQueue* q = getOutputQueue();
+q->vtable[0x130](q);        // IOOutputQueue::stop()
+
+// 2. Stop output thread
+stopOutputThread(interface, 0);
+
+// 3. Abort interrupt pipe (prevents new status callbacks)
+Itr::stop(driver[0x160]);   // → abortUrb(ITR=2)
+driver[0x148] = 0;          // clear Itr active flag
+
+// 4. Stop RX (abort bulk IN pipe)
+Rx::stop(driver[0x158]);    // → abortUrb(RX=1); ring->head = 0
+
+// 5. Disable HAL (stop hardware, mark disabled)
+AqUsbHal::disable(driver[0x120], interface);
+```
+
+### AqUsbHal::disable(IONetworkInterface*)
+
+```c
+hal[0x44] = 0;   // clear enabled flag
+hal[0x43] = 0;   // clear last ItrData[1] (link speed cache)
+
+if (wol_active)
+    hwPrepareSleep();   // WoL path — configure wake filters
+else
+    hwStop();           // normal path
+```
+
+### AqUsbHal::hwStop()
+
+Undocumented detail; issues vendor commands to quiesce the device (stop TX/RX DMA, disable PHY). Full sequence TBD from disassembly.
+
+### AqPacificDriver::willTerminate(IOService* provider, IOOptionBits options)
+
+```c
+// Abort pending RX and interrupt URBs so they don't fire after provider gone
+Rx::stop(driver[0x158]);    // abortUrb(RX=1)
+abortUrb(ITR=2);            // abort interrupt pipe directly
+
+// Tail-call super
+super::willTerminate(provider, options);   // [vtable dispatch]
+```
+
+### AqPacificDriver::didTerminate(IOService* provider, IOOptionBits options, bool* defer)
+
+```c
+AqUsbHal::stop(driver[0x120]);
+*defer = false;   // (implicit — returns true/kIOReturnSuccess)
+```
+
+### AqPacificDriver::stop(IOService* provider)
+
+```c
+Tx::stop(driver[0x150]);         // release all TxRing memdesc + mbuf
+AqUsbHal::stop(driver[0x120]);   // release pipes, close interface, destroy PhyAccess
+detachInterface(driver[0x118], false);
+super::stop(provider);           // [tail call via vtable]
+```
+
+### AqUsbHal::stop()
+
+```c
+if (!hal[0x4b]) {        // not reconfigured
+    phy->phyPower(false); // power down PHY
+}
+delete hal[0x38];        // destroy PhyAccess object (DirectPhyAccess or FWPhyAccess)
+hal[0x38] = nullptr;
+
+// Release the three pipes (vtable[0x28] = release/retain/free)
+if (hal[0x20]) { hal[0x20]->vtable[0x28](hal[0x20]); hal[0x20] = nullptr; }  // RX bulk IN
+if (hal[0x28]) { hal[0x28]->vtable[0x28](hal[0x28]); hal[0x28] = nullptr; }  // TX bulk OUT
+if (hal[0x30]) { hal[0x30]->vtable[0x28](hal[0x30]); hal[0x30] = nullptr; }  // ITR interrupt IN
+
+// Close the USB interface
+hal[0x08]->vtable[0x5d8](hal[0x08]);   // IOUSBHostInterface::close()
+```
+
+### AqUsbHal::abortUrb(To direction)
+
+```c
+// direction: 1=RX (bulk IN), 2=ITR (interrupt IN), 3=TX (bulk OUT)
+IOUSBHostPipe* pipe = (direction == 1) ? hal[0x20]
+                    : (direction == 2) ? hal[0x30]
+                    :                    hal[0x28];
+
+if (pipe == nullptr) return;
+
+// IOUSBHostPipe::abort(IOUSBHostPipe*, uint32_t options, IOReturn withError, uint32_t forEndpointVariant)
+pipe->vtable[0x178](pipe, 0, 0xe00002eb /*kIOReturnAborted*/, 0);
+```
+
+Aborting causes all outstanding URBs on that pipe to complete with `kIOReturnAborted`. Completion callbacks detect this and skip rescheduling (see AsyncThreadObject abort detection above).
+
+### Itr::stop()
+
+```c
+abortUrb(ITR=2);
+```
+
+One-liner. The ITR pipe abort causes the pending interrupt IN URB to complete with `kIOReturnAborted`; `onItrComplete` detects and returns without resubmitting.
+
+### Rx::stop()
+
+```c
+abortUrb(RX=1);
+ring->head = 0;   // reset ring head pointer
+```
+
+Outstanding bulk IN URBs complete with `kIOReturnAborted`; `onRxComplete` detects abort status and does not call `schedule()`.
+
+### Tx::stop()
+
+```c
+// Walk all 32 ring slots, release any in-flight resources
+TxRing* ring = tx[0x10];
+for (int i = 0; i < 0x20; i++) {
+    TxRingEntry* entry = &ring->entries[i];
+    if (entry->memdesc != nullptr) {
+        entry->memdesc->complete();
+        entry->memdesc->release();
+        entry->memdesc = nullptr;
+    }
+    if (entry->mbuf != nullptr) {
+        freePacket(entry->mbuf);
+        entry->mbuf = nullptr;
+    }
+}
+```
+
+Note: `abortUrb(TX)` is NOT called in `Tx::stop()` directly — TX URBs are aborted implicitly when the pipe is released in `AqUsbHal::stop()`.
+
+---
+
+## Exported Functions — Coverage Status
+
+Functions exported (symbolicated) in the binary. ✅ = documented above. ⬜ = not yet documented.
+
+| Symbol | Status |
+|--------|--------|
+| `AqPacificDriver::start(IOService*)` | ✅ |
+| `AqPacificDriver::stop(IOService*)` | ✅ |
+| `AqPacificDriver::disable(IONetworkInterface*)` | ✅ |
+| `AqPacificDriver::willTerminate(IOService*, uint)` | ✅ |
+| `AqPacificDriver::didTerminate(IOService*, uint, bool*)` | ✅ |
+| `AqPacificDriver::enable(IONetworkInterface*)` | ✅ |
+| `AqPacificDriver::outputStart(IONetworkInterface*, uint)` | ✅ |
+| `AqPacificDriver::outputPacket(mbuf_t, void*)` | ✅ (brief) |
+| `AqPacificDriver::onLinkStatusChanged(...)` | ✅ |
+| `AqPacificDriver::onUnstallTxQueue(AqPacificDriver*)` | ✅ |
+| `AqUsbHal::start(IOService*)` | ✅ |
+| `AqUsbHal::stop()` | ✅ |
+| `AqUsbHal::enable(IONetworkInterface*)` | ✅ |
+| `AqUsbHal::disable(IONetworkInterface*)` | ✅ |
+| `AqUsbHal::hwStart()` | ✅ |
+| `AqUsbHal::hwStop()` | ⬜ detail TBD |
+| `AqUsbHal::hwOnLinkChange(uint8_t)` | ✅ |
+| `AqUsbHal::hwPrepareSleep()` | ⬜ (WoL path, lower priority) |
+| `AqUsbHal::hwFinishSleep()` | ⬜ (WoL path, lower priority) |
+| `AqUsbHal::hwSetFilters()` | ⬜ (writes multicast/promisc registers) |
+| `AqUsbHal::findEnpoints()` | ✅ |
+| `AqUsbHal::abortUrb(To)` | ✅ |
+| `AqUsbHal::onInterruptEvent(...)` | ✅ |
+| `AqUsbHal::performUrb(...)` | ✅ |
+| `AqUsbHal::vendorCmd(...)` | ✅ |
+| `AqUsbHal::readReg(uint16_t)` | ✅ |
+| `AqUsbHal::writeReg(uint16_t, uint16_t)` | ✅ |
+| `Tx::start()` | ✅ |
+| `Tx::stop()` | ✅ |
+| `Tx::transmit(mbuf_t)` | ✅ |
+| `Tx::onComplete(...)` | ✅ |
+| `Tx::service(void*)` | ✅ |
+| `Rx::start()` | ✅ |
+| `Rx::stop()` | ✅ |
+| `Rx::service(void*)` | ✅ |
+| `Rx::onRxComplete(...)` | ✅ |
+| `Itr::start()` | ✅ |
+| `Itr::stop()` | ✅ |
+| `Itr::onItrComplete(...)` | ✅ |
+| `DirectPhyAccess::phyPower(bool)` | ✅ |
+| `DirectPhyAccess::lowPower(bool)` | ✅ |
+| `DirectPhyAccess::advertise(uint8_t*)` | ✅ |
+| `DirectPhyAccess::sleep(bool)` | ✅ |
+| `FWPhyAccess::phyPower(bool)` | ✅ |
+| `FWPhyAccess::lowPower(bool)` | ✅ |
+| `FWPhyAccess::advertise(uint8_t*)` | ✅ |
+| `FWPhyAccess::sleep(bool)` | ✅ |
+| `AqPacificDriver::selectMedium(IONetworkMedium const*)` | ⬜ |
+| `AqPacificDriver::setPromiscuousMode(bool)` | ⬜ |
+| `AqPacificDriver::setMulticastMode(bool)` | ⬜ |
+| `AqPacificDriver::setMulticastList(IOEthernetAddress*, uint32_t)` | ⬜ |
+| `AqPacificDriver::setWakeOnMagicPacket(bool)` | ⬜ |
+| `AqPacificDriver::setMaxPacketSize(uint32_t)` | ⬜ |
+
