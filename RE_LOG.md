@@ -1327,10 +1327,135 @@ Functions exported (symbolicated) in the binary. ✅ = documented above. ⬜ = n
 | `FWPhyAccess::lowPower(bool)` | ✅ |
 | `FWPhyAccess::advertise(uint8_t*)` | ✅ |
 | `FWPhyAccess::sleep(bool)` | ✅ |
-| `AqPacificDriver::selectMedium(IONetworkMedium const*)` | ⬜ |
-| `AqPacificDriver::setPromiscuousMode(bool)` | ⬜ |
-| `AqPacificDriver::setMulticastMode(bool)` | ⬜ |
-| `AqPacificDriver::setMulticastList(IOEthernetAddress*, uint32_t)` | ⬜ |
-| `AqPacificDriver::setWakeOnMagicPacket(bool)` | ⬜ |
-| `AqPacificDriver::setMaxPacketSize(uint32_t)` | ⬜ |
+| `AqPacificDriver::selectMedium(IONetworkMedium const*)` | ✅ |
+| `AqPacificDriver::setPromiscuousMode(bool)` | ✅ |
+| `AqPacificDriver::setMulticastMode(bool)` | ✅ |
+| `AqPacificDriver::setMulticastList(IOEthernetAddress*, uint32_t)` | ✅ |
+| `AqPacificDriver::setWakeOnMagicPacket(bool)` | ✅ |
+| `AqPacificDriver::setMaxPacketSize(uint32_t)` | ✅ |
+
+---
+
+## RX Filter, Multicast, and Medium Selection
+
+### AqPacificDriver — driver-level stubs
+
+All five methods are single-line stubs: load `driver[0x120]` (HAL pointer) into `rdi`, forward the same argument, tail-call the HAL method, return 0.
+
+```c
+AqPacificDriver::setMulticastMode(bool on)     → AqUsbHal::setMulticast(on)
+AqPacificDriver::setPromiscuousMode(bool on)   → AqUsbHal::setPromiscuous(on)
+AqPacificDriver::setMulticastList(addr, count) → AqUsbHal::setMulticastList(addr, count)
+AqPacificDriver::setWakeOnMagicPacket(bool on) → AqUsbHal::setWakeOnMagicPacket(on)
+AqPacificDriver::setMaxPacketSize(uint32_t n)  → AqUsbHal::setMtu(n)
+```
+
+`selectMedium` does slightly more (see below).
+
+### AqUsbHal::setMulticast(bool on)
+
+```c
+hal[0x4c] = on;   // multicast filter active flag
+hwSetFilters();
+```
+
+### AqUsbHal::setPromiscuous(bool on)
+
+```c
+hal[0x4d] = on;   // promiscuous mode flag
+hwSetFilters();
+```
+
+### AqUsbHal::setWakeOnMagicPacket(bool on)
+
+```c
+hal[0x57] = on;   // WoL flag — stored but NOT forwarded to hwSetFilters here;
+                  // used by hwPrepareSleep() when suspending
+```
+
+### AqUsbHal::setMtu(uint32_t n)
+
+```c
+hal[0x5c] = n - 4;   // store MTU minus 4 (strips FCS from IOKit-provided value)
+onMtuChanged();       // sends MTU to device
+```
+
+### AqUsbHal::setMulticastList(IOEthernetAddress* list, uint32_t count)
+
+```c
+if (count > 0x40) {
+    // Too many entries for hash filter — switch to all-multicast
+    hal[0x56] = 1;    // all-multicast flag
+    hal[0x4c] = 0;    // disable hash filter
+    memset(hal[0x4e], 0, 8);  // clear hash table
+} else {
+    // Compute CRC32 per address, accumulate 64-bit hash table
+    // (same algorithm as Multicast Hash Filter Algorithm section above)
+    hal[0x4c] = 1;    // hash filter active
+}
+hwSetFilters();
+```
+
+### AqUsbHal::hwSetFilters()
+
+Called after any filter state change. Guards on `hal[0x43] != 0` (device link active); returns immediately if the device is not yet linked.
+
+```c
+if (hal[0x43] == 0) return;   // no link yet — skip
+
+// Build the 2-byte RX filter mode word
+uint16_t filter = 0x0288;     // default: unicast + broadcast + directed multicast
+
+if (hal[0x4c]) {
+    // Hash multicast filter enabled — upload 8-byte hash table first
+    filter = 0x0298;           // bit[4] set = hash filter enable
+    vendorCmd(bRequest=0x01, wValue=0x0016, wIndex=0x0008,
+              data=&hal[0x4e], len=8);   // write multicast hash table
+}
+if (hal[0x4d]) filter |= 0x01;   // bit[0] = promiscuous
+if (hal[0x56]) filter |= 0x02;   // bit[1] = all-multicast
+
+// Write RX filter mode register
+vendorCmd(bRequest=0x01, wValue=0x000b, wIndex=0x0020,
+          data=&filter, len=2);
+```
+
+Filter mode bits (register at wValue=0x000b):
+| Bit | Meaning |
+|-----|---------|
+| 0   | Promiscuous mode |
+| 1   | All-multicast (receive all multicast frames) |
+| 4   | Multicast hash filter enable (use 64-bit hash table at wValue=0x0016) |
+
+Vendor command bRequest=0x01 is a bulk register write (distinct from bRequest=0x21 single-register write).
+
+Also called from `hwOnLinkChange()` after link-up, to re-apply filter state on each link event.
+
+### AqPacificDriver::selectMedium(IONetworkMedium const* medium)
+
+```c
+if (medium != nullptr) {
+    // Retrieve the medium's type/flags (vtable[0x130] on IONetworkMedium)
+    uint32_t flags = medium->getMediumFlags();
+    // Update HAL speed advertisement
+    AqUsbHal::setLinkSpeed(hal, &flags);
+}
+// Always update the current medium (regardless of null)
+IONetworkController::setCurrentMedium(this, medium);   // vtable[0x978]
+return kIOReturnSuccess;
+```
+
+### AqUsbHal::setLinkSpeed(MediumFlags* flags)
+
+```c
+hal[0x58] = *flags;   // update MediumFlags byte
+
+if (hal[0x44] == 0) return;   // not yet enabled — skip advertise
+                               // (speeds will be advertised at hwStart time)
+
+// Re-advertise if already enabled
+phy->advertise(&hal[0x58]);   // PhyAccess::advertise — vtable[0x20]
+```
+
+This allows runtime speed changes (e.g., user forces 1G in Network preferences) to take effect immediately without a full restart.
 
