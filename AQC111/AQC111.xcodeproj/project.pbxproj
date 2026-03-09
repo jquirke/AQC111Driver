@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		9BB87CA92F5D383C000790E9 /* DriverKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9BB87CA82F5D383C000790E9 /* DriverKit.framework */; };
 		9BB87CB72F5D394E000790E9 /* USBDriverKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9BB87CB62F5D394E000790E9 /* USBDriverKit.framework */; };
+		9BB87CC02F5D400000000001 /* NetworkingDriverKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9BB87CBF2F5D400000000001 /* NetworkingDriverKit.framework */; };
 		9BC0AABE2F5D8B0000DF0450 /* au.com.jquirke.AQC111Driver.dext in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = 9BB87CA52F5D383C000790E9 /* au.com.jquirke.AQC111Driver.dext */; settings = {ATTRIBUTES = (); }; };
 /* End PBXBuildFile section */
 
@@ -40,6 +41,7 @@
 		9BB87CA52F5D383C000790E9 /* au.com.jquirke.AQC111Driver.dext */ = {isa = PBXFileReference; explicitFileType = "wrapper.driver-extension"; includeInIndex = 0; path = au.com.jquirke.AQC111Driver.dext; sourceTree = BUILT_PRODUCTS_DIR; };
 		9BB87CA82F5D383C000790E9 /* DriverKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = DriverKit.framework; path = Library/Frameworks/DriverKit.framework; sourceTree = DEVELOPER_DIR; };
 		9BB87CB62F5D394E000790E9 /* USBDriverKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = USBDriverKit.framework; path = System/DriverKit/System/Library/Frameworks/USBDriverKit.framework; sourceTree = SDKROOT; };
+		9BB87CBF2F5D400000000001 /* NetworkingDriverKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkingDriverKit.framework; path = System/DriverKit/System/Library/Frameworks/NetworkingDriverKit.framework; sourceTree = SDKROOT; };
 		9BC0AA8C2F5D892600DF0450 /* AQC111Loader.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AQC111Loader.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -85,6 +87,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				9BB87CB72F5D394E000790E9 /* USBDriverKit.framework in Frameworks */,
+				9BB87CC02F5D400000000001 /* NetworkingDriverKit.framework in Frameworks */,
 				9BB87CA92F5D383C000790E9 /* DriverKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -122,6 +125,7 @@
 			isa = PBXGroup;
 			children = (
 				9BB87CB62F5D394E000790E9 /* USBDriverKit.framework */,
+				9BB87CBF2F5D400000000001 /* NetworkingDriverKit.framework */,
 				9BB87CA82F5D383C000790E9 /* DriverKit.framework */,
 			);
 			name = Frameworks;
