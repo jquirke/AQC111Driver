@@ -219,30 +219,30 @@ IMPL(AQC111, SetWakeOnMagicPacketEnable)
 }
 
 // ---------------------------------------------------------------------------
-// Deprecated pure-virtual stubs — LOCAL (direct C++ override, not IPC)
+// Deprecated pure-virtual stubs — LOCAL
 // ---------------------------------------------------------------------------
 
 kern_return_t
-AQC111::SetMTU(uint32_t mtu)
+IMPL(AQC111, SetMTU)
 {
     return kIOReturnSuccess;
 }
 
 kern_return_t
-AQC111::GetMaxTransferUnit(uint32_t *mtu)
+IMPL(AQC111, GetMaxTransferUnit)
 {
     *mtu = 1500;
     return kIOReturnSuccess;
 }
 
 kern_return_t
-AQC111::SetHardwareAssists(uint32_t hardwareAssists)
+IMPL(AQC111, SetHardwareAssists)
 {
     return kIOReturnSuccess;
 }
 
 kern_return_t
-AQC111::GetHardwareAssists(uint32_t *hardwareAssists)
+IMPL(AQC111, GetHardwareAssists)
 {
     *hardwareAssists = 0;
     return kIOReturnSuccess;
