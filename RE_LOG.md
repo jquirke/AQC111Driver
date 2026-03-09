@@ -880,20 +880,30 @@ Programs hardware registers for the new link speed. Only entered when `data[1] <
 
 Register write sequence on link-up (via `IOUSBHostInterface::deviceRequest`, vtable[0xa98], timeout=10s):
 
-| Register | Bytes | Notes |
-|----------|-------|-------|
-| `0x000d` | 1     | `0x05` if speed_mbps==5000 (`0x1388`), else `0x00` |
-| `0x00b2` | 3     | speed-dependent 3-byte PHY config |
-| `0x002e` | 5     | 5-byte PHY config: byte[0]=`0xa0` (100M) or `0xff` (other), byte[1]=`0x1f`, byte[2]=`0x00`, byte[3]=`0xff`; 100M variant sets [4]=`0x4fb` |
-| `0x000b` | 2     | written to `0x0000` (reset?) |
-| `0x00b7` | 1     | written to `1` |
-| `0x00b9` | 1     | written to `2` |
-| `0x0022` | 2     | MTU/link-enable register (RMW — see Vendor Commands) |
-| `0x0022` | 2     | second write to same register |
-| `0x002b` | 1     | written to `0x10` |
-| `0x0046` | 1     | speed-dependent |
-| `0x009e` | 1     | speed-dependent |
-| `0x000b` | 2     | second write |
+| Register | Name | Bytes | Notes |
+|----------|------|-------|-------|
+| `0x000d` | `SFR_INTER_PACKET_GAP_0` | 1 | `0x05` if 5G, else `0x00` |
+| `0x00b2` | `SFR_TX_PAUSE_RESEND_T` | 3 | speed-dependent 3-byte value |
+| `0x002e`–`0x0032` | `SFR_RX_BULKIN_QCTRL`… | 5 | RX coalescing config (see table below) |
+| `0x000b` | `SFR_RX_CTL` | 2 | written to `0x0000` (`SFR_RX_CTL_STOP`) |
+| `0x00b7` | `SFR_ETH_MAC_PATH` | 1 | written to `1` (`SFR_RX_PATH_READY`) |
+| `0x00b9` | `SFR_BULK_OUT_CTRL` | 1 | written to `2` (`SFR_BULK_OUT_EFF_EN`) |
+| `0x0022` | `SFR_MEDIUM_STATUS_MODE` | 2 | RMW — set speed/duplex/flow-control/jumbo bits |
+| `0x0022` | `SFR_MEDIUM_STATUS_MODE` | 2 | second write — set `SFR_MEDIUM_RECEIVE_EN` |
+| `0x002b` | `SFR_VLAN_ID_CONTROL` | 1 | written to `0x10` (`SFR_VLAN_CONTROL_VSO`) |
+| `0x0046` | `SFR_BMTX_DMA_CONTROL` | 1 | speed-dependent |
+| `0x009e` | `SFR_ARC_CTRL` | 1 | speed-dependent |
+| `0x000b` | `SFR_RX_CTL` | 2 | second write — re-enable RX with filter bits |
+
+**RX bulk-in coalescing configuration** (written to `SFR_RX_BULKIN_QCTRL`..`SFR_RX_BULKIN_QIFG`, 5 bytes):
+
+| Profile | ctrl | timer_l | timer_h | size | ifg | Used for |
+|---------|------|---------|---------|------|-----|----------|
+| High speed | `0x07` | `0x00` | `0x01` | `0x1E` | `0xFF` | 5G / 2.5G / 1G |
+| 100M | `0x07` | `0xA0` | `0x00` | `0x14` | `0x00` | 100 Mbps |
+| Jumbo | `0x07` | `0x00` | `0x01` | `0x18` | `0xFF` | Jumbo MTU |
+
+`ctrl=0x07` = `SFR_RX_BULKIN_QCTRL_TIME | SFR_RX_BULKIN_QCTRL_IFG | SFR_RX_BULKIN_QCTRL_SIZE` (all coalescing modes active). Timer is 16-bit LE across `QTIMR_LOW`/`QTIMR_HIGH`. High-speed profile uses a longer timer (0x0100) and larger size threshold (30 frames) vs 100M (shorter timer 0x00A0, 20 frames, no IFG coalescing).
 
 ### AqPacificDriver::onLinkStatusChanged(AqPacificDriver* drv, uint32_t link_medium_idx, bool up)
 
