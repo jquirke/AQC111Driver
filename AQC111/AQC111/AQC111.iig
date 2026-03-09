@@ -50,6 +50,19 @@ public:
 
     virtual kern_return_t
     SetWakeOnMagicPacketEnable(bool enable) override;
+
+    // Deprecated LOCAL pure-virtual overrides (not IPC-dispatched)
+    virtual kern_return_t
+    SetMTU(uint32_t mtu) override LOCALONLY;
+
+    virtual kern_return_t
+    GetMaxTransferUnit(uint32_t *mtu) override LOCALONLY;
+
+    virtual kern_return_t
+    SetHardwareAssists(uint32_t hardwareAssists) override LOCALONLY;
+
+    virtual kern_return_t
+    GetHardwareAssists(uint32_t *hardwareAssists) override LOCALONLY;
 };
 
 #endif /* AQC111_h */
