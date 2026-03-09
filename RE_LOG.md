@@ -325,43 +325,112 @@ the `Tx::transmit()` logic needs to be replicated.
 
 ### Named Constants
 
-```c
-// bRequest values
-#define AQ_ACCESS_MAC        0x01   // MAC register read/write (bulk, multi-byte)
-#define AQ_FLASH_PARAMETERS  0x20   // Read flash/EEPROM parameters (MAC address)
-#define AQ_PHY_POWER         0x31   // Direct PHY power control (DirectPhyAccess only)
-#define AQ_WOL_CFG           0x60   // Wake-on-LAN configuration
-#define AQ_PHY_OPS           0x61   // Firmware-mediated PHY operations (FWPhyAccess only)
+**bRequest values:**
 
-// AQ_ACCESS_MAC register addresses (wValue)
-#define AQ_FW_VER_MAJOR      0xDA   // Firmware version major byte
-#define AQ_FW_VER_MINOR      0xDB   // Firmware version minor byte
-#define AQ_FW_VER_REV        0xDC   // Firmware version revision byte
+| Name | Value | Description |
+|------|-------|-------------|
+| `AQ_ACCESS_MAC` | `0x01` | MAC register read/write (bulk, multi-byte) |
+| `AQ_FLASH_PARAMETERS` | `0x20` | Read flash/EEPROM parameters (MAC address) |
+| `AQ_PHY_POWER` | `0x31` | Direct PHY power control (DirectPhyAccess only) |
+| `AQ_WOL_CFG` | `0x60` | Wake-on-LAN configuration |
+| `AQ_PHY_OPS` | `0x61` | Firmware-mediated PHY operations (FWPhyAccess only) |
 
-// MediumFlags — 32-bit bitmask stored at hal[0x58]; sent verbatim as AQ_PHY_OPS payload
-#define AQ_ADV_100M          BIT(0)
-#define AQ_ADV_1G            BIT(1)
-#define AQ_ADV_2G5           BIT(2)
-#define AQ_ADV_5G            BIT(3)
-#define AQ_ADV_MASK          0x0F
+**AQ_ACCESS_MAC register addresses (wValue):**
 
-#define AQ_PAUSE             BIT(16)
-#define AQ_ASYM_PAUSE        BIT(17)
-#define AQ_LOW_POWER         BIT(18)   // FWPhyAccess fw[0x12] bit 2
-#define AQ_PHY_POWER_EN      BIT(19)   // FWPhyAccess fw[0x12] bit 3
-#define AQ_WOL               BIT(20)   // FWPhyAccess fw[0x12] bit 4
-#define AQ_DOWNSHIFT         BIT(21)   // FWPhyAccess fw[0x12] bit 5
+| Name | Value | Description |
+|------|-------|-------------|
+| `AQ_FW_VER_MAJOR` | `0xDA` | Firmware version major byte |
+| `AQ_FW_VER_MINOR` | `0xDB` | Firmware version minor byte |
+| `AQ_FW_VER_REV` | `0xDC` | Firmware version revision byte |
 
-#define AQ_DSH_RETRIES_SHIFT 0x18      // downshift retry count field shift (bits 24-27)
-#define AQ_DSH_RETRIES_MASK  0xF000000
+**MediumFlags — 32-bit bitmask at hal[0x58]; sent verbatim as AQ_PHY_OPS payload:**
 
-// WoL flags (used with AQ_WOL_CFG)
-#define AQ_WOL_FLAG_MP       0x2       // magic packet
-```
+| Name | Bit | fw byte/bit | Description |
+|------|-----|-------------|-------------|
+| `AQ_ADV_100M` | 0 | fw[0x10].0 | Advertise 100 Mbps |
+| `AQ_ADV_1G` | 1 | fw[0x10].1 | Advertise 1 Gbps |
+| `AQ_ADV_2G5` | 2 | fw[0x10].2 | Advertise 2.5 Gbps |
+| `AQ_ADV_5G` | 3 | fw[0x10].3 | Advertise 5 Gbps |
+| `AQ_ADV_MASK` | 0x0F | — | Speed advertisement mask |
+| `AQ_PAUSE` | 16 | fw[0x12].0 | Pause frame support |
+| `AQ_ASYM_PAUSE` | 17 | fw[0x12].1 | Asymmetric pause |
+| `AQ_LOW_POWER` | 18 | fw[0x12].2 | Low-power mode |
+| `AQ_PHY_POWER_EN` | 19 | fw[0x12].3 | PHY power enable |
+| `AQ_WOL` | 20 | fw[0x12].4 | Wake-on-LAN |
+| `AQ_DOWNSHIFT` | 21 | fw[0x12].5 | Speed downshift enable |
+| `AQ_DSH_RETRIES` | 24–27 | fw[0x13].0–3 | Downshift retry count (shift=0x18, mask=0xF000000) |
+
+**WoL flags (AQ_WOL_CFG):** `AQ_WOL_FLAG_MP = 0x2` (magic packet)
 
 `0x21` and `0x32` appear in the binary but lack confirmed names:
 - `0x21` — write flash/EEPROM parameter (write counterpart to `AQ_FLASH_PARAMETERS`)
 - `0x32` — Clause 45 MDIO read/write (used by `DirectPhyAccess` for PHY register access)
+
+### MAC Register Map (AQ_ACCESS_MAC wValue addresses)
+
+| Addr | Name | Bits / values | Description |
+|------|------|---------------|-------------|
+| `0x03` | `SFR_GENERAL_STATUS` | — | General device status |
+| `0x05` | `SFR_CHIP_STATUS` | — | Chip status |
+| `0x0B` | `SFR_RX_CTL` | see below | RX control / packet filter |
+| `0x0D` | `SFR_INTER_PACKET_GAP_0` | — | Inter-packet gap |
+| `0x10` | `SFR_NODE_ID` | 6 bytes | MAC address |
+| `0x16` | `SFR_MULTI_FILTER_ARRY` | 8 bytes | 64-bit multicast hash table |
+| `0x22` | `SFR_MEDIUM_STATUS_MODE` | see below | Medium / link mode control |
+| `0x24` | `SFR_MONITOR_MODE` | see below | PHY / WoL monitor control |
+| `0x26` | `SFR_PHYPWR_RSTCTL` | `0x0010`=BZ, `0x0020`=IPRL | PHY power / reset control |
+| `0x2A` | `SFR_VLAN_ID_ADDRESS` | — | VLAN ID address |
+| `0x2B` | `SFR_VLAN_ID_CONTROL` | `0x01`=WE, `0x02`=RD, `0x10`=VSO, `0x20`=VFE | VLAN control |
+| `0x2C` | `SFR_VLAN_ID_DATA0` | — | VLAN data low |
+| `0x2D` | `SFR_VLAN_ID_DATA1` | — | VLAN data high |
+| `0x2E` | `SFR_RX_BULKIN_QCTRL` | `0x01`=TIME, `0x02`=IFG, `0x04`=SIZE | Bulk-in queue coalescing control |
+| `0x2F` | `SFR_RX_BULKIN_QTIMR_LOW` | — | Queue timer low |
+| `0x30` | `SFR_RX_BULKIN_QTIMR_HIGH` | — | Queue timer high |
+| `0x31` | `SFR_RX_BULKIN_QSIZE` | — | Queue size threshold |
+| `0x32` | `SFR_RX_BULKIN_QIFG` | — | Queue inter-frame gap |
+| `0x34` | `SFR_RXCOE_CTL` | `IP`/`TCP`/`UDP`/`ICMP`/`IGMP`/`TCPv6`/`UDPv6`/`ICMPv6` (bits 0–7) | RX checksum offload control |
+| `0x35` | `SFR_TXCOE_CTL` | same bit layout as RXCOE | TX checksum offload control |
+| `0x41` | `SFR_BM_INT_MASK` | write `0xFF` to unmask all | Burst-mode interrupt mask |
+| `0x43` | `SFR_BMRX_DMA_CONTROL` | `0x80`=EN | Burst-mode RX DMA control |
+| `0x46` | `SFR_BMTX_DMA_CONTROL` | — | Burst-mode TX DMA control |
+| `0x54` | `SFR_PAUSE_WATERLVL_LOW` | — | Pause watermark low |
+| `0x55` | `SFR_PAUSE_WATERLVL_HIGH` | — | Pause watermark high |
+| `0x9E` | `SFR_ARC_CTRL` | — | ARC control |
+| `0xB1` | `SFR_SWP_CTRL` | — | Switch/swap control |
+| `0xB2` | `SFR_TX_PAUSE_RESEND_T` | — | TX pause resend timer |
+| `0xB7` | `SFR_ETH_MAC_PATH` | `0x01`=RX_PATH_READY | Ethernet MAC path status |
+| `0xB9` | `SFR_BULK_OUT_CTRL` | `0x01`=FLUSH_EN, `0x02`=EFF_EN | Bulk-out control |
+
+**SFR_RX_CTL (0x0B) bits:**
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `0x0000` | `SFR_RX_CTL_STOP` | Stop RX engine |
+| `0x0001` | `SFR_RX_CTL_PRO` | Promiscuous mode |
+| `0x0002` | `SFR_RX_CTL_AMALL` | Accept all multicast |
+| `0x0008` | `SFR_RX_CTL_AB` | Accept broadcast |
+| `0x0010` | `SFR_RX_CTL_AM` | Multicast hash filter enable |
+| `0x0020` | `SFR_RX_CTL_AP` | Accept all packets |
+| `0x0040` | `SFR_RX_CTL_RF_WAK` | Remote wake filter |
+| `0x0080` | `SFR_RX_CTL_START` | Start RX engine |
+| `0x0100` | `SFR_RX_CTL_DROPCRCERR` | Drop CRC-error frames |
+| `0x0200` | `SFR_RX_CTL_IPE` | IP checksum error checking |
+| `0x0400` | `SFR_RX_CTL_TXPADCRC` | TX pad and CRC |
+
+Default value in hwSetFilters: `0x0288` = `IPE \| START \| AB`. With hash filter: `0x0298` = adds `AM`.
+
+**SFR_MEDIUM_STATUS_MODE (0x22) bits:**
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `0x0001` | `SFR_MEDIUM_XGMIIMODE` | XGMII mode (5G/2.5G); else GMII (1G/100M) |
+| `0x0002` | `SFR_MEDIUM_FULL_DUPLEX` | Full duplex |
+| `0x0010` | `SFR_MEDIUM_RXFLOW_CTRLEN` | RX flow control enable |
+| `0x0020` | `SFR_MEDIUM_TXFLOW_CTRLEN` | TX flow control enable |
+| `0x0040` | `SFR_MEDIUM_JUMBO_EN` | Jumbo frame enable |
+| `0x0100` | `SFR_MEDIUM_RECEIVE_EN` | RX enable — cleared by `hwStop()` |
+
+**SFR_MONITOR_MODE (0x24) bits:** `0x01`=EPHYRW, `0x02`=RWLC, `0x04`=RWMP, `0x08`=RWWF, `0x10`=RW_FLAG, `0x20`=PMEPOL, `0x40`=PMETYPE
 
 ### Protocol Pattern
 
@@ -750,54 +819,59 @@ IOUSBHostPipe completion
 
 ### ItrData layout (8 bytes, filled by interrupt IN URB)
 
-| Byte | Field |
-|------|-------|
-| `[0]` | unknown |
-| `[1]` | link status byte: `0` = link down; `0x8f`=5Gbps, `0x90`=2.5Gbps, `0x91`=1Gbps, `0x93`=100Mbps; bit 7 set = link up |
-| `[2]` | feature flags: bits[1:0] = flow control active (3 = TX+RX FC) |
-| `[3]`–`[7]` | unknown |
+The first two bytes form a 16-bit little-endian status word:
 
-`hal[0x43]` = last-seen `ItrData[1]` (change detection — no-op if same as previous).
+| Field | Mask | Description |
+|-------|------|-------------|
+| Link status | `0x8000` (bit 15) | 1 = link up, 0 = link down |
+| Speed code | `0x7F00` >> 8 | Speed identifier (see table below) |
+| Flow control | byte[2] bits[1:0] | Active flow control (3 = TX+RX) |
+
+Speed codes (byte[1] & 0x7F, i.e. bits 14:8 of status word):
+
+| Speed code | Speed | ItrData[1] |
+|-----------|-------|------------|
+| `0x0F` | 5 Gbps | `0x8F` |
+| `0x10` | 2.5 Gbps | `0x90` |
+| `0x11` | 1 Gbps | `0x91` |
+| `0x13` | 100 Mbps | `0x93` |
+
+`hal[0x43]` caches `ItrData[1]` for change detection.
 
 ### AqUsbHal::onInterruptEvent(AqUsbHal* hal, ItrData* data)
 
 ```c
 if (data[1] == hal[0x43]) return;   // no link state change — early exit
 
-hal[0x43] = data[1];                // record new state
+hal[0x43] = data[1];                // cache new state
 
-// Decode link speed from data[1]:
-//   (data[1] + 0x71) mod 256 → index into speed/medium tables
-//   index 0 → 5000 Mbps, medium_index=4 ("5000BaseT-Full")
-//   index 1 → 2500 Mbps, medium_index=3 ("2500BaseT-Full")
-//   index 2 → 1000 Mbps, medium_index=2 ("1000BaseT-Full")
-//   index 3 → 0 Mbps    (reserved / not used)
-//   index 4 → 100 Mbps,  medium_index=1 ("100BaseTX-Full")
-//   index >4 → unhandled (speed = 0, medium_index = 0)
+uint16_t status = *(uint16_t*)data;
+bool up         = (status & 0x8000) != 0;         // link status bit
+uint8_t speed   = (status & 0x7F00) >> 8;         // speed code
+
+// Compiler used add-0x71-and-wrap trick to map speed codes to table indices:
+//   0x0F→0 (5G), 0x10→1 (2.5G), 0x11→2 (1G), 0x13→4 (100M)
 uint8_t idx = (uint8_t)(data[1] + 0x71);
-uint32_t speed_mbps    = (idx <= 4) ? speed_table[idx]  : 0;  // table at 0x3fa0
-uint32_t medium_index  = (idx <= 4) ? medium_table[idx] : 0;  // table at 0x3fc0
+uint32_t speed_mbps   = (idx <= 4) ? speed_table[idx]  : 0;  // 0x3fa0
+uint32_t medium_index = (idx <= 4) ? medium_table[idx] : 0;  // 0x3fc0
 
 hwOnLinkChange(hal, data, speed_mbps);   // program hardware for new speed
 
-// Decode flow control from data[2] bits [1:0]:
+// Flow control: if both TX+RX active, use FC variant of medium
 uint32_t link = medium_index;
-if ((data[2] & 3) == 3) link = medium_index + 5;  // +5 → FC variant in medium dict
+if ((data[2] & 3) == 3) link = medium_index + 5;
 
-bool up = (data[1] > 0);   // non-zero = link up (bit 7 set)
-
-// Notify driver → IONetworkInterface
 AqPacificDriver::onLinkStatusChanged(driver, link, up);   // tail-call
 ```
 
-Speed/medium tables (at 0x3fa0 / 0x3fc0, 5 × uint32_t each):
+Speed/medium tables (5 × uint32_t each):
 
-| idx | speed_mbps | medium_index | ItrData[1] value |
-|-----|-----------|--------------|------------------|
-| 0   | 5000      | 4            | `0x8f`           |
-| 1   | 2500      | 3            | `0x90`           |
-| 2   | 1000      | 2            | `0x91`           |
-| 3   | 0         | 0            | `0x92` (unused?) |
+| idx | speed_mbps | medium_index | speed code | ItrData[1] |
+|-----|-----------|--------------|------------|------------|
+| 0   | 5000      | 4            | `0x0F`     | `0x8F`     |
+| 1   | 2500      | 3            | `0x10`     | `0x90`     |
+| 2   | 1000      | 2            | `0x11`     | `0x91`     |
+| 3   | 0         | 0            | —          | `0x92` (unused?) |
 | 4   | 100       | 1            | `0x93`           |
 
 ### AqUsbHal::hwOnLinkChange(AqUsbHal* hal, ItrData* data, uint32_t speed_mbps)
