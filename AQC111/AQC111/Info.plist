@@ -12,8 +12,6 @@
 	<dict>
 		<key>com.apple.iokit.IOSkywalkFamily</key>
 		<string>1.0</string>
-		<key>com.apple.driver.driverkit.transport.usb</key>
-		<string>1.0</string>
 	</dict>
 	<key>IOKitPersonalities</key>
 	<dict>
@@ -27,7 +25,7 @@
 			<key>CFBundleIdentifier</key>
 			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 			<key>CFBundleIdentifierKernel</key>
-			<string>com.apple.driver.driverkit.transport.usb</string>
+			<string>com.apple.kpi.iokit</string>
 			<key>IOClass</key>
 			<string>IOUserService</string>
 			<key>IOMatchCategory</key>
