@@ -1,0 +1,6 @@
+# Xcode
+AQC111/build/
+*.xcuserstate
+
+# macOS
+.DS_Store
