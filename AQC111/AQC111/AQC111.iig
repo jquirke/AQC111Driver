@@ -1,8 +1,9 @@
 //
 //  AQC111.iig
-//  AQC111
+//  AQC111 — Personality A: USB config selector (IOService)
 //
-//  Created by JQ on 3/8/26.
+//  Matches IOUSBHostDevice, opens it, selects Config 1 (vendor-specific),
+//  then closes it so the USB stack publishes IOUSBHostInterface children.
 //
 
 #ifndef AQC111_h
@@ -10,12 +11,10 @@
 
 #include <Availability.h>
 #include <DriverKit/IOService.iig>
-#include <USBDriverKit/IOUSBHostDevice.iig>
-#include <NetworkingDriverKit/IOUserNetworkEthernet.iig>
 
 struct AQC111_IVars;
 
-class AQC111: public IOUserNetworkEthernet
+class AQC111: public IOService
 {
 public:
     virtual bool
@@ -29,40 +28,6 @@ public:
 
     virtual kern_return_t
     Stop(IOService * provider) override;
-
-    // Deprecated pure-virtual overrides required by IOUserNetworkEthernet.
-    // Stubs for now; wired up in later milestones.
-    virtual kern_return_t
-    SetInterfaceEnable(bool isEnable) override;
-
-    virtual kern_return_t
-    SetPromiscuousModeEnable(bool enable) override;
-
-    virtual kern_return_t
-    SetMulticastAddresses(const IOUserNetworkMACAddress *addresses,
-                          uint32_t count) override;
-
-    virtual kern_return_t
-    SetAllMulticastModeEnable(bool enable) override;
-
-    virtual kern_return_t
-    SelectMediaType(IOUserNetworkMediaType mediaType) override;
-
-    virtual kern_return_t
-    SetWakeOnMagicPacketEnable(bool enable) override;
-
-    // Deprecated LOCAL pure-virtual overrides (not IPC-dispatched)
-    virtual kern_return_t
-    SetMTU(uint32_t mtu) override LOCAL;
-
-    virtual kern_return_t
-    GetMaxTransferUnit(uint32_t *mtu) override LOCAL;
-
-    virtual kern_return_t
-    SetHardwareAssists(uint32_t hardwareAssists) override LOCAL;
-
-    virtual kern_return_t
-    GetHardwareAssists(uint32_t *hardwareAssists) override LOCAL;
 };
 
 #endif /* AQC111_h */

@@ -1,0 +1,781 @@
+
+//  AQC111NIC.cpp
+//  AQC111 — Single personality: USB Ethernet NIC
+//
+//  Matches IOUSBHostDevice (VID=0x20f4, PID=0xe05a).
+//  IOClass=IOUserNetworkEthernet in Info.plist is required so the kernel
+//  instantiates the proper networking proxy object (not generic IOUserService).
+//
+//  Start() does everything in one pass:
+//    1. super::Start(provider, SUPERDISPATCH)  ← tests whether IOUSBHostDevice is accepted
+//    2. Open device, SetConfiguration(1, false)
+//    3. CreateInterfaceIterator → find class=255 interface
+//    4. Open interface, get pipes
+//    5. Create queues, RegisterEthernetInterface
+//
+
+#include <os/log.h>
+#include <string.h>
+
+#include <DriverKit/DriverKit.h>
+#include <USBDriverKit/USBDriverKit.h>
+#include <NetworkingDriverKit/NetworkingDriverKit.h>
+
+#include "AQC111NIC.h"
+
+#define Log(fmt, ...) os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] - " fmt, ##__VA_ARGS__)
+
+// Endpoint addresses for Config 1 vendor interface (class 0xFF)
+#define EP_ITR  0x81   // EP1 IN  Interrupt 16B  — link status
+#define EP_RX   0x82   // EP2 IN  Bulk 1024B     — receive
+#define EP_TX   0x03   // EP3 OUT Bulk 1024B     — transmit
+
+// RX ring — 10 outstanding USB bulk IN transfers, each 64KB.
+// Device aggregates multiple Ethernet frames per transfer.
+#define RX_SLOTS        10
+#define RX_BUF_SIZE     0x10000   // 64KB per slot
+
+static kern_return_t aqWrite(IOUSBHostInterface *iface, uint16_t addr, const void *data, uint16_t len);
+static kern_return_t aqRead(IOUSBHostInterface *iface, uint16_t addr, void *data, uint16_t len);
+
+// Reads the permanent 6-byte MAC address from device EEPROM via AQ_FLASH_PARAMETERS.
+// RE: bmRequestType=0xC0 IN|Vendor|Device, bRequest=0x20, wValue=0, wIndex=0, wLength=6.
+static kern_return_t
+readMACAddress(IOUSBHostInterface *iface, IOUserNetworkMACAddress *out)
+{
+    IOBufferMemoryDescriptor *buf = nullptr;
+    kern_return_t ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionIn, 6, 0, &buf);
+    if (ret != kIOReturnSuccess) return ret;
+    buf->SetLength(6);
+
+    uint16_t transferred = 0;
+    ret = iface->DeviceRequest(0xC0, 0x20, 0, 0, 6, buf, &transferred, 10000);
+    if (ret == kIOReturnSuccess && transferred == 6) {
+        IOAddressSegment range;
+        buf->GetAddressRange(&range);
+        memcpy(out->octet, (const void *)range.address, 6);
+    }
+    OSSafeReleaseNULL(buf);
+    return ret;
+}
+
+struct AQC111NIC_IVars {
+    IODispatchQueue                    *queue;
+    IOUserNetworkPacketBufferPool      *pool;
+    IOUserNetworkTxSubmissionQueue     *txsQueue;
+    IOUserNetworkTxCompletionQueue     *txcQueue;
+    IOUserNetworkRxSubmissionQueue     *rxsQueue;
+    IOUserNetworkRxCompletionQueue     *rxcQueue;
+    IOUSBHostDevice                    *device;
+    IOUSBHostInterface                 *interface;
+    IOUSBHostPipe                      *pipeItr;
+    IOUSBHostPipe                      *pipeRx;
+    IOUSBHostPipe                      *pipeTx;
+    // RX ring: 10 × 64KB buffers with one outstanding AsyncIO each
+    IOBufferMemoryDescriptor           *rxBufs[RX_SLOTS];
+    OSAction                           *rxActions[RX_SLOTS];
+    // ITR pipe: one 16-byte buffer for link-status interrupt events
+    IOBufferMemoryDescriptor           *itrBuf;
+    OSAction                           *itrAction;
+    bool                                lastLinkUp;
+    IOUserNetworkMACAddress             macAddress;
+    // OSAction dispatch diagnostic
+    IOTimerDispatchSource              *timerTest;
+    OSAction                           *timerAction;
+};
+
+bool
+AQC111NIC::init()
+{
+    if (!super::init()) return false;
+    ivars = IONewZero(AQC111NIC_IVars, 1);
+    return ivars != nullptr;
+}
+
+void
+AQC111NIC::free()
+{
+    IOSafeDeleteNULL(ivars, AQC111NIC_IVars, 1);
+    super::free();
+}
+
+kern_return_t
+IMPL(AQC111NIC, Start)
+{
+    kern_return_t ret;
+    IOUserNetworkPacketQueue *queues[4];
+    struct IOUserNetworkPacketBufferPoolOptions poolOptions;
+    uintptr_t iter = 0;
+    IOUserNetworkMACAddress macAddress = {};
+
+    // Single personality: IOUserNetworkEthernet + IOUSBHostDevice + IOSkywalkFamily.
+    // Critical test: does IOSkywalkFamily's IOUserNetworkEthernet proxy instantiate
+    // with IOUSBHostDevice as provider? If super::Start() returns 0x0 we're through.
+    Log("Start ENTERED: provider=%p", provider);
+
+    ret = Start(provider, SUPERDISPATCH);
+    Log("Start: super -> 0x%x", ret);
+    if (ret != kIOReturnSuccess) {
+        Log("Start: super FAILED");
+        return ret;
+    }
+    Log("Start: super OK");
+
+    // Open device, select Config 1, discover interface via iterator.
+    ivars->device = OSDynamicCast(IOUSBHostDevice, provider);
+    if (ivars->device == nullptr) {
+        Log("Start: provider is not IOUSBHostDevice");
+        goto fail;
+    }
+
+    ret = ivars->device->Open(this, 0, 0);
+    if (ret != kIOReturnSuccess) {
+        Log("Start: device Open failed: 0x%x", ret);
+        goto fail;
+    }
+
+    // matchInterfaces=true: kernel creates interface nubs and issues xHCI
+    // Configure Endpoint for all alt-0 endpoints as part of nub creation.
+    // This is required because the device STALLs SET_INTERFACE (vendor class
+    // 0xFF, single alternate setting), so SelectAlternateSetting(0) always
+    // fails and xHCI endpoint DMA is never initialized via that path.
+    ret = ivars->device->SetConfiguration(1, true);
+    Log("Start: SetConfiguration(1) -> 0x%x", ret);
+    if (ret != kIOReturnSuccess) goto fail;
+
+    ret = ivars->device->CreateInterfaceIterator(&iter);
+    if (ret != kIOReturnSuccess) {
+        Log("Start: CreateInterfaceIterator failed: 0x%x", ret);
+        goto fail;
+    }
+    ret = ivars->device->CopyInterface(iter, &ivars->interface);
+    ivars->device->DestroyInterfaceIterator(iter);
+    iter = 0;
+    if (ret != kIOReturnSuccess || ivars->interface == nullptr) {
+        Log("Start: CopyInterface failed: 0x%x", ret);
+        goto fail;
+    }
+    Log("Start: got interface %p", ivars->interface);
+
+    ret = ivars->interface->Open(this, 0, nullptr);
+    if (ret != kIOReturnSuccess) {
+        Log("Start: interface Open failed: 0x%x", ret);
+        goto fail;
+    }
+    Log("Start: interface open");
+
+    // Do NOT call SelectAlternateSetting — this device STALLs SET_INTERFACE
+    // (confirmed: always returns 0xe0005000 = kIOUSBHostReturnPipeStalled).
+    // Endpoint DMA is already initialized by the matchInterfaces=true path above.
+
+    // Read permanent MAC address from EEPROM (AQ_FLASH_PARAMETERS, bRequest=0x20).
+    // RE: bmRequestType=0xC0 IN, wValue=0, wIndex=0, wLength=6.
+    {
+        kern_return_t macRet = readMACAddress(ivars->interface, &macAddress);
+        Log("Start: readMAC -> 0x%x  %02x:%02x:%02x:%02x:%02x:%02x",
+            macRet,
+            macAddress.octet[0], macAddress.octet[1], macAddress.octet[2],
+            macAddress.octet[3], macAddress.octet[4], macAddress.octet[5]);
+        if (macRet != kIOReturnSuccess) {
+            macAddress = { .octet = { 0x02, 0xAC, 0x11, 0x11, 0x00, 0x01 } };
+        }
+
+        // Store in ivars — hwEnable writes it to SFR_NODE_ID on every enable.
+        ivars->macAddress = macAddress;
+
+        // Write MAC to SFR_NODE_ID (0x0010) — RE: done immediately after reading EEPROM.
+        kern_return_t nodeRet = aqWrite(ivars->interface, 0x0010, ivars->macAddress.octet, 6);
+        Log("Start: write SFR_NODE_ID -> 0x%x", nodeRet);
+        // Readback to verify the write took.
+        uint8_t readback[6] = {};
+        kern_return_t rbRet = aqRead(ivars->interface, 0x0010, readback, 6);
+        Log("Start: read  SFR_NODE_ID -> 0x%x  %02x:%02x:%02x:%02x:%02x:%02x",
+            rbRet,
+            readback[0], readback[1], readback[2],
+            readback[3], readback[4], readback[5]);
+    }
+
+    ret = ivars->interface->CopyPipe(EP_ITR, &ivars->pipeItr);
+    Log("Start: CopyPipe(ITR) -> 0x%x pipe=%p", ret, ivars->pipeItr);
+    ret = ivars->interface->CopyPipe(EP_RX, &ivars->pipeRx);
+    Log("Start: CopyPipe(RX)  -> 0x%x pipe=%p", ret, ivars->pipeRx);
+    ret = ivars->interface->CopyPipe(EP_TX, &ivars->pipeTx);
+    Log("Start: CopyPipe(TX)  -> 0x%x pipe=%p", ret, ivars->pipeTx);
+
+    // Defensively clear any stall on the pipes before posting AsyncIO.
+    // withRequest=false: reset host-side toggle/state only, no USB request sent.
+    if (ivars->pipeItr) {
+        kern_return_t csRet = ivars->pipeItr->ClearStall(false);
+        Log("Start: ClearStall(ITR) -> 0x%x", csRet);
+    }
+    if (ivars->pipeRx) {
+        kern_return_t csRet = ivars->pipeRx->ClearStall(false);
+        Log("Start: ClearStall(RX) -> 0x%x", csRet);
+    }
+
+    // --- Networking setup ---
+
+    // Create our own dispatch queue rather than copying "Default".
+    // CopyDispatchQueue("Default") on IOUserNetworkEthernet returns the
+    // networking framework's queue, which does not dispatch OSAction callbacks
+    // to the dext. We need a queue we own for AsyncIO / timer completions.
+    ret = IODispatchQueue::Create("AQC111Queue", 0, 0, &ivars->queue);
+    if (ret != kIOReturnSuccess) {
+        Log("Start: IODispatchQueue::Create failed: 0x%x", ret);
+        goto fail;
+    }
+
+    poolOptions.packetCount = 64;
+    poolOptions.bufferCount = 64;
+    poolOptions.bufferSize  = 2048;
+    poolOptions.maxBuffersPerPacket = 1;
+    poolOptions.memorySegmentSize = 0;
+    poolOptions.poolFlags = PoolFlagMapToDext;
+    poolOptions.dmaSpecification.maxAddressBits = 64;
+    ret = IOUserNetworkPacketBufferPool::CreateWithOptions(
+        this, "AQC111", &poolOptions, &ivars->pool);
+    if (ret != kIOReturnSuccess) {
+        Log("Start: CreatePacketBufferPool failed: 0x%x", ret);
+        goto fail;
+    }
+
+    ret = IOUserNetworkTxSubmissionQueue::Create(
+        ivars->pool, this, 16, 0, ivars->queue, &ivars->txsQueue);
+    if (ret != kIOReturnSuccess) { Log("Start: TxSubmission failed: 0x%x", ret); goto fail; }
+
+    ret = IOUserNetworkTxCompletionQueue::Create(
+        ivars->pool, this, 16, 0, ivars->queue, &ivars->txcQueue);
+    if (ret != kIOReturnSuccess) { Log("Start: TxCompletion failed: 0x%x", ret); goto fail; }
+
+    ret = IOUserNetworkRxSubmissionQueue::Create(
+        ivars->pool, this, 16, 0, ivars->queue, &ivars->rxsQueue);
+    if (ret != kIOReturnSuccess) { Log("Start: RxSubmission failed: 0x%x", ret); goto fail; }
+
+    ret = IOUserNetworkRxCompletionQueue::Create(
+        ivars->pool, this, 16, 0, ivars->queue, &ivars->rxcQueue);
+    if (ret != kIOReturnSuccess) { Log("Start: RxCompletion failed: 0x%x", ret); goto fail; }
+
+    queues[0] = ivars->txsQueue;
+    queues[1] = ivars->txcQueue;
+    queues[2] = ivars->rxsQueue;
+    queues[3] = ivars->rxcQueue;
+
+    ret = RegisterEthernetInterface(macAddress, ivars->pool, queues, 4);
+    if (ret != kIOReturnSuccess) {
+        Log("Start: RegisterEthernetInterface failed: 0x%x", ret);
+        goto fail;
+    }
+    Log("Start: RegisterEthernetInterface OK");
+
+    // Post 10 outstanding RX bulk IN transfers.
+    for (int i = 0; i < RX_SLOTS; i++) {
+        ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionIn, RX_BUF_SIZE, 0, &ivars->rxBufs[i]);
+        if (ret != kIOReturnSuccess) {
+            Log("Start: rxBuf[%d] alloc failed: 0x%x", i, ret);
+            goto fail;
+        }
+        // Store the slot index in the OSAction's reference field so OnRxComplete
+        // knows which buffer completed without searching the array.
+        ret = OSAction::Create(this, AQC111NIC_OnRxComplete_ID,
+                               IOUSBHostPipe_CompleteAsyncIO_ID,
+                               sizeof(uint32_t), &ivars->rxActions[i]);
+        if (ret != kIOReturnSuccess) {
+            Log("Start: rxAction[%d] create failed: 0x%x", i, ret);
+            goto fail;
+        }
+        *(uint32_t *)ivars->rxActions[i]->GetReference() = (uint32_t)i;
+
+        ret = ivars->pipeRx->AsyncIO(ivars->rxBufs[i], RX_BUF_SIZE, ivars->rxActions[i], 0);
+        if (ret != kIOReturnSuccess) {
+            Log("Start: rxAsyncIO[%d] failed: 0x%x", i, ret);
+            goto fail;
+        }
+    }
+    Log("Start: %d RX transfers posted", RX_SLOTS);
+
+    // Post one ITR (interrupt IN) transfer for link-status events.
+    // Interrupt endpoint delivers 16 bytes per event.
+    ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionIn, 16, 0, &ivars->itrBuf);
+    if (ret != kIOReturnSuccess) {
+        Log("Start: itrBuf alloc failed: 0x%x", ret);
+        goto fail;
+    }
+    ret = OSAction::Create(this, AQC111NIC_OnItrComplete_ID,
+                           IOUSBHostPipe_CompleteAsyncIO_ID,
+                           0, &ivars->itrAction);
+    if (ret != kIOReturnSuccess) {
+        Log("Start: itrAction create failed: 0x%x", ret);
+        goto fail;
+    }
+    ret = ivars->pipeItr->AsyncIO(ivars->itrBuf, 16, ivars->itrAction, 0);
+    if (ret != kIOReturnSuccess) {
+        Log("Start: itrAsyncIO failed: 0x%x", ret);
+        goto fail;
+    }
+    Log("Start: ITR transfer posted");
+
+    // Report initial link-down state so SIOCGIFXMEDIA succeeds immediately.
+    reportLinkStatus(kIOUserNetworkLinkStatusInactive, kIOUserNetworkMediaEthernetAuto);
+
+    ret = RegisterService();
+    Log("Start: RegisterService -> 0x%x", ret);
+
+    // --- OSAction dispatch diagnostic ---
+    // Schedule a timer 3 seconds from now. If OnTimerFired is called, OSAction
+    // dispatch works for this class. If it never fires, ALL OSAction completions
+    // are broken (not just USB pipes), pointing to a fundamental dispatch issue.
+    {
+        kern_return_t tr = IOTimerDispatchSource::Create(ivars->queue, &ivars->timerTest);
+        if (tr == kIOReturnSuccess) {
+            tr = OSAction::Create(this, AQC111NIC_OnTimerFired_ID,
+                                  IOTimerDispatchSource_TimerOccurred_ID,
+                                  0, &ivars->timerAction);
+        }
+        if (tr == kIOReturnSuccess) {
+            ivars->timerTest->SetHandler(ivars->timerAction);
+            // mach_absolute_time() is in nanoseconds on Apple Silicon (numer=denom=1).
+            uint64_t fireAt = mach_absolute_time() + 3ULL * 1000000000ULL;
+            ivars->timerTest->WakeAtTime(kIOTimerClockMachAbsoluteTime, fireAt, 0);
+            Log("Start: timer diagnostic scheduled (fires in ~3s)");
+        } else {
+            Log("Start: timer diagnostic setup failed: 0x%x", tr);
+        }
+    }
+
+    return ret;
+
+fail:
+    Stop(provider, SUPERDISPATCH);
+    return kIOReturnError;
+}
+
+kern_return_t
+IMPL(AQC111NIC, Stop)
+{
+    Log("Stop");
+    // Cancel timer diagnostic.
+    OSSafeReleaseNULL(ivars->timerAction);
+    OSSafeReleaseNULL(ivars->timerTest);
+    // Abort both async pipes before releasing their buffers and actions.
+    if (ivars->pipeItr != nullptr) {
+        ivars->pipeItr->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, nullptr);
+    }
+    OSSafeReleaseNULL(ivars->itrAction);
+    OSSafeReleaseNULL(ivars->itrBuf);
+
+    if (ivars->pipeRx != nullptr) {
+        ivars->pipeRx->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, nullptr);
+    }
+    for (int i = 0; i < RX_SLOTS; i++) {
+        OSSafeReleaseNULL(ivars->rxActions[i]);
+        OSSafeReleaseNULL(ivars->rxBufs[i]);
+    }
+    OSSafeReleaseNULL(ivars->rxcQueue);
+    OSSafeReleaseNULL(ivars->rxsQueue);
+    OSSafeReleaseNULL(ivars->txcQueue);
+    OSSafeReleaseNULL(ivars->txsQueue);
+    OSSafeReleaseNULL(ivars->pool);
+    OSSafeReleaseNULL(ivars->queue);
+    OSSafeReleaseNULL(ivars->pipeItr);
+    OSSafeReleaseNULL(ivars->pipeRx);
+    OSSafeReleaseNULL(ivars->pipeTx);
+    if (ivars->interface != nullptr) {
+        ivars->interface->Close(this, 0);
+        OSSafeReleaseNULL(ivars->interface);
+    }
+    if (ivars->device != nullptr) {
+        ivars->device->Close(this, 0);
+        OSSafeReleaseNULL(ivars->device);
+    }
+    return Stop(provider, SUPERDISPATCH);
+}
+
+// --- Hardware register access ---
+//
+// AQ_ACCESS_MAC (bRequest=0x01): read/write device MAC-side SFR registers.
+//   OUT (0x40): write len bytes to register at addr; wIndex=wLength=len.
+//   IN  (0xC0): read  len bytes from register at addr; wIndex=wLength=len.
+//
+// DeviceRequest() requires an IOMemoryDescriptor for the data buffer.
+
+static kern_return_t
+aqWrite(IOUSBHostInterface *iface, uint16_t addr, const void *data, uint16_t len)
+{
+    IOBufferMemoryDescriptor *buf = nullptr;
+    kern_return_t ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionOut, len, 0, &buf);
+    if (ret != kIOReturnSuccess) return ret;
+
+    IOAddressSegment range;
+    buf->GetAddressRange(&range);
+    memcpy((void *)range.address, data, len);
+    buf->SetLength(len);
+
+    uint16_t transferred = 0;
+    ret = iface->DeviceRequest(0x40, 0x01, addr, len, len, buf, &transferred, 10000);
+    OSSafeReleaseNULL(buf);
+    return ret;
+}
+
+static kern_return_t
+aqRead(IOUSBHostInterface *iface, uint16_t addr, void *data, uint16_t len)
+{
+    IOBufferMemoryDescriptor *buf = nullptr;
+    kern_return_t ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionIn, len, 0, &buf);
+    if (ret != kIOReturnSuccess) return ret;
+    buf->SetLength(len);
+
+    uint16_t transferred = 0;
+    ret = iface->DeviceRequest(0xC0, 0x01, addr, len, len, buf, &transferred, 10000);
+    if (ret == kIOReturnSuccess) {
+        IOAddressSegment range;
+        buf->GetAddressRange(&range);
+        memcpy(data, (const void *)range.address, len);
+    }
+    OSSafeReleaseNULL(buf);
+    return ret;
+}
+
+// Minimal hardware enable sequence derived from AqUsbHal::hwStart() +
+// AqUsbHal::hwOnLinkChange(). Assumes 1G link (GMII mode).
+static void
+hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
+{
+    kern_return_t ret;
+    uint8_t  b;
+    uint16_t w;
+
+    // --- FWPhyAccess init (bRequest=0x61, AQ_PHY_OPS) ---
+    // Combines phyPower(true) + lowPower(false) + advertise(all speeds).
+    // fw[0]: AQ_ADV_100M|1G|2G5|5G = 0x0F
+    // fw[1]: 0x00
+    // fw[2]: PHY_POWER_EN(0x08) | DOWNSHIFT(0x20) | PAUSE(0x01) | ASYM_PAUSE(0x02)
+    // fw[3]: downshift retries = 7
+    {
+        uint8_t ops[4] = { 0x0F, 0x00, 0x2B, 0x07 };
+        IOBufferMemoryDescriptor *buf = nullptr;
+        if (IOBufferMemoryDescriptor::Create(kIOMemoryDirectionOut, 4, 0, &buf) == kIOReturnSuccess) {
+            IOAddressSegment range;
+            buf->GetAddressRange(&range);
+            memcpy((void *)range.address, ops, 4);
+            buf->SetLength(4);
+            uint16_t transferred = 0;
+            ret = iface->DeviceRequest(0x40, 0x61, 0, 0, 4, buf, &transferred, 10000);
+            Log("hwEnable: AQ_PHY_OPS -> 0x%x (transferred=%u)", ret, transferred);
+            OSSafeReleaseNULL(buf);
+        }
+    }
+
+    // Write MAC address to SFR_NODE_ID (0x0010) — RE: done in hwStart after EEPROM read.
+    ret = aqWrite(iface, 0x0010, mac.octet, 6);
+    Log("hwEnable: SFR_NODE_ID -> 0x%x", ret);
+
+    // Unmask all burst-mode interrupts.
+    b = 0xFF;
+    ret = aqWrite(iface, 0x0041, &b, 1);
+    Log("hwEnable: BM_INT_MASK=0xFF -> 0x%x", ret);
+
+    // Stop RX engine before reconfiguring.
+    w = 0x0000;
+    ret = aqWrite(iface, 0x000B, &w, 2);
+
+    // ETH_MAC_PATH = RX_PATH_READY.
+    b = 0x01;
+    aqWrite(iface, 0x00B7, &b, 1);
+
+    // BULK_OUT_CTRL = EFF_EN.
+    b = 0x02;
+    aqWrite(iface, 0x00B9, &b, 1);
+
+    // RX bulk-in coalescing — high-speed profile (1G / 2.5G / 5G):
+    // ctrl=0x07, timer=0x0100 (LE), size=30 frames, ifg=0xFF.
+    uint8_t coalesce[5] = { 0x07, 0x00, 0x01, 0x1E, 0xFF };
+    aqWrite(iface, 0x002E, coalesce, 5);
+
+    // MEDIUM_STATUS_MODE: FULL_DUPLEX | RXFLOW | TXFLOW (1G GMII, no XGMIIMODE).
+    w = 0x0032;
+    aqWrite(iface, 0x0022, &w, 2);
+    // Second write adds RECEIVE_EN (bit 8).
+    w |= 0x0100;
+    ret = aqWrite(iface, 0x0022, &w, 2);
+    Log("hwEnable: MEDIUM_STATUS_MODE=0x%04x -> 0x%x", w, ret);
+
+    // Enable RX DMA.
+    b = 0x80;
+    aqWrite(iface, 0x0043, &b, 1);
+
+    // Start RX engine: START | IPE | AB = 0x0288.
+    w = 0x0288;
+    ret = aqWrite(iface, 0x000B, &w, 2);
+    Log("hwEnable: RX_CTL=0x0288 -> 0x%x", ret);
+}
+
+static void
+hwDisable(IOUSBHostInterface *iface)
+{
+    uint16_t w;
+    uint8_t  b;
+
+    // Stop RX engine.
+    w = 0x0000;
+    aqWrite(iface, 0x000B, &w, 2);
+
+    // Clear RECEIVE_EN from MEDIUM_STATUS_MODE.
+    w = 0;
+    aqRead(iface, 0x0022, &w, 2);
+    w &= ~(uint16_t)0x0100;
+    aqWrite(iface, 0x0022, &w, 2);
+
+    // Disable RX DMA.
+    b = 0x00;
+    aqWrite(iface, 0x0043, &b, 1);
+}
+
+// --- RX path ---
+
+void
+IMPL(AQC111NIC, OnRxComplete)
+{
+    uint32_t slot = *(uint32_t *)action->GetReference();
+    Log("OnRxComplete: slot=%u status=0x%x bytes=%u", slot, status, actualByteCount);
+
+    if (status == kIOReturnAborted) {
+        // Stop() is tearing down — do not repost.
+        return;
+    }
+    if (status != kIOReturnSuccess || actualByteCount < 4) {
+        Log("RX[%u] error: status=0x%x bytes=%u — reposting", slot, status, actualByteCount);
+        ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
+        return;
+    }
+
+    // --- Parse aggregated RX buffer ---
+    // Layout: [4-byte header][pkt0: 2B pad + payload][pkt1...][N × 8-byte descriptors at desc_off]
+    IOAddressSegment range;
+    ivars->rxBufs[slot]->GetAddressRange(&range);
+    const uint8_t *buf = (const uint8_t *)range.address;
+
+    uint32_t header    = *(const uint32_t *)buf;
+    uint32_t pkt_count = header & 0x1FFF;
+    uint32_t desc_off  = (header & 0xFFFFE000) >> 13;
+
+    if (pkt_count == 0 || desc_off + pkt_count * 8 > actualByteCount) {
+        // Malformed — repost and move on.
+        ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
+        return;
+    }
+
+    uint32_t pkt_offset = 4;  // packets start after 4-byte header
+    uint32_t delivered  = 0;
+
+    for (uint32_t i = 0; i < pkt_count; i++) {
+        uint64_t pd      = *(const uint64_t *)(buf + desc_off + i * 8);
+        bool     drop    = (pd >> 31) & 1;
+        bool     ok      = (pd >> 11) & 1;
+        uint32_t pkt_len = (uint32_t)((pd & 0x7FFF0000) >> 16);
+
+        if (!drop && ok && pkt_len > 2) {
+            uint32_t frame_len = pkt_len - 2;  // strip 2-byte HW alignment pad
+
+            IOUserNetworkPacket *pkt = nullptr;
+            if (ivars->pool->allocatePacket(&pkt) == kIOReturnSuccess) {
+                uint8_t *dst = (uint8_t *)pkt->getDataVirtualAddress();
+                memcpy(dst, buf + pkt_offset + 2, frame_len);
+                pkt->setDataLength(frame_len);
+                ivars->rxcQueue->EnqueuePacket(pkt);
+                delivered++;
+            }
+        }
+
+        pkt_offset += pkt_len;
+    }
+
+    if (delivered > 0) {
+        Log("RX[%u] %u bytes → %u/%u frames delivered", slot, actualByteCount, delivered, pkt_count);
+    }
+
+    // Repost this slot immediately to keep the ring full.
+    ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
+}
+
+// --- ITR (interrupt IN) path — link status ---
+//
+// ItrData byte[1]: bit7=link-up, bits[6:0]=speed code
+//   0x0F = 5G, 0x10 = 2.5G, 0x11 = 1G, 0x13 = 100M
+// When link is up:   byte[1] = 0x80 | speed_code  (e.g. 0x91 = 1G up)
+// When link is down: byte[1] = 0x00
+
+void
+IMPL(AQC111NIC, OnItrComplete)
+{
+    Log("OnItrComplete: status=0x%x bytes=%u", status, actualByteCount);
+
+    if (status == kIOReturnAborted) {
+        // Stop() is tearing down — do not repost.
+        return;
+    }
+    if (status == kIOReturnSuccess && actualByteCount >= 2) {
+        IOAddressSegment range;
+        ivars->itrBuf->GetAddressRange(&range);
+        const uint8_t *data = (const uint8_t *)range.address;
+
+        uint8_t byte1     = data[1];
+        bool    linkUp    = (byte1 >> 7) & 1;
+        uint8_t speedCode = byte1 & 0x7F;
+
+        const uint32_t opts = kIOUserNetworkMediaOptionFullDuplex |
+                              kIOUserNetworkMediaOptionFlowControl;
+        MediaWord media = kIOUserNetworkMediaEthernetAuto;
+        if (linkUp) {
+            switch (speedCode) {
+                case 0x0F: media = kIOUserNetworkMediaEthernet5000BaseT | opts; break;
+                case 0x10: media = kIOUserNetworkMediaEthernet2500BaseT | opts; break;
+                case 0x11: media = kIOUserNetworkMediaEthernet1000BaseT | opts; break;
+                case 0x13: media = kIOUserNetworkMediaEthernet100BaseTX | opts; break;
+                default:   media = kIOUserNetworkMediaEthernet1000BaseT | opts; break;
+            }
+        }
+
+        LinkStatus ls = linkUp ? kIOUserNetworkLinkStatusActive
+                                : kIOUserNetworkLinkStatusInactive;
+        Log("ITR: byte1=0x%02x linkUp=%d speed=0x%02x -> reportLinkStatus(0x%x, 0x%x)",
+            byte1, (int)linkUp, speedCode, ls, media);
+        reportLinkStatus(ls, media);
+        ivars->lastLinkUp = linkUp;
+    } else if (status != kIOReturnSuccess) {
+        Log("ITR error: status=0x%x bytes=%u", status, actualByteCount);
+    }
+
+    // Repost immediately to keep listening.
+    ivars->pipeItr->AsyncIO(ivars->itrBuf, 16, ivars->itrAction, 0);
+}
+
+// --- OSAction dispatch diagnostic ---
+
+void
+IMPL(AQC111NIC, OnTimerFired)
+{
+    Log("OnTimerFired: OSAction dispatch CONFIRMED WORKING (time=%llu)", time);
+}
+
+// --- LOCAL overrides ---
+
+kern_return_t
+IMPL(AQC111NIC, SetMTU)
+{
+    Log("SetMTU: %u", mtu);
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+IMPL(AQC111NIC, GetMaxTransferUnit)
+{
+    Log("GetMaxTransferUnit");
+    *mtu = 1500;
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+IMPL(AQC111NIC, SetHardwareAssists)
+{
+    Log("SetHardwareAssists: 0x%x", hardwareAssists);
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+IMPL(AQC111NIC, GetHardwareAssists)
+{
+    Log("GetHardwareAssists");
+    *hardwareAssists = 0;
+    return kIOReturnSuccess;
+}
+
+// --- Dispatched overrides ---
+
+kern_return_t
+IMPL(AQC111NIC, SetInterfaceEnable)
+{
+    Log("SetInterfaceEnable: %d", isEnable);
+    if (isEnable) {
+        hwEnable(ivars->interface, ivars->macAddress);
+    } else {
+        hwDisable(ivars->interface);
+    }
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+IMPL(AQC111NIC, SetPromiscuousModeEnable)
+{
+    Log("SetPromiscuousModeEnable: %d", enable);
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+IMPL(AQC111NIC, SetAllMulticastModeEnable)
+{
+    Log("SetAllMulticastModeEnable: %d", enable);
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+IMPL(AQC111NIC, SetMulticastAddresses)
+{
+    Log("SetMulticastAddresses: count=%u", count);
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *a = addresses[i].octet;
+        Log("  [%u] %02x:%02x:%02x:%02x:%02x:%02x", i,
+            a[0], a[1], a[2], a[3], a[4], a[5]);
+    }
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+IMPL(AQC111NIC, SelectMediaType)
+{
+    Log("SelectMediaType: 0x%x", mediaType);
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+IMPL(AQC111NIC, SetWakeOnMagicPacketEnable)
+{
+    Log("SetWakeOnMagicPacketEnable: %d", enable);
+    return kIOReturnSuccess;
+}
+
+// --- Media support ---
+
+kern_return_t
+AQC111NIC::getSupportedMediaArray(MediaWord *mediaArray, uint32_t *mediaCount)
+{
+    Log("getSupportedMediaArray");
+    static const uint32_t opts = kIOUserNetworkMediaOptionFullDuplex |
+                                 kIOUserNetworkMediaOptionFlowControl;
+    static const MediaWord kMedia[] = {
+        kIOUserNetworkMediaEthernetAuto,
+        kIOUserNetworkMediaEthernet100BaseTX | opts,
+        kIOUserNetworkMediaEthernet1000BaseT | opts,
+        kIOUserNetworkMediaEthernet2500BaseT | opts,
+        kIOUserNetworkMediaEthernet5000BaseT | opts,
+    };
+    const uint32_t count = sizeof(kMedia) / sizeof(kMedia[0]);
+    for (uint32_t i = 0; i < count; i++) {
+        mediaArray[i] = kMedia[i];
+    }
+    *mediaCount = count;
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+AQC111NIC::handleChosenMedia(MediaWord chosenMedia)
+{
+    Log("handleChosenMedia: 0x%x", chosenMedia);
+    return kIOReturnSuccess;
+}
+
+MediaWord
+AQC111NIC::getInitialMedia()
+{
+    Log("getInitialMedia");
+    return kIOUserNetworkMediaEthernetAuto;
+}

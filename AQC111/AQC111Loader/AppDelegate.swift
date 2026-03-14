@@ -20,8 +20,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, OSSystemExtensionReque
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 440, height: 110),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -29,15 +29,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, OSSystemExtensionReque
         window.center()
 
         let installButton = NSButton(title: "Install", target: self, action: #selector(install))
-        installButton.frame = NSRect(x: 20, y: 65, width: 120, height: 32)
+        installButton.frame = NSRect(x: 20, y: 558, width: 120, height: 32)
         window.contentView?.addSubview(installButton)
 
         let uninstallButton = NSButton(title: "Uninstall", target: self, action: #selector(uninstall))
-        uninstallButton.frame = NSRect(x: 155, y: 65, width: 120, height: 32)
+        uninstallButton.frame = NSRect(x: 155, y: 558, width: 120, height: 32)
         window.contentView?.addSubview(uninstallButton)
 
-        statusLabel = NSTextField(labelWithString: "Ready.")
-        statusLabel.frame = NSRect(x: 20, y: 30, width: 400, height: 20)
+        statusLabel = NSTextField(wrappingLabelWithString: "Ready.")
+        statusLabel.frame = NSRect(x: 20, y: 10, width: 760, height: 538)
+        statusLabel.isSelectable = true
+        statusLabel.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
         window.contentView?.addSubview(statusLabel)
 
         window.makeKeyAndOrderFront(nil)

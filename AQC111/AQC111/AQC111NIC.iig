@@ -1,0 +1,101 @@
+//
+//  AQC111NIC.iig
+//  AQC111 — Single personality: USB Ethernet NIC
+//
+//  Matches IOUSBHostDevice (VID=0x20f4, PID=0xe05a).
+//  IOClass=IOUserNetworkEthernet in Info.plist is required so the kernel
+//  instantiates the proper networking proxy object (not generic IOUserService).
+//
+
+#ifndef AQC111NIC_h
+#define AQC111NIC_h
+
+#include <Availability.h>
+#include <DriverKit/IOService.iig>
+#include <DriverKit/IOTimerDispatchSource.iig>
+#include <NetworkingDriverKit/IOUserNetworkEthernet.iig>
+#include <USBDriverKit/IOUSBHostPipe.iig>
+
+struct AQC111NIC_IVars;
+
+class AQC111NIC: public IOUserNetworkEthernet
+{
+public:
+    virtual bool
+    init() override;
+
+    virtual void
+    free() override;
+
+    virtual kern_return_t
+    Start(IOService * provider) override;
+
+    virtual kern_return_t
+    Stop(IOService * provider) override;
+
+    // USB RX completion — called once per completed bulk IN transfer
+    virtual void
+    OnRxComplete(OSAction * action,
+                 IOReturn status,
+                 uint32_t actualByteCount,
+                 uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
+
+    // USB ITR (interrupt IN) completion — link status
+    virtual void
+    OnItrComplete(OSAction * action,
+                  IOReturn status,
+                  uint32_t actualByteCount,
+                  uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
+
+    // OSAction dispatch diagnostic — fires 3s after Start() via IOTimerDispatchSource.
+    // If this fires, OSAction dispatch works for this class; if not, it's broken globally.
+    virtual void
+    OnTimerFired(OSAction * action,
+                 uint64_t time) TYPE(IOTimerDispatchSource::TimerOccurred);
+
+    // Media support
+    virtual kern_return_t
+    getSupportedMediaArray(MediaWord * mediaArray,
+                           uint32_t * mediaCount) override LOCALONLY;
+
+    virtual kern_return_t
+    handleChosenMedia(MediaWord chosenMedia) override LOCALONLY;
+
+    virtual MediaWord
+    getInitialMedia() override LOCALONLY;
+
+    // Deprecated pure virtuals — dispatched
+    virtual kern_return_t
+    SetInterfaceEnable(bool isEnable) override;
+
+    virtual kern_return_t
+    SetPromiscuousModeEnable(bool enable) override;
+
+    virtual kern_return_t
+    SetAllMulticastModeEnable(bool enable) override;
+
+    virtual kern_return_t
+    SetMulticastAddresses(const IOUserNetworkMACAddress * addresses,
+                          uint32_t count) override;
+
+    virtual kern_return_t
+    SelectMediaType(IOUserNetworkMediaType mediaType) override;
+
+    virtual kern_return_t
+    SetWakeOnMagicPacketEnable(bool enable) override;
+
+    // Deprecated LOCAL pure virtuals
+    virtual kern_return_t
+    SetMTU(uint32_t mtu) override LOCAL;
+
+    virtual kern_return_t
+    GetMaxTransferUnit(uint32_t * mtu) override LOCAL;
+
+    virtual kern_return_t
+    SetHardwareAssists(uint32_t hardwareAssists) override LOCAL;
+
+    virtual kern_return_t
+    GetHardwareAssists(uint32_t * hardwareAssists) override LOCAL;
+};
+
+#endif /* AQC111NIC_h */
