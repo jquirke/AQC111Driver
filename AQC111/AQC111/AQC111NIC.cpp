@@ -133,17 +133,14 @@ IMPL(AQC111NIC, Start)
     // Get device for control transfers (bRequest=0x01/0x20/0x61).
     // Personality A already holds it open; we open a second session to
     // ensure Config 1 stays pinned even if A tears down before we do.
+    // Get device reference for control transfers. Personality A (AQC111) already
+    // holds the exclusive open session; we must NOT call Open() again.
     ret = ivars->interface->CopyDevice(&ivars->device);
     if (ret != kIOReturnSuccess || ivars->device == nullptr) {
         Log("Start: CopyDevice failed: 0x%x", ret);
         goto fail;
     }
-
-    ret = ivars->device->Open(this, 0, 0);
-    if (ret != kIOReturnSuccess) {
-        Log("Start: device Open failed: 0x%x", ret);
-        goto fail;
-    }
+    Log("Start: CopyDevice OK device=%p", ivars->device);
 
     // Open our provider interface. No SetConfiguration needed — already done.
     ret = ivars->interface->Open(this, 0, nullptr);
@@ -347,15 +344,12 @@ IMPL(AQC111NIC, Stop)
     OSSafeReleaseNULL(ivars->pipeItr);
     OSSafeReleaseNULL(ivars->pipeRx);
     OSSafeReleaseNULL(ivars->pipeTx);
-    // Close interface before device.
     if (ivars->interface != nullptr) {
         ivars->interface->Close(this, 0);
         OSSafeReleaseNULL(ivars->interface);
     }
-    if (ivars->device != nullptr) {
-        ivars->device->Close(this, 0);
-        OSSafeReleaseNULL(ivars->device);
-    }
+    // Device was not opened by us (Personality A holds the session); just release ref.
+    OSSafeReleaseNULL(ivars->device);
     return Stop(provider, SUPERDISPATCH);
 }
 
