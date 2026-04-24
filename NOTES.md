@@ -160,6 +160,71 @@ Note: for device-level drivers that must configure the device before interface m
 - `com.apple.developer.driverkit.transport.usb` entitlement format: `<array><dict><key>idVendor</key><string>*</string></dict></array>` (not `<true/>`)
 - systemextensionsctl tangled state: requires reboot to clear. Uninstall via deactivationRequest also leaves "terminating for uninstall but still running" if dext is active — reboot required.
 
+## Known Bugs (session 26, 2026-04-24)
+
+Observed via `log stream --predicate 'eventMessage contains "AQC111" AND process == "kernel"'` after `ifconfig en10 up` with no cable.
+
+### OBSERVATION: Re-enumeration delayed after unplug (not a zombie)
+
+On USB unplug, the dext teardown burns 2 corpse slots (one per personality process).
+The second corpse hits the system limit: `Corpse failure, too many 6`. After this,
+re-plugging the USB device appears to do nothing — no `Start ENTERED` in logs.
+However, after ~a few minutes the device re-enumerates and the driver reattaches
+normally. Likely cause: kernel is delaying re-match until internal cleanup from the
+failed corpse accounting completes. Not a zombie. Reboot resets corpse budget.
+
+**Development implication:** budget is ~2 unplug cycles per boot before this delay
+appears. Plan test sequences to minimize unplugs, reboot to reset.
+
+### VERIFIED: PHY bring-up now produces link-up and correct media selection
+
+After replacing the one-shot PHY init with the Linux/x86-style bring-up model
+(explicit PHY power-on, pre-advertise clears, stateful `AQ_PHY_OPS`, deferred
+medium enable), `ifconfig en10 up` now produces a real link-up interrupt:
+
+- `SetInterfaceEnable: 1`
+- `hwEnable: AQ_PHY_POWER=0x02 -> 0x0`
+- `hwEnable: AQ_PHY_OPS flags=0x072b000f -> 0x0`
+- `ITR: byte1=0x91 linkUp=1 speed=0x11 -> reportLinkStatus(0x3, 0x500030)`
+
+This is the first confirmed transition from the earlier no-link state to
+device-reported link-up.
+
+### VERIFIED: media decoding path is correct
+
+The interrupt handler decodes the hardware speed byte correctly:
+
+- `0x0F` -> `5000BaseT`
+- `0x10` -> `2500BaseT`
+- `0x11` -> `1000BaseT`
+- `0x13` -> `100BaseTX`
+
+The observed link-up event carried `speed=0x11`, and the driver reported the
+matching NetworkingDriverKit media word (`1000BaseT` full duplex with flow
+control). So the current issue is not incorrect media decoding.
+
+Direct userland confirmation after `sudo ifconfig en10 up`:
+
+- `media: autoselect (1000baseT <full-duplex>)`
+- `status: active`
+
+### REMAINING BUG: zombie / teardown lifecycle still regresses after some cycles
+
+The driver can still end up in a zombie / stuck lifecycle state after repeated
+attach-detach or development cycles, requiring a reboot to recover cleanly.
+That is now separate from PHY/media correctness:
+
+- PHY bring-up can produce link-up
+- media reporting follows the ITR speed code correctly
+- remaining instability is in lifecycle / teardown / reattach behavior
+
+### NEXT WORK
+
+- make `ifconfig en10 down` a reversible soft shutdown:
+  stop reposting RX/ITR, withdraw advertisement, enter PHY low power, report link down
+- keep full PHY power-off for deeper stop / unplug / termination paths
+- investigate why the dext can still zombie and require reboot after some runs
+
 ## References
 
 - Linux kernel aqc111 driver: `drivers/net/usb/aqc111.c`

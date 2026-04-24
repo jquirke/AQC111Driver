@@ -84,6 +84,8 @@ struct AQC111NIC_IVars {
     IOBufferMemoryDescriptor           *itrBuf;
     OSAction                           *itrAction;
     bool                                lastLinkUp;
+    bool                                interfaceEnabled;
+    bool                                ioArmed;
     IOUserNetworkMACAddress             macAddress;
     // Dext-owned queue for OSAction callbacks (timer, USB async IO).
     // CopyDispatchQueue("Default") returns the kernel-side networking proxy queue
@@ -303,6 +305,7 @@ IMPL(AQC111NIC, Start)
         Log("Start: itrAsyncIO failed: 0x%x", ret);
         goto fail;
     }
+    ivars->ioArmed = true;
     Log("Start: ITR transfer posted");
 
     reportLinkStatus(kIOUserNetworkLinkStatusInactive, kIOUserNetworkMediaEthernetAuto);
@@ -344,6 +347,8 @@ kern_return_t
 IMPL(AQC111NIC, Stop)
 {
     Log("Stop: enter");
+    ivars->interfaceEnabled = false;
+    ivars->ioArmed = false;
 
     // DispatchSync removed: during force-close/uninstall asyncQueue may not
     // be serviceable, causing DispatchSync to block indefinitely and
@@ -466,6 +471,50 @@ aqRead(IOUSBHostInterface *iface, uint16_t addr, void *data, uint16_t len)
     return ret;
 }
 
+static kern_return_t
+armAsyncIO(AQC111NIC_IVars *ivars)
+{
+    kern_return_t ret;
+
+    if (ivars->ioArmed) {
+        return kIOReturnSuccess;
+    }
+
+    for (int i = 0; i < RX_SLOTS; i++) {
+        ret = ivars->pipeRx->AsyncIO(ivars->rxBufs[i], RX_BUF_SIZE, ivars->rxActions[i], 0);
+        Log("armAsyncIO: RX[%d] -> 0x%x", i, ret);
+        if (ret != kIOReturnSuccess) {
+            return ret;
+        }
+    }
+
+    ret = ivars->pipeItr->AsyncIO(ivars->itrBuf, 16, ivars->itrAction, 0);
+    Log("armAsyncIO: ITR -> 0x%x", ret);
+    if (ret != kIOReturnSuccess) {
+        return ret;
+    }
+
+    ivars->ioArmed = true;
+    return kIOReturnSuccess;
+}
+
+static void
+disarmAsyncIO(AQC111NIC_IVars *ivars)
+{
+    kern_return_t r;
+
+    ivars->ioArmed = false;
+
+    if (ivars->pipeItr != nullptr) {
+        r = ivars->pipeItr->Abort(kIOUSBAbortSynchronous, kIOReturnAborted, nullptr);
+        Log("disarmAsyncIO: Abort ITR -> 0x%x", r);
+    }
+    if (ivars->pipeRx != nullptr) {
+        r = ivars->pipeRx->Abort(kIOUSBAbortSynchronous, kIOReturnAborted, nullptr);
+        Log("disarmAsyncIO: Abort RX -> 0x%x", r);
+    }
+}
+
 // Minimal PHY-only bring-up sequence derived from Linux aqc111.c and the x86
 // IOKit RE notes. This intentionally does not enable RX or program the final
 // medium state; that belongs on the link-up path once the PHY is alive.
@@ -560,6 +609,7 @@ static void
 hwDisable(IOUSBHostInterface *iface)
 {
     kern_return_t r;
+    uint32_t phyFlags;
     uint16_t w;
     uint8_t  b;
 
@@ -575,8 +625,24 @@ hwDisable(IOUSBHostInterface *iface)
     Log("hwDisable: MEDIUM_STATUS_MODE=0x%04x (clear RECEIVE_EN) -> 0x%x", w, r);
 
     b = 0x00;
+    r = aqWrite(iface, 0x00B7, &b, 1);
+    Log("hwDisable: ETH_MAC_PATH=0x00 -> 0x%x", r);
+
+    b = 0x00;
+    r = aqWrite(iface, 0x00B9, &b, 1);
+    Log("hwDisable: BULK_OUT_CTRL=0x00 -> 0x%x", r);
+
+    b = 0x00;
     r = aqWrite(iface, 0x0043, &b, 1);
     Log("hwDisable: BMRX_DMA=0x00 -> 0x%x", r);
+
+    phyFlags = 0;
+    r = aqVendorOut(iface, 0x61, &phyFlags, sizeof(phyFlags));
+    Log("hwDisable: AQ_PHY_OPS withdraw advertise flags=0x%08x -> 0x%x", phyFlags, r);
+
+    phyFlags = (1u << 18) | (1u << 19);
+    r = aqVendorOut(iface, 0x61, &phyFlags, sizeof(phyFlags));
+    Log("hwDisable: AQ_PHY_OPS lowPower flags=0x%08x -> 0x%x", phyFlags, r);
 }
 
 // --- OSAction dispatch diagnostic ---
@@ -597,6 +663,10 @@ IMPL(AQC111NIC, OnRxComplete)
 
     if (status == kIOReturnAborted) {
         return;  // Stop in progress — don't repost
+    }
+    if (!ivars->interfaceEnabled || !ivars->ioArmed) {
+        Log("RX[%u] disabled path — not reposting", slot);
+        return;
     }
     if (status == kUSBHostReturnPipeStalled) {
         kern_return_t r = ivars->pipeRx->ClearStall(false);
@@ -678,6 +748,10 @@ IMPL(AQC111NIC, OnItrComplete)
     Log("OnItrComplete: status=0x%x bytes=%u", status, actualByteCount);
 
     if (status == kIOReturnAborted) {
+        return;
+    }
+    if (!ivars->interfaceEnabled || !ivars->ioArmed) {
+        Log("ITR disabled path — not reposting");
         return;
     }
     if (status == kIOReturnSuccess && actualByteCount >= 2) {
@@ -762,9 +836,17 @@ IMPL(AQC111NIC, SetInterfaceEnable)
 {
     Log("SetInterfaceEnable: %d", isEnable);
     if (isEnable) {
+        ivars->interfaceEnabled = true;
+        kern_return_t armRet = armAsyncIO(ivars);
+        Log("SetInterfaceEnable: armAsyncIO -> 0x%x", armRet);
         hwEnable(ivars->interface, ivars->macAddress);
     } else {
+        ivars->interfaceEnabled = false;
+        disarmAsyncIO(ivars);
         hwDisable(ivars->interface);
+        ivars->lastLinkUp = false;
+        reportLinkStatus(kIOUserNetworkLinkStatusInactive, kIOUserNetworkMediaEthernetAuto);
+        Log("SetInterfaceEnable: reportLinkStatus inactive");
     }
     return kIOReturnSuccess;
 }
