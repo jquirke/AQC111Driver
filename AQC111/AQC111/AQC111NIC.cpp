@@ -21,6 +21,7 @@
 
 #include <os/log.h>
 #include <string.h>
+#include <time.h>
 
 #include <DriverKit/DriverKit.h>
 #include <USBDriverKit/USBDriverKit.h>
@@ -84,6 +85,10 @@ struct AQC111NIC_IVars {
     OSAction                           *itrAction;
     bool                                lastLinkUp;
     IOUserNetworkMACAddress             macAddress;
+    // Dext-owned queue for OSAction callbacks (timer, USB async IO).
+    // CopyDispatchQueue("Default") returns the kernel-side networking proxy queue
+    // which doesn't deliver OSAction callbacks into our process.
+    IODispatchQueue                    *asyncQueue;
     // OSAction dispatch diagnostic
     IOTimerDispatchSource              *timerTest;
     OSAction                           *timerAction;
@@ -121,6 +126,23 @@ IMPL(AQC111NIC, Start)
         return ret;
     }
     Log("Start: super OK");
+
+    // Create a dext-owned queue for Skywalk RxDispatchQueue/TxDispatchQueue slots.
+    // IIG's AQC111NIC_QueueNames registers these two names; SetDispatchQueue binds them.
+    // "Default" is intentionally NOT overridden — it is a framework-installed proxy queue
+    // with hidden internal structure that Stop_Impl's async cancel completion depends on.
+    // Replacing "Default" causes a null+0x10 crash in Stop_Impl's teardown block.
+    ret = IODispatchQueue::Create("AQC111.async", 0, 0, &ivars->asyncQueue);
+    Log("Start: asyncQueue create -> 0x%x queue=%p", ret, ivars->asyncQueue);
+    if (ret != kIOReturnSuccess) goto fail;
+
+    ret = SetDispatchQueue("RxDispatchQueue", ivars->asyncQueue);
+    Log("Start: SetDispatchQueue(RxDispatchQueue) -> 0x%x", ret);
+    if (ret != kIOReturnSuccess) goto fail;
+
+    ret = SetDispatchQueue("TxDispatchQueue", ivars->asyncQueue);
+    Log("Start: SetDispatchQueue(TxDispatchQueue) -> 0x%x", ret);
+    if (ret != kIOReturnSuccess) goto fail;
 
     // Provider is IOUSBHostInterface — Config 1, bInterfaceClass=255.
     // Config 1 is already pinned by Personality A (AQC111 device personality).
@@ -174,10 +196,15 @@ IMPL(AQC111NIC, Start)
 
     ret = ivars->interface->CopyPipe(EP_ITR, &ivars->pipeItr);
     Log("Start: CopyPipe(ITR) -> 0x%x pipe=%p", ret, ivars->pipeItr);
+    if (ret != kIOReturnSuccess || ivars->pipeItr == nullptr) goto fail;
+
     ret = ivars->interface->CopyPipe(EP_RX, &ivars->pipeRx);
     Log("Start: CopyPipe(RX)  -> 0x%x pipe=%p", ret, ivars->pipeRx);
+    if (ret != kIOReturnSuccess || ivars->pipeRx == nullptr) goto fail;
+
     ret = ivars->interface->CopyPipe(EP_TX, &ivars->pipeTx);
     Log("Start: CopyPipe(TX)  -> 0x%x pipe=%p", ret, ivars->pipeTx);
+    if (ret != kIOReturnSuccess || ivars->pipeTx == nullptr) goto fail;
 
     if (ivars->pipeItr) {
         kern_return_t csRet = ivars->pipeItr->ClearStall(false);
@@ -245,9 +272,7 @@ IMPL(AQC111NIC, Start)
             Log("Start: rxBuf[%d] alloc failed: 0x%x", i, ret);
             goto fail;
         }
-        ret = OSAction::Create(this, AQC111NIC_OnRxComplete_ID,
-                               IOUSBHostPipe_CompleteAsyncIO_ID,
-                               sizeof(uint32_t), &ivars->rxActions[i]);
+        ret = CreateActionOnRxComplete(sizeof(uint32_t), &ivars->rxActions[i]);
         if (ret != kIOReturnSuccess) {
             Log("Start: rxAction[%d] create failed: 0x%x", i, ret);
             goto fail;
@@ -268,9 +293,7 @@ IMPL(AQC111NIC, Start)
         Log("Start: itrBuf alloc failed: 0x%x", ret);
         goto fail;
     }
-    ret = OSAction::Create(this, AQC111NIC_OnItrComplete_ID,
-                           IOUSBHostPipe_CompleteAsyncIO_ID,
-                           0, &ivars->itrAction);
+    ret = CreateActionOnItrComplete(0, &ivars->itrAction);
     if (ret != kIOReturnSuccess) {
         Log("Start: itrAction create failed: 0x%x", ret);
         goto fail;
@@ -293,17 +316,19 @@ IMPL(AQC111NIC, Start)
     {
         kern_return_t tr = IOTimerDispatchSource::Create(ivars->queue, &ivars->timerTest);
         if (tr == kIOReturnSuccess) {
-            tr = OSAction::Create(this, AQC111NIC_OnTimerFired_ID,
-                                  IOTimerDispatchSource_TimerOccurred_ID,
-                                  0, &ivars->timerAction);
+            tr = CreateActionOnTimerFired(0, &ivars->timerAction);
         }
         if (tr == kIOReturnSuccess) {
             ivars->timerTest->SetHandler(ivars->timerAction);
-            uint64_t fireAt = mach_absolute_time() + 3ULL * 1000000000ULL;
-            ivars->timerTest->WakeAtTime(kIOTimerClockMachAbsoluteTime, fireAt, 0);
-            Log("Start: timer diagnostic scheduled (fires in ~3s)");
+            tr = ivars->timerTest->SetEnable(true);
+            Log("Start: timer SetEnable -> 0x%x", tr);
+        }
+        if (tr == kIOReturnSuccess) {
+            uint64_t fireAt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 3ULL * 1000000000ULL;
+            kern_return_t wr = ivars->timerTest->WakeAtTime(kIOTimerClockUptimeRaw, fireAt, 0);
+            Log("Start: timer WakeAtTime -> 0x%x (fires in ~3s)", wr);
         } else {
-            Log("Start: timer diagnostic setup failed: 0x%x", tr);
+            Log("Start: timer setup failed: 0x%x", tr);
         }
     }
 
@@ -318,19 +343,42 @@ kern_return_t
 IMPL(AQC111NIC, Stop)
 {
     Log("Stop");
-    // Cancel timer diagnostic.
+
+    // Teardown order derived from AppleUserECM RE (arm64e Stop_Impl):
+    //
+    //   1. Close interface  — kernel aborts all pending pipe IO and enqueues
+    //                         abort completion callbacks onto asyncQueue.
+    //   2. DispatchSync     — our block is enqueued at the END of asyncQueue,
+    //                         so all abort completions from step 1 have already
+    //                         fired by the time the block runs. Timer Cancel is
+    //                         also serialized here on the same queue as timer
+    //                         callbacks, preventing a cancel/fire race.
+    //   3. Release objects  — all in-flight callbacks done; safe to release.
+    //   4. SUPERDISPATCH    — last. Stop_Impl's async cleanup block fires on
+    //                         "AQC111NIC-Default" after this returns; by now
+    //                         all driver state is quiesced so the block sees
+    //                         a valid proxy and no longer crashes at +0x10.
+
+    // Step 1: close interface (implicitly aborts all pipes on this interface).
+    if (ivars->interface != nullptr) {
+        ivars->interface->Close(this, 0);
+    }
+
+    // Step 2: drain asyncQueue synchronously.
+    // Cancel the timer here, serialized with its callbacks on asyncQueue.
+    if (ivars->asyncQueue != nullptr) {
+        ivars->asyncQueue->DispatchSync(^{
+            if (ivars->timerTest != nullptr) {
+                ivars->timerTest->Cancel(nullptr);
+            }
+        });
+    }
+
+    // Step 3: release all retained objects.
     OSSafeReleaseNULL(ivars->timerAction);
     OSSafeReleaseNULL(ivars->timerTest);
-    // Abort both async pipes before releasing their buffers and actions.
-    if (ivars->pipeItr != nullptr) {
-        ivars->pipeItr->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, nullptr);
-    }
     OSSafeReleaseNULL(ivars->itrAction);
     OSSafeReleaseNULL(ivars->itrBuf);
-
-    if (ivars->pipeRx != nullptr) {
-        ivars->pipeRx->Abort(kIOUSBAbortAsynchronous, kIOReturnAborted, nullptr);
-    }
     for (int i = 0; i < RX_SLOTS; i++) {
         OSSafeReleaseNULL(ivars->rxActions[i]);
         OSSafeReleaseNULL(ivars->rxBufs[i]);
@@ -340,16 +388,15 @@ IMPL(AQC111NIC, Stop)
     OSSafeReleaseNULL(ivars->txcQueue);
     OSSafeReleaseNULL(ivars->txsQueue);
     OSSafeReleaseNULL(ivars->pool);
-    OSSafeReleaseNULL(ivars->queue);
     OSSafeReleaseNULL(ivars->pipeItr);
     OSSafeReleaseNULL(ivars->pipeRx);
     OSSafeReleaseNULL(ivars->pipeTx);
-    if (ivars->interface != nullptr) {
-        ivars->interface->Close(this, 0);
-        OSSafeReleaseNULL(ivars->interface);
-    }
-    // Device was not opened by us (Personality A holds the session); just release ref.
+    OSSafeReleaseNULL(ivars->interface);
     OSSafeReleaseNULL(ivars->device);
+    OSSafeReleaseNULL(ivars->asyncQueue);
+    OSSafeReleaseNULL(ivars->queue);
+
+    // Step 4: SUPERDISPATCH last.
     return Stop(provider, SUPERDISPATCH);
 }
 
@@ -489,10 +536,19 @@ IMPL(AQC111NIC, OnRxComplete)
     Log("OnRxComplete: slot=%u status=0x%x bytes=%u", slot, status, actualByteCount);
 
     if (status == kIOReturnAborted) {
+        return;  // Stop in progress — don't repost
+    }
+    if (status == kUSBHostReturnPipeStalled) {
+        ivars->pipeRx->ClearStall(false);
+        ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
         return;
     }
-    if (status != kIOReturnSuccess || actualByteCount < 4) {
-        Log("RX[%u] error: status=0x%x bytes=%u — reposting", slot, status, actualByteCount);
+    if (status != kIOReturnSuccess) {
+        // Terminal (device removed, not ready, etc.) — do NOT repost.
+        Log("RX[%u] terminal error: status=0x%x — not reposting", slot, status);
+        return;
+    }
+    if (actualByteCount < 4) {
         ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
         return;
     }
@@ -587,8 +643,14 @@ IMPL(AQC111NIC, OnItrComplete)
             byte1, (int)linkUp, speedCode, ls, media);
         reportLinkStatus(ls, media);
         ivars->lastLinkUp = linkUp;
+    } else if (status == kUSBHostReturnPipeStalled) {
+        Log("ITR pipe stalled — clearing stall and reposting");
+        ivars->pipeItr->ClearStall(false);
+        ivars->pipeItr->AsyncIO(ivars->itrBuf, 16, ivars->itrAction, 0);
+        return;
     } else if (status != kIOReturnSuccess) {
-        Log("ITR error: status=0x%x bytes=%u", status, actualByteCount);
+        Log("ITR terminal error: status=0x%x — not reposting", status);
+        return;
     }
 
     ivars->pipeItr->AsyncIO(ivars->itrBuf, 16, ivars->itrAction, 0);
