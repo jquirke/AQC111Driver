@@ -208,6 +208,23 @@ Direct userland confirmation after `sudo ifconfig en10 up`:
 - `media: autoselect (1000baseT <full-duplex>)`
 - `status: active`
 
+### VERIFIED: manual end-to-end `ifconfig up/down` works
+
+The NIC now responds correctly to manual interface state changes from userland:
+
+- `ifconfig en10 up` triggers `SetInterfaceEnable: 1`, arms RX/ITR async IO,
+  runs `hwEnable`, and produces the expected link pulse / active media state
+- `ifconfig en10 down` triggers `SetInterfaceEnable: 0`, aborts RX/ITR cleanly,
+  withdraws PHY advertisement, enters PHY low power, and reports link inactive
+
+Observed RX completions with `status=0xe00002eb` after `ifconfig ... down` are
+expected abort completions from the deliberate `disarmAsyncIO` path, not a new
+data-path failure.
+
+Current limitation: this is still a manual control path validated via
+`ifconfig`. Automatic lifecycle handling across attach, detach, and repeated
+development cycles still needs work.
+
 ### REMAINING BUG: zombie / teardown lifecycle still regresses after some cycles
 
 The driver can still end up in a zombie / stuck lifecycle state after repeated
@@ -215,13 +232,13 @@ attach-detach or development cycles, requiring a reboot to recover cleanly.
 That is now separate from PHY/media correctness:
 
 - PHY bring-up can produce link-up
+- manual `ifconfig en10 up/down` is end-to-end functional
 - media reporting follows the ITR speed code correctly
 - remaining instability is in lifecycle / teardown / reattach behavior
 
 ### NEXT WORK
 
-- make `ifconfig en10 down` a reversible soft shutdown:
-  stop reposting RX/ITR, withdraw advertisement, enter PHY low power, report link down
+- wire the now-working soft up/down path into broader automatic lifecycle handling
 - keep full PHY power-off for deeper stop / unplug / termination paths
 - investigate why the dext can still zombie and require reboot after some runs
 

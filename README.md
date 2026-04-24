@@ -52,20 +52,24 @@ Anyone who has done kernel debugging on other platforms will recognise the value
 
 ## Current Status
 
-The driver loads, forces Config 1, registers an Ethernet interface, opens all pipes, and successfully receives async IO callbacks (RX, TX, interrupt). Link status is parsed from the interrupt pipe. The MAC address is read from the device at start.
+The driver loads, forces Config 1, registers an Ethernet interface, opens all pipes, and successfully receives async IO callbacks. The MAC address is read from hardware. Link state is parsed from the interrupt pipe, and manual interface up/down now works end-to-end through `ifconfig`.
 
 **What works:**
 - Config 1 selection and session pinning
 - NIC personality match and `Start()` completion
 - All three pipe callbacks (RX, ITR, timer diagnostic) confirmed firing
-- Link status reporting (up/down, speed code)
 - MAC address read from hardware
+- PHY bring-up now produces a real link-up event
+- Link status reporting (up/down, speed code) and media decoding
+- Manual `ifconfig enX up` / `ifconfig enX down` soft enable/disable path
+- Soft disable aborts RX/ITR, withdraws PHY advertisement, enters low power, and reports link down
 
-**In progress / pending:**
+**What is not done yet:**
 - RX frame parsing: the DMA aggregation header sits at the **end** of the buffer (last 8 bytes), not the beginning — parsing logic needs fixing
-- `hwEnable` should run after the interrupt pipe reports link-up, not in `SetInterfaceEnable`
 - TX path not yet implemented
 - End-to-end packet flow not yet validated
+- Automatic lifecycle handling is still incomplete: attach/detach, repeated development cycles, and reattach can still regress into a stuck state that may require a reboot
+- The current validated control path is still manual (`ifconfig`), not a polished automatic bring-up/shutdown flow
 
 ---
 
