@@ -43,6 +43,7 @@
 
 static kern_return_t aqWrite(IOUSBHostInterface *iface, uint16_t addr, const void *data, uint16_t len);
 static kern_return_t aqRead(IOUSBHostInterface *iface, uint16_t addr, void *data, uint16_t len);
+static kern_return_t aqVendorOut(IOUSBHostInterface *iface, uint8_t request, const void *data, uint16_t len);
 // Reads the permanent 6-byte MAC address from device EEPROM via AQ_FLASH_PARAMETERS.
 // RE: bmRequestType=0xC0 IN|Vendor|Device, bRequest=0x20, wValue=0, wIndex=0, wLength=6.
 static kern_return_t
@@ -429,6 +430,24 @@ aqWrite(IOUSBHostInterface *iface, uint16_t addr, const void *data, uint16_t len
 }
 
 static kern_return_t
+aqVendorOut(IOUSBHostInterface *iface, uint8_t request, const void *data, uint16_t len)
+{
+    IOBufferMemoryDescriptor *buf = nullptr;
+    kern_return_t ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionOut, len, 0, &buf);
+    if (ret != kIOReturnSuccess) return ret;
+
+    IOAddressSegment range;
+    buf->GetAddressRange(&range);
+    memcpy((void *)range.address, data, len);
+    buf->SetLength(len);
+
+    uint16_t transferred = 0;
+    ret = iface->DeviceRequest(0x40, request, 0, 0, len, buf, &transferred, 10000);
+    OSSafeReleaseNULL(buf);
+    return ret;
+}
+
+static kern_return_t
 aqRead(IOUSBHostInterface *iface, uint16_t addr, void *data, uint16_t len)
 {
     IOBufferMemoryDescriptor *buf = nullptr;
@@ -447,30 +466,23 @@ aqRead(IOUSBHostInterface *iface, uint16_t addr, void *data, uint16_t len)
     return ret;
 }
 
-// Minimal hardware enable sequence derived from AqUsbHal::hwStart() +
-// AqUsbHal::hwOnLinkChange(). Assumes 1G link (GMII mode).
+// Minimal PHY-only bring-up sequence derived from Linux aqc111.c and the x86
+// IOKit RE notes. This intentionally does not enable RX or program the final
+// medium state; that belongs on the link-up path once the PHY is alive.
 static void
 hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
 {
     kern_return_t ret;
     uint8_t  b;
     uint16_t w;
- 
-    // --- FWPhyAccess init (bRequest=0x61, AQ_PHY_OPS) ---
-    {
-        uint8_t ops[4] = { 0x0F, 0x00, 0x2B, 0x07 };
-        IOBufferMemoryDescriptor *buf = nullptr;
-        if (IOBufferMemoryDescriptor::Create(kIOMemoryDirectionOut, 4, 0, &buf) == kIOReturnSuccess) {
-            IOAddressSegment range;
-            buf->GetAddressRange(&range);
-            memcpy((void *)range.address, ops, 4);
-            buf->SetLength(4);
-            uint16_t transferred = 0;
-            ret = iface->DeviceRequest(0x40, 0x61, 0, 0, 4, buf, &transferred, 10000);
-            Log("hwEnable: AQ_PHY_OPS -> 0x%x (transferred=%u)", ret, transferred);
-            OSSafeReleaseNULL(buf);
-        }
-    }
+    uint32_t phyFlags;
+
+    // RE note: the x86 driver exits PHY low-power before advertisement.
+    // We do not have the MDIO helper path wired up yet, so perform the steps
+    // we can map directly first: explicit PHY power-on and stateful advertise.
+    b = 0x02;
+    ret = aqVendorOut(iface, 0x31, &b, 1);
+    Log("hwEnable: AQ_PHY_POWER=0x02 -> 0x%x", ret);
 
     ret = aqWrite(iface, 0x0010, mac.octet, 6);
     Log("hwEnable: SFR_NODE_ID -> 0x%x", ret);
@@ -479,9 +491,57 @@ hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
     ret = aqWrite(iface, 0x0041, &b, 1);
     Log("hwEnable: BM_INT_MASK=0xFF -> 0x%x", ret);
 
-    w = 0x0000;
-    ret = aqWrite(iface, 0x000B, &w, 2);
-    Log("hwEnable: RX_CTL=0x0000 -> 0x%x", ret);
+    // Mirror the x86 driver's pre-advertise state clears before asking the PHY
+    // to negotiate. These clear MAC/path bits that should not remain latched
+    // across bring-up attempts.
+    b = 0x00;
+    ret = aqWrite(iface, 0x00B1, &b, 1);
+    Log("hwEnable: reg[0x00B1]=0x00 -> 0x%x", ret);
+
+    b = 0;
+    ret = aqRead(iface, 0x0024, &b, 1);
+    if (ret == kIOReturnSuccess) {
+        b &= 0xE0;
+        ret = aqWrite(iface, 0x0024, &b, 1);
+    }
+    Log("hwEnable: reg[0x0024]&=0xE0 -> 0x%x", ret);
+
+    b = 0;
+    ret = aqRead(iface, 0x000B, &b, 1);
+    if (ret == kIOReturnSuccess) {
+        b &= (uint8_t)~0x80;
+        ret = aqWrite(iface, 0x000B, &b, 1);
+    }
+    Log("hwEnable: reg[0x000B] clear bit7 -> 0x%x", ret);
+
+    w = 0;
+    ret = aqRead(iface, 0x0022, &w, 2);
+    if (ret == kIOReturnSuccess) {
+        w &= (uint16_t)~0x0100;
+        ret = aqWrite(iface, 0x0022, &w, 2);
+    }
+    Log("hwEnable: reg[0x0022] clear bit8 -> 0x%x", ret);
+
+    b = 0;
+    ret = aqRead(iface, 0x00B0, &b, 1);
+    if (ret == kIOReturnSuccess) {
+        b &= (uint8_t)~0x01;
+        ret = aqWrite(iface, 0x00B0, &b, 1);
+    }
+    Log("hwEnable: reg[0x00B0] clear bit0 -> 0x%x", ret);
+
+    // AQ_PHY_OPS takes the little-endian MediumFlags dword, not a hardcoded
+    // 4-byte literal. Match the Linux/x86 model: advertise all rates, pause,
+    // asym pause, PHY power enabled, downshift enabled, retries=7.
+    phyFlags = 0;
+    phyFlags |= 0x0000000Fu;  // AQ_ADV_MASK: 100M, 1G, 2.5G, 5G
+    phyFlags |= 1u << 16;     // AQ_PAUSE
+    phyFlags |= 1u << 17;     // AQ_ASYM_PAUSE
+    phyFlags |= 1u << 19;     // AQ_PHY_POWER_EN
+    phyFlags |= 1u << 21;     // AQ_DOWNSHIFT
+    phyFlags |= 7u << 24;     // AQ_DSH_RETRIES default
+    ret = aqVendorOut(iface, 0x61, &phyFlags, sizeof(phyFlags));
+    Log("hwEnable: AQ_PHY_OPS flags=0x%08x -> 0x%x", phyFlags, ret);
 
     b = 0x01;
     ret = aqWrite(iface, 0x00B7, &b, 1);
@@ -494,29 +554,6 @@ hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
     uint8_t coalesce[5] = { 0x07, 0x00, 0x01, 0x1E, 0xFF };
     ret = aqWrite(iface, 0x002E, coalesce, 5);
     Log("hwEnable: coalescing -> 0x%x", ret);
-
-    // TODO(link-up): MEDIUM_STATUS_MODE must be programmed from OnItrComplete
-    // using the ITR speed code, not here. Correct model: OnItrComplete detects
-    // link-up, reads speed code from byte[0:1], sets XGMII bit (0x0001) for
-    // 5G/2.5G only, then does two writes — first without RECEIVE_EN (0x0100),
-    // then with. Full hwOnLinkChange sequence (coalescing, RX_CTL stop/start,
-    // SFR_INTER_PACKET_GAP_0, SFR_TX_PAUSE_RESEND_T) belongs there too.
-    // For now: placeholder 1G-only write to keep RX plumbed during bringup.
-    // Do not treat 0x0032/0x0132 as the intended final values.
-    w = 0x0032;  // FULL_DUPLEX | RXFLOW | TXFLOW — 1G GMII, no XGMII
-    ret = aqWrite(iface, 0x0022, &w, 2);
-    Log("hwEnable: MEDIUM_STATUS_MODE=0x%04x (first write) -> 0x%x", w, ret);
-    w |= 0x0100;  // add RECEIVE_EN
-    ret = aqWrite(iface, 0x0022, &w, 2);
-    Log("hwEnable: MEDIUM_STATUS_MODE=0x%04x (placeholder 1G) -> 0x%x", w, ret);
-
-    b = 0x80;
-    ret = aqWrite(iface, 0x0043, &b, 1);
-    Log("hwEnable: BMRX_DMA=0x80 -> 0x%x", ret);
-
-    w = 0x0288;
-    ret = aqWrite(iface, 0x000B, &w, 2);
-    Log("hwEnable: RX_CTL=0x0288 -> 0x%x", ret);
 }
 
 static void
