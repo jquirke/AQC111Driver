@@ -43,7 +43,6 @@
 
 static kern_return_t aqWrite(IOUSBHostInterface *iface, uint16_t addr, const void *data, uint16_t len);
 static kern_return_t aqRead(IOUSBHostInterface *iface, uint16_t addr, void *data, uint16_t len);
-
 // Reads the permanent 6-byte MAC address from device EEPROM via AQ_FLASH_PARAMETERS.
 // RE: bmRequestType=0xC0 IN|Vendor|Device, bRequest=0x20, wValue=0, wIndex=0, wLength=6.
 static kern_return_t
@@ -319,8 +318,9 @@ IMPL(AQC111NIC, Start)
             tr = CreateActionOnTimerFired(0, &ivars->timerAction);
         }
         if (tr == kIOReturnSuccess) {
-            ivars->timerTest->SetHandler(ivars->timerAction);
-            tr = ivars->timerTest->SetEnable(true);
+            tr = ivars->timerTest->SetHandler(ivars->timerAction);
+            Log("Start: timer SetHandler -> 0x%x", tr);
+            if (tr == kIOReturnSuccess) tr = ivars->timerTest->SetEnable(true);
             Log("Start: timer SetEnable -> 0x%x", tr);
         }
         if (tr == kIOReturnSuccess) {
@@ -342,39 +342,41 @@ fail:
 kern_return_t
 IMPL(AQC111NIC, Stop)
 {
-    Log("Stop");
+    Log("Stop: enter");
 
-    // Teardown order derived from AppleUserECM RE (arm64e Stop_Impl):
-    //
-    //   1. Close interface  — kernel aborts all pending pipe IO and enqueues
-    //                         abort completion callbacks onto asyncQueue.
-    //   2. DispatchSync     — our block is enqueued at the END of asyncQueue,
-    //                         so all abort completions from step 1 have already
-    //                         fired by the time the block runs. Timer Cancel is
-    //                         also serialized here on the same queue as timer
-    //                         callbacks, preventing a cancel/fire race.
-    //   3. Release objects  — all in-flight callbacks done; safe to release.
-    //   4. SUPERDISPATCH    — last. Stop_Impl's async cleanup block fires on
-    //                         "AQC111NIC-Default" after this returns; by now
-    //                         all driver state is quiesced so the block sees
-    //                         a valid proxy and no longer crashes at +0x10.
+    // DispatchSync removed: during force-close/uninstall asyncQueue may not
+    // be serviceable, causing DispatchSync to block indefinitely and
+    // preventing SUPERDISPATCH from ever being called. Instead: cancel timer
+    // and abort pipes directly, then close interface.
 
-    // Step 1: close interface (implicitly aborts all pipes on this interface).
+    // Cancel timer directly (no queue serialisation needed — timer is
+    // one-shot and either already fired or idle by this point).
+    if (ivars->timerTest != nullptr) {
+        kern_return_t r = ivars->timerTest->Cancel(nullptr);
+        Log("Stop: Cancel timer -> 0x%x", r);
+    }
+
+    // Abort pipes synchronously before closing the interface.
+    // kIOUSBAbortSynchronous ensures completions have fired before returning.
+    if (ivars->pipeItr != nullptr) {
+        kern_return_t r = ivars->pipeItr->Abort(kIOUSBAbortSynchronous, kIOReturnAborted, nullptr);
+        Log("Stop: Abort ITR -> 0x%x", r);
+    }
+    if (ivars->pipeRx != nullptr) {
+        kern_return_t r = ivars->pipeRx->Abort(kIOUSBAbortSynchronous, kIOReturnAborted, nullptr);
+        Log("Stop: Abort RX -> 0x%x", r);
+    }
+    if (ivars->pipeTx != nullptr) {
+        kern_return_t r = ivars->pipeTx->Abort(kIOUSBAbortSynchronous, kIOReturnAborted, nullptr);
+        Log("Stop: Abort TX -> 0x%x", r);
+    }
+
     if (ivars->interface != nullptr) {
-        ivars->interface->Close(this, 0);
+        kern_return_t r = ivars->interface->Close(this, 0);
+        Log("Stop: Close interface -> 0x%x", r);
     }
 
-    // Step 2: drain asyncQueue synchronously.
-    // Cancel the timer here, serialized with its callbacks on asyncQueue.
-    if (ivars->asyncQueue != nullptr) {
-        ivars->asyncQueue->DispatchSync(^{
-            if (ivars->timerTest != nullptr) {
-                ivars->timerTest->Cancel(nullptr);
-            }
-        });
-    }
-
-    // Step 3: release all retained objects.
+    Log("Stop: releasing objects");
     OSSafeReleaseNULL(ivars->timerAction);
     OSSafeReleaseNULL(ivars->timerTest);
     OSSafeReleaseNULL(ivars->itrAction);
@@ -396,8 +398,10 @@ IMPL(AQC111NIC, Stop)
     OSSafeReleaseNULL(ivars->asyncQueue);
     OSSafeReleaseNULL(ivars->queue);
 
-    // Step 4: SUPERDISPATCH last.
-    return Stop(provider, SUPERDISPATCH);
+    Log("Stop: before SUPERDISPATCH");
+    kern_return_t ret = Stop(provider, SUPERDISPATCH);
+    Log("Stop: after SUPERDISPATCH ret=0x%x", ret);
+    return ret;
 }
 
 // --- Hardware register access ---
@@ -451,7 +455,7 @@ hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
     kern_return_t ret;
     uint8_t  b;
     uint16_t w;
-
+ 
     // --- FWPhyAccess init (bRequest=0x61, AQ_PHY_OPS) ---
     {
         uint8_t ops[4] = { 0x0F, 0x00, 0x2B, 0x07 };
@@ -476,25 +480,39 @@ hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
     Log("hwEnable: BM_INT_MASK=0xFF -> 0x%x", ret);
 
     w = 0x0000;
-    aqWrite(iface, 0x000B, &w, 2);
+    ret = aqWrite(iface, 0x000B, &w, 2);
+    Log("hwEnable: RX_CTL=0x0000 -> 0x%x", ret);
 
     b = 0x01;
-    aqWrite(iface, 0x00B7, &b, 1);
+    ret = aqWrite(iface, 0x00B7, &b, 1);
+    Log("hwEnable: ETH_MAC_PATH=0x01 -> 0x%x", ret);
 
     b = 0x02;
-    aqWrite(iface, 0x00B9, &b, 1);
+    ret = aqWrite(iface, 0x00B9, &b, 1);
+    Log("hwEnable: BULK_OUT_CTRL=0x02 -> 0x%x", ret);
 
     uint8_t coalesce[5] = { 0x07, 0x00, 0x01, 0x1E, 0xFF };
-    aqWrite(iface, 0x002E, coalesce, 5);
+    ret = aqWrite(iface, 0x002E, coalesce, 5);
+    Log("hwEnable: coalescing -> 0x%x", ret);
 
-    w = 0x0032;
-    aqWrite(iface, 0x0022, &w, 2);
-    w |= 0x0100;
+    // TODO(link-up): MEDIUM_STATUS_MODE must be programmed from OnItrComplete
+    // using the ITR speed code, not here. Correct model: OnItrComplete detects
+    // link-up, reads speed code from byte[0:1], sets XGMII bit (0x0001) for
+    // 5G/2.5G only, then does two writes — first without RECEIVE_EN (0x0100),
+    // then with. Full hwOnLinkChange sequence (coalescing, RX_CTL stop/start,
+    // SFR_INTER_PACKET_GAP_0, SFR_TX_PAUSE_RESEND_T) belongs there too.
+    // For now: placeholder 1G-only write to keep RX plumbed during bringup.
+    // Do not treat 0x0032/0x0132 as the intended final values.
+    w = 0x0032;  // FULL_DUPLEX | RXFLOW | TXFLOW — 1G GMII, no XGMII
     ret = aqWrite(iface, 0x0022, &w, 2);
-    Log("hwEnable: MEDIUM_STATUS_MODE=0x%04x -> 0x%x", w, ret);
+    Log("hwEnable: MEDIUM_STATUS_MODE=0x%04x (first write) -> 0x%x", w, ret);
+    w |= 0x0100;  // add RECEIVE_EN
+    ret = aqWrite(iface, 0x0022, &w, 2);
+    Log("hwEnable: MEDIUM_STATUS_MODE=0x%04x (placeholder 1G) -> 0x%x", w, ret);
 
     b = 0x80;
-    aqWrite(iface, 0x0043, &b, 1);
+    ret = aqWrite(iface, 0x0043, &b, 1);
+    Log("hwEnable: BMRX_DMA=0x80 -> 0x%x", ret);
 
     w = 0x0288;
     ret = aqWrite(iface, 0x000B, &w, 2);
@@ -504,19 +522,24 @@ hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
 static void
 hwDisable(IOUSBHostInterface *iface)
 {
+    kern_return_t r;
     uint16_t w;
     uint8_t  b;
 
     w = 0x0000;
-    aqWrite(iface, 0x000B, &w, 2);
+    r = aqWrite(iface, 0x000B, &w, 2);
+    Log("hwDisable: RX_CTL=0x0000 -> 0x%x", r);
 
     w = 0;
-    aqRead(iface, 0x0022, &w, 2);
+    r = aqRead(iface, 0x0022, &w, 2);
+    Log("hwDisable: read MEDIUM_STATUS_MODE -> 0x%x val=0x%04x", r, w);
     w &= ~(uint16_t)0x0100;
-    aqWrite(iface, 0x0022, &w, 2);
+    r = aqWrite(iface, 0x0022, &w, 2);
+    Log("hwDisable: MEDIUM_STATUS_MODE=0x%04x (clear RECEIVE_EN) -> 0x%x", w, r);
 
     b = 0x00;
-    aqWrite(iface, 0x0043, &b, 1);
+    r = aqWrite(iface, 0x0043, &b, 1);
+    Log("hwDisable: BMRX_DMA=0x00 -> 0x%x", r);
 }
 
 // --- OSAction dispatch diagnostic ---
@@ -539,8 +562,10 @@ IMPL(AQC111NIC, OnRxComplete)
         return;  // Stop in progress — don't repost
     }
     if (status == kUSBHostReturnPipeStalled) {
-        ivars->pipeRx->ClearStall(false);
-        ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
+        kern_return_t r = ivars->pipeRx->ClearStall(false);
+        Log("RX[%u] stall ClearStall -> 0x%x", slot, r);
+        r = ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
+        Log("RX[%u] stall repost -> 0x%x", slot, r);
         return;
     }
     if (status != kIOReturnSuccess) {
@@ -549,7 +574,8 @@ IMPL(AQC111NIC, OnRxComplete)
         return;
     }
     if (actualByteCount < 4) {
-        ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
+        kern_return_t r = ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
+        Log("RX[%u] short buffer repost -> 0x%x", slot, r);
         return;
     }
 
@@ -566,7 +592,8 @@ IMPL(AQC111NIC, OnRxComplete)
     uint32_t desc_off  = (header & 0xFFFFE000) >> 13;
 
     if (pkt_count == 0 || desc_off + pkt_count * 8 > actualByteCount) {
-        ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
+        kern_return_t r = ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
+        Log("RX[%u] bad header repost -> 0x%x", slot, r);
         return;
     }
 
@@ -599,7 +626,8 @@ IMPL(AQC111NIC, OnRxComplete)
         Log("RX[%u] %u bytes → %u/%u frames delivered", slot, actualByteCount, delivered, pkt_count);
     }
 
-    ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
+    kern_return_t r = ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
+    Log("RX[%u] repost -> 0x%x", slot, r);
 }
 
 // --- ITR (interrupt IN) path — link status ---
@@ -644,16 +672,18 @@ IMPL(AQC111NIC, OnItrComplete)
         reportLinkStatus(ls, media);
         ivars->lastLinkUp = linkUp;
     } else if (status == kUSBHostReturnPipeStalled) {
-        Log("ITR pipe stalled — clearing stall and reposting");
-        ivars->pipeItr->ClearStall(false);
-        ivars->pipeItr->AsyncIO(ivars->itrBuf, 16, ivars->itrAction, 0);
+        kern_return_t r = ivars->pipeItr->ClearStall(false);
+        Log("ITR stall ClearStall -> 0x%x", r);
+        r = ivars->pipeItr->AsyncIO(ivars->itrBuf, 16, ivars->itrAction, 0);
+        Log("ITR stall repost -> 0x%x", r);
         return;
     } else if (status != kIOReturnSuccess) {
         Log("ITR terminal error: status=0x%x — not reposting", status);
         return;
     }
 
-    ivars->pipeItr->AsyncIO(ivars->itrBuf, 16, ivars->itrAction, 0);
+    kern_return_t r = ivars->pipeItr->AsyncIO(ivars->itrBuf, 16, ivars->itrAction, 0);
+    Log("ITR repost -> 0x%x", r);
 }
 
 // --- LOCAL overrides ---
