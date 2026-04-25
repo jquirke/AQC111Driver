@@ -13,6 +13,7 @@
 #include <Availability.h>
 #include <DriverKit/IOService.iig>
 #include <DriverKit/IOTimerDispatchSource.iig>
+#include <DriverKit/IODataQueueDispatchSource.iig>
 #include <NetworkingDriverKit/IOUserNetworkEthernet.iig>
 #include <USBDriverKit/IOUSBHostPipe.iig>
 
@@ -52,6 +53,17 @@ public:
     virtual void
     OnTimerFired(OSAction * action,
                  uint64_t time) TYPE(IOTimerDispatchSource::TimerOccurred);
+
+    // TX path — fired by IODataQueueDispatchSource when stack enqueues a packet
+    virtual void
+    TxPacketAvailable(OSAction * action) TYPE(IODataQueueDispatchSource::DataAvailable);
+
+    // TX USB bulk OUT completion
+    virtual void
+    OnTxComplete(OSAction * action,
+                 IOReturn status,
+                 uint32_t actualByteCount,
+                 uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
 
     // Media support
     virtual kern_return_t

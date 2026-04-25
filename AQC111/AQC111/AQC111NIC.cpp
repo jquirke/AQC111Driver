@@ -114,6 +114,12 @@ struct AQC111NIC_IVars {
     bool                                dumpedRx80;
     bool                                dumpedRx432;
     bool                                dumpedRxOther;
+    // TX path — one frame in flight at a time
+    IOBufferMemoryDescriptor           *txBuf;           // staging buffer: 2-byte hdr + frame
+    OSAction                           *txPacketAction;  // TxPacketAvailable OSAction
+    OSAction                           *txCompleteAction;// OnTxComplete OSAction
+    IOUserNetworkPacket                *txInFlight;      // packet held during USB flight
+    bool                                txBusy;
 };
 
 bool
@@ -280,12 +286,40 @@ IMPL(AQC111NIC, Start)
     queues[2] = ivars->rxsQueue;
     queues[3] = ivars->rxcQueue;
 
+    ret = SetTxPacketHeadroom(2);
+    Log("Start: SetTxPacketHeadroom(2) -> 0x%x", ret);
+
     ret = RegisterEthernetInterface(macAddress, ivars->pool, queues, 4);
     if (ret != kIOReturnSuccess) {
         Log("Start: RegisterEthernetInterface failed: 0x%x", ret);
         goto fail;
     }
     Log("Start: RegisterEthernetInterface OK");
+
+    // --- TX path ---
+    // Wire up TxPacketAvailable: stack notifies via IODataQueueDispatchSource
+    // when it enqueues a packet onto txsQueue.
+    ret = CreateActionTxPacketAvailable(0, &ivars->txPacketAction);
+    if (ret != kIOReturnSuccess) { Log("Start: CreateActionTxPacketAvailable failed: 0x%x", ret); goto fail; }
+
+    {
+        IODataQueueDispatchSource *txDataQueue = nullptr;
+        ret = ivars->txsQueue->CopyDataQueue(&txDataQueue);
+        Log("Start: txsQueue CopyDataQueue -> 0x%x dq=%p", ret, txDataQueue);
+        if (ret == kIOReturnSuccess && txDataQueue != nullptr) {
+            ret = txDataQueue->SetDataAvailableHandler(ivars->txPacketAction);
+            Log("Start: SetDataAvailableHandler -> 0x%x", ret);
+            OSSafeReleaseNULL(txDataQueue);
+        }
+        if (ret != kIOReturnSuccess) goto fail;
+    }
+
+    ret = CreateActionOnTxComplete(0, &ivars->txCompleteAction);
+    if (ret != kIOReturnSuccess) { Log("Start: CreateActionOnTxComplete failed: 0x%x", ret); goto fail; }
+
+    // Staging buffer: 2-byte LE length header + max Ethernet frame (1518 w/ VLAN)
+    ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionOut, 2 + 1518, 0, &ivars->txBuf);
+    if (ret != kIOReturnSuccess) { Log("Start: txBuf alloc failed: 0x%x", ret); goto fail; }
 
     // Post 10 outstanding RX bulk IN transfers.
     for (int i = 0; i < RX_SLOTS; i++) {
@@ -411,6 +445,9 @@ IMPL(AQC111NIC, Stop)
         OSSafeReleaseNULL(ivars->rxActions[i]);
         OSSafeReleaseNULL(ivars->rxBufs[i]);
     }
+    OSSafeReleaseNULL(ivars->txCompleteAction);
+    OSSafeReleaseNULL(ivars->txPacketAction);
+    OSSafeReleaseNULL(ivars->txBuf);
     OSSafeReleaseNULL(ivars->rxcQueue);
     OSSafeReleaseNULL(ivars->rxsQueue);
     OSSafeReleaseNULL(ivars->txcQueue);
@@ -893,6 +930,86 @@ void
 IMPL(AQC111NIC, OnTimerFired)
 {
     Log("OnTimerFired: OSAction dispatch CONFIRMED WORKING (time=%llu)", time);
+}
+
+// --- TX path ---
+//
+// Wire format (SFR_BULK_OUT_EFF_EN=0x02 already set in hwEnable):
+//   [uint16_t frame_len LE][raw Ethernet frame]
+// Matches Linux aqc111_tx_fixup. One frame in flight at a time.
+
+static void
+txDrainOne(AQC111NIC_IVars *ivars)
+{
+    if (ivars->txBusy || !ivars->interfaceEnabled || !ivars->ioArmed) {
+        return;
+    }
+
+    IOUserNetworkPacket *packets[1];
+    uint32_t count = ivars->txsQueue->DequeuePackets(packets, 1);
+    if (count == 0) return;
+
+    IOUserNetworkPacket *pkt = packets[0];
+    uint16_t dataOffset = pkt->getDataOffset();
+    uint32_t dataLen    = pkt->getDataLength();
+    const uint8_t *frame = (const uint8_t *)(uintptr_t)pkt->getDataVirtualAddress() + dataOffset;
+
+    Log("txDrainOne: pkt=%p offset=%u len=%u", pkt, (unsigned)dataOffset, dataLen);
+
+    if (dataLen == 0 || dataLen > 1514) {
+        Log("txDrainOne: bad len=%u, dropping", dataLen);
+        pkt->setCompletionStatus(kIOReturnError);
+        ivars->txcQueue->EnqueuePacket(pkt);
+        return;
+    }
+
+    // Build staging buffer: 2-byte LE length + raw frame
+    IOAddressSegment range;
+    ivars->txBuf->GetAddressRange(&range);
+    uint8_t *txp = (uint8_t *)range.address;
+    txp[0] = (uint8_t)(dataLen & 0xFF);
+    txp[1] = (uint8_t)(dataLen >> 8);
+    memcpy(txp + 2, frame, dataLen);
+    uint32_t txLen = 2 + dataLen;
+    ivars->txBuf->SetLength(txLen);
+
+    ivars->txInFlight = pkt;
+    ivars->txBusy     = true;
+
+    kern_return_t r = ivars->pipeTx->AsyncIO(ivars->txBuf, txLen, ivars->txCompleteAction, 0);
+    Log("txDrainOne: AsyncIO txLen=%u -> 0x%x", txLen, r);
+    if (r != kIOReturnSuccess) {
+        ivars->txBusy     = false;
+        ivars->txInFlight = nullptr;
+        pkt->setCompletionStatus(r);
+        ivars->txcQueue->EnqueuePacket(pkt);
+    }
+}
+
+void
+IMPL(AQC111NIC, TxPacketAvailable)
+{
+    Log("TxPacketAvailable: fired");
+    txDrainOne(ivars);
+}
+
+void
+IMPL(AQC111NIC, OnTxComplete)
+{
+    Log("OnTxComplete: status=0x%x bytes=%u", status, actualByteCount);
+
+    IOUserNetworkPacket *pkt = ivars->txInFlight;
+    ivars->txInFlight = nullptr;
+    ivars->txBusy     = false;
+
+    if (pkt != nullptr) {
+        pkt->setCompletionStatus(status == kIOReturnSuccess ? kIOReturnSuccess : kIOReturnError);
+        kern_return_t r = ivars->txcQueue->EnqueuePacket(pkt);
+        Log("OnTxComplete: EnqueuePacket -> 0x%x", r);
+    }
+
+    // Drain next queued packet if one arrived while we were in flight
+    txDrainOne(ivars);
 }
 
 // --- RX path ---
