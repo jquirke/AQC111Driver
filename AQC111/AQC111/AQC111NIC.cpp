@@ -20,6 +20,7 @@
 //
 
 #include <os/log.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -44,6 +45,21 @@
 static kern_return_t aqWrite(IOUSBHostInterface *iface, uint16_t addr, const void *data, uint16_t len);
 static kern_return_t aqRead(IOUSBHostInterface *iface, uint16_t addr, void *data, uint16_t len);
 static kern_return_t aqVendorOut(IOUSBHostInterface *iface, uint8_t request, const void *data, uint16_t len);
+static void disarmAsyncIO(struct AQC111NIC_IVars *ivars);
+static void hwDisable(IOUSBHostInterface *iface);
+static void hwOnLinkUp(IOUSBHostInterface *iface, uint8_t speedCode);
+static void hwOnLinkDown(IOUSBHostInterface *iface);
+static void ensureRxStarted(struct AQC111NIC_IVars *ivars, uint8_t speedCode);
+static void ensureRxStopped(struct AQC111NIC_IVars *ivars);
+static void resetEnablePath(struct AQC111NIC_IVars *ivars);
+static void dumpRxBytes(const uint8_t *buf, uint32_t actualByteCount, uint32_t slot, IOReturn status);
+struct RxParseInfo {
+    uint32_t headerOffset;
+    uint32_t packetBaseOffset;
+    uint32_t descriptorOffset;
+    uint32_t packetCount;
+};
+static bool parseRxLayout(const uint8_t *buf, uint32_t actualByteCount, RxParseInfo *info);
 // Reads the permanent 6-byte MAC address from device EEPROM via AQ_FLASH_PARAMETERS.
 // RE: bmRequestType=0xC0 IN|Vendor|Device, bRequest=0x20, wValue=0, wIndex=0, wLength=6.
 static kern_return_t
@@ -85,6 +101,7 @@ struct AQC111NIC_IVars {
     OSAction                           *itrAction;
     bool                                lastLinkUp;
     bool                                interfaceEnabled;
+    bool                                rxStarted;
     bool                                ioArmed;
     IOUserNetworkMACAddress             macAddress;
     // Dext-owned queue for OSAction callbacks (timer, USB async IO).
@@ -94,6 +111,9 @@ struct AQC111NIC_IVars {
     // OSAction dispatch diagnostic
     IOTimerDispatchSource              *timerTest;
     OSAction                           *timerAction;
+    bool                                dumpedRx80;
+    bool                                dumpedRx432;
+    bool                                dumpedRxOther;
 };
 
 bool
@@ -606,6 +626,228 @@ hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
 }
 
 static void
+hwOnLinkUp(IOUSBHostInterface *iface, uint8_t speedCode)
+{
+    kern_return_t r;
+    uint16_t rxCtl;
+    uint16_t medium;
+    uint8_t b;
+    uint8_t coalesce[5] = { 0x07, 0x00, 0x01, 0x1E, 0xFF };
+
+    // Mirror the Linux/x86 receive-start sequence on actual link-up.
+    rxCtl = 0x0000;
+    r = aqWrite(iface, 0x000B, &rxCtl, 2);
+    Log("hwOnLinkUp: RX_CTL=0x0000 -> 0x%x", r);
+
+    b = 0x01;
+    r = aqWrite(iface, 0x00B7, &b, 1);
+    Log("hwOnLinkUp: ETH_MAC_PATH=0x01 -> 0x%x", r);
+
+    b = 0x02;
+    r = aqWrite(iface, 0x00B9, &b, 1);
+    Log("hwOnLinkUp: BULK_OUT_CTRL=0x02 -> 0x%x", r);
+
+    if (speedCode == 0x13) {
+        coalesce[1] = 0xA0;
+        coalesce[2] = 0x00;
+        coalesce[3] = 0x14;
+        coalesce[4] = 0x00;
+    }
+    r = aqWrite(iface, 0x002E, coalesce, sizeof(coalesce));
+    Log("hwOnLinkUp: coalescing(speed=0x%02x) -> 0x%x", speedCode, r);
+
+    medium = 0x0002 | 0x0010 | 0x0020;  // full duplex + RX/TX flow control
+    if (speedCode == 0x0F || speedCode == 0x10) {
+        medium |= 0x0001;  // XGMIIMODE for 5G / 2.5G
+    }
+    r = aqWrite(iface, 0x0022, &medium, 2);
+    Log("hwOnLinkUp: MEDIUM_STATUS_MODE=0x%04x -> 0x%x", medium, r);
+
+    medium |= 0x0100;  // RECEIVE_EN
+    r = aqWrite(iface, 0x0022, &medium, 2);
+    Log("hwOnLinkUp: MEDIUM_STATUS_MODE|=RECEIVE_EN => 0x%04x -> 0x%x", medium, r);
+
+    b = 0x10;  // SFR_VLAN_CONTROL_VSO
+    r = aqWrite(iface, 0x002B, &b, 1);
+    Log("hwOnLinkUp: VLAN_ID_CONTROL=0x10 -> 0x%x", r);
+
+    // The x86 path also touches speed-dependent secondary controls here
+    // (0x0046, 0x009e). Keep this patch minimal and focus first on the
+    // must-have RX producer enables.
+    rxCtl = 0x0288;  // default hwSetFilters: IPE | START | AB
+    r = aqWrite(iface, 0x000B, &rxCtl, 2);
+    Log("hwOnLinkUp: RX_CTL=0x%04x -> 0x%x", rxCtl, r);
+}
+
+static void
+hwOnLinkDown(IOUSBHostInterface *iface)
+{
+    kern_return_t r;
+    uint16_t rxCtl;
+    uint16_t medium;
+
+    rxCtl = 0x0000;
+    r = aqWrite(iface, 0x000B, &rxCtl, 2);
+    Log("hwOnLinkDown: RX_CTL=0x0000 -> 0x%x", r);
+
+    medium = 0;
+    r = aqRead(iface, 0x0022, &medium, 2);
+    Log("hwOnLinkDown: read MEDIUM_STATUS_MODE -> 0x%x val=0x%04x", r, medium);
+    if (r == kIOReturnSuccess) {
+        medium &= (uint16_t)~0x0100;
+        r = aqWrite(iface, 0x0022, &medium, 2);
+    }
+    Log("hwOnLinkDown: MEDIUM_STATUS_MODE&=~RECEIVE_EN => 0x%04x -> 0x%x", medium, r);
+}
+
+static void
+ensureRxStarted(AQC111NIC_IVars *ivars, uint8_t speedCode)
+{
+    if (ivars == nullptr || !ivars->interfaceEnabled) {
+        return;
+    }
+    if (ivars->rxStarted) {
+        Log("ensureRxStarted: already started");
+        return;
+    }
+    hwOnLinkUp(ivars->interface, speedCode);
+    ivars->rxStarted = true;
+    Log("ensureRxStarted: started speed=0x%02x", speedCode);
+}
+
+static void
+ensureRxStopped(AQC111NIC_IVars *ivars)
+{
+    if (ivars == nullptr) {
+        return;
+    }
+    if (!ivars->rxStarted) {
+        Log("ensureRxStopped: already stopped");
+        return;
+    }
+    hwOnLinkDown(ivars->interface);
+    ivars->rxStarted = false;
+    Log("ensureRxStopped: stopped");
+}
+
+static void
+resetEnablePath(AQC111NIC_IVars *ivars)
+{
+    if (ivars == nullptr) {
+        return;
+    }
+
+    // `ifconfig up` needs to be strong enough to recreate the transient RX-working
+    // state seen earlier, not just leave previously armed USB state in place.
+    ensureRxStopped(ivars);
+    disarmAsyncIO(ivars);
+    hwDisable(ivars->interface);
+
+    if (ivars->pipeItr != nullptr) {
+        kern_return_t r = ivars->pipeItr->ClearStall(false);
+        Log("resetEnablePath: ClearStall ITR -> 0x%x", r);
+    }
+    if (ivars->pipeRx != nullptr) {
+        kern_return_t r = ivars->pipeRx->ClearStall(false);
+        Log("resetEnablePath: ClearStall RX -> 0x%x", r);
+    }
+    if (ivars->pipeTx != nullptr) {
+        kern_return_t r = ivars->pipeTx->ClearStall(false);
+        Log("resetEnablePath: ClearStall TX -> 0x%x", r);
+    }
+
+    ivars->lastLinkUp = false;
+    ivars->rxStarted = false;
+}
+
+static void
+dumpRxBytes(const uint8_t *buf, uint32_t actualByteCount, uint32_t slot, IOReturn status)
+{
+    if (buf == nullptr || actualByteCount == 0) {
+        return;
+    }
+
+    auto dumpRange = [buf, slot](uint32_t start, uint32_t end) {
+        for (uint32_t i = start; i < end; i += 16) {
+            char line[96];
+            int n = snprintf(line, sizeof(line), "RXDUMP[%u] %04x:", slot, (unsigned)i);
+            for (uint32_t j = 0; j < 16 && i + j < end && n > 0 && n < (int)sizeof(line); j++) {
+                n += snprintf(line + n, sizeof(line) - (size_t)n, " %02x", buf[i + j]);
+            }
+            Log("%s", line);
+        }
+    };
+
+    Log("RXDUMP slot=%u status=0x%x bytes=%u", slot, status, actualByteCount);
+
+    if (actualByteCount <= 512) {
+        dumpRange(0, actualByteCount);
+        return;
+    }
+
+    dumpRange(0, 64);
+    Log("RXDUMP[%u] ...", slot);
+    dumpRange(actualByteCount - 64, actualByteCount);
+}
+
+static bool
+parseRxLayoutCandidate(const uint8_t *buf, uint32_t actualByteCount, uint32_t headerOffset,
+                       uint32_t packetBaseOffset, RxParseInfo *info)
+{
+    if (buf == nullptr || info == nullptr || actualByteCount < headerOffset + sizeof(uint32_t)) {
+        return false;
+    }
+
+    uint32_t header    = *(const uint32_t *)(buf + headerOffset);
+    uint32_t pktCount  = header & 0x1FFF;
+    uint32_t descOff   = (header & 0xFFFFE000) >> 13;
+    uint32_t descBytes = pktCount * 8;
+
+    if (pktCount == 0 || descOff < packetBaseOffset || descOff + descBytes > actualByteCount) {
+        return false;
+    }
+
+    if (headerOffset != 0 && descOff + descBytes > headerOffset) {
+        return false;
+    }
+
+    uint32_t pktOffset = packetBaseOffset;
+    for (uint32_t i = 0; i < pktCount; i++) {
+        uint64_t pd      = *(const uint64_t *)(buf + descOff + i * 8);
+        uint32_t pktLen  = (uint32_t)((pd & 0x7FFF0000) >> 16);
+
+        if (pktLen == 0) {
+            return false;
+        }
+        if (pktOffset + pktLen > descOff) {
+            return false;
+        }
+        pktOffset += pktLen;
+    }
+
+    info->headerOffset     = headerOffset;
+    info->packetBaseOffset = packetBaseOffset;
+    info->descriptorOffset = descOff;
+    info->packetCount      = pktCount;
+    return true;
+}
+
+static bool
+parseRxLayout(const uint8_t *buf, uint32_t actualByteCount, RxParseInfo *info)
+{
+    if (parseRxLayoutCandidate(buf, actualByteCount, 0, 4, info)) {
+        return true;
+    }
+    if (actualByteCount >= 8 && parseRxLayoutCandidate(buf, actualByteCount, actualByteCount - 8, 0, info)) {
+        return true;
+    }
+    if (actualByteCount >= 4 && parseRxLayoutCandidate(buf, actualByteCount, actualByteCount - 4, 0, info)) {
+        return true;
+    }
+    return false;
+}
+
+static void
 hwDisable(IOUSBHostInterface *iface)
 {
     kern_return_t r;
@@ -686,29 +928,43 @@ IMPL(AQC111NIC, OnRxComplete)
         return;
     }
 
-    // Parse aggregated RX buffer.
-    // Layout: [4-byte header][pkt0: 2B pad + payload][pkt1...][N × 8-byte descriptors at desc_off]
-    // NOTE: Linux reads the DMA header from the last 8 bytes of the buffer, not the first 4.
-    // This parsing logic needs reconciliation once callbacks are confirmed firing.
+    // Parse aggregated RX buffer. Hardware revisions / reverse-engineering notes disagree on
+    // whether the 4-byte aggregation header is at offset 0 or in the final 8 bytes, so accept
+    // whichever layout validates cleanly against the completed transfer length.
     IOAddressSegment range;
     ivars->rxBufs[slot]->GetAddressRange(&range);
     const uint8_t *buf = (const uint8_t *)range.address;
+    RxParseInfo layout = {};
 
-    uint32_t header    = *(const uint32_t *)buf;
-    uint32_t pkt_count = header & 0x1FFF;
-    uint32_t desc_off  = (header & 0xFFFFE000) >> 13;
+    bool shouldDump = false;
+    if (actualByteCount == 80 && !ivars->dumpedRx80) {
+        ivars->dumpedRx80 = true;
+        shouldDump = true;
+    } else if (actualByteCount == 432 && !ivars->dumpedRx432) {
+        ivars->dumpedRx432 = true;
+        shouldDump = true;
+    } else if (!ivars->dumpedRxOther) {
+        ivars->dumpedRxOther = true;
+        shouldDump = true;
+    }
+    if (shouldDump) {
+        dumpRxBytes(buf, actualByteCount, slot, status);
+    }
 
-    if (pkt_count == 0 || desc_off + pkt_count * 8 > actualByteCount) {
+    if (!parseRxLayout(buf, actualByteCount, &layout)) {
         kern_return_t r = ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
         Log("RX[%u] bad header repost -> 0x%x", slot, r);
         return;
     }
 
-    uint32_t pkt_offset = 4;
+    Log("RX[%u] parsed layout: hdr=%u pkt_base=%u desc=%u count=%u",
+        slot, layout.headerOffset, layout.packetBaseOffset, layout.descriptorOffset, layout.packetCount);
+
+    uint32_t pkt_offset = layout.packetBaseOffset;
     uint32_t delivered  = 0;
 
-    for (uint32_t i = 0; i < pkt_count; i++) {
-        uint64_t pd      = *(const uint64_t *)(buf + desc_off + i * 8);
+    for (uint32_t i = 0; i < layout.packetCount; i++) {
+        uint64_t pd      = *(const uint64_t *)(buf + layout.descriptorOffset + i * 8);
         bool     drop    = (pd >> 31) & 1;
         bool     ok      = (pd >> 11) & 1;
         uint32_t pkt_len = (uint32_t)((pd & 0x7FFF0000) >> 16);
@@ -716,13 +972,56 @@ IMPL(AQC111NIC, OnRxComplete)
         if (!drop && ok && pkt_len > 2) {
             uint32_t frame_len = pkt_len - 2;
 
+            if (frame_len < 14) {
+                Log("RX[%u] frame[%u] too short for Ethernet: pkt_len=%u frame_len=%u",
+                    slot, i, pkt_len, frame_len);
+                pkt_offset += pkt_len;
+                continue;
+            }
+
+            const uint8_t *frame = buf + pkt_offset + 2;
+            uint16_t etherType = ((uint16_t)frame[12] << 8) | frame[13];
+            Log("RX[%u] frame[%u]: pkt_len=%u frame_len=%u dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x type=0x%04x",
+                slot, i, pkt_len, frame_len,
+                frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
+                frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
+                etherType);
+            if (frame_len >= 32) {
+                Log("RX[%u] frame[%u] first32: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                    slot, i,
+                    frame[0], frame[1], frame[2], frame[3], frame[4], frame[5], frame[6], frame[7],
+                    frame[8], frame[9], frame[10], frame[11], frame[12], frame[13], frame[14], frame[15],
+                    frame[16], frame[17], frame[18], frame[19], frame[20], frame[21], frame[22], frame[23],
+                    frame[24], frame[25], frame[26], frame[27], frame[28], frame[29], frame[30], frame[31]);
+            } else {
+                Log("RX[%u] frame[%u] first32 unavailable: frame_len=%u", slot, i, frame_len);
+            }
+
             IOUserNetworkPacket *pkt = nullptr;
-            if (ivars->pool->allocatePacket(&pkt) == kIOReturnSuccess) {
+            IOReturn allocRet = ivars->pool->allocatePacket(&pkt);
+            if (allocRet == kIOReturnSuccess && pkt != nullptr) {
                 uint8_t *dst = (uint8_t *)pkt->getDataVirtualAddress();
-                memcpy(dst, buf + pkt_offset + 2, frame_len);
-                pkt->setDataLength(frame_len);
-                ivars->rxcQueue->EnqueuePacket(pkt);
-                delivered++;
+                memcpy(dst, frame, frame_len);
+
+                IOReturn prepRet = pkt->prepareWithQueue(ivars->rxcQueue, kIOUserNetworkPacketDirectionRx);
+                IOReturn offRet = pkt->setDataOffsetAndLength(0, frame_len);
+                IOReturn lhlRet = pkt->setLinkHeaderLength(14);
+                pkt->setCompletionStatus(kIOReturnSuccess);
+                IOUserNetworkPacket *packetArray[1] = { pkt };
+                IOReturn enqRet = ivars->rxcQueue->enqueuePackets(packetArray, 1);
+                Log("RX[%u] frame[%u] packet metadata: prepare=0x%x offLen=0x%x linkHdr=0x%x enqueuePackets=0x%x",
+                    slot, i, prepRet, offRet, lhlRet, enqRet);
+
+                if (enqRet == kIOReturnSuccess) {
+                    delivered++;
+                } else {
+                    IOReturn deallocRet = ivars->pool->deallocatePacket(pkt);
+                    Log("RX[%u] frame[%u] deallocate after enqueue failure -> 0x%x",
+                        slot, i, deallocRet);
+                }
+            } else {
+                Log("RX[%u] frame[%u] allocatePacket failed -> 0x%x pkt=%p",
+                    slot, i, allocRet, pkt);
             }
         }
 
@@ -730,7 +1029,7 @@ IMPL(AQC111NIC, OnRxComplete)
     }
 
     if (delivered > 0) {
-        Log("RX[%u] %u bytes → %u/%u frames delivered", slot, actualByteCount, delivered, pkt_count);
+        Log("RX[%u] %u bytes → %u/%u frames delivered", slot, actualByteCount, delivered, layout.packetCount);
     }
 
     kern_return_t r = ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
@@ -767,6 +1066,8 @@ IMPL(AQC111NIC, OnItrComplete)
                               kIOUserNetworkMediaOptionFlowControl;
         MediaWord media = kIOUserNetworkMediaEthernetAuto;
         if (linkUp) {
+            ivars->lastLinkUp = true;
+            ensureRxStarted(ivars, speedCode);
             switch (speedCode) {
                 case 0x0F: media = kIOUserNetworkMediaEthernet5000BaseT | opts; break;
                 case 0x10: media = kIOUserNetworkMediaEthernet2500BaseT | opts; break;
@@ -774,6 +1075,9 @@ IMPL(AQC111NIC, OnItrComplete)
                 case 0x13: media = kIOUserNetworkMediaEthernet100BaseTX | opts; break;
                 default:   media = kIOUserNetworkMediaEthernet1000BaseT | opts; break;
             }
+        } else {
+            ivars->lastLinkUp = false;
+            ensureRxStopped(ivars);
         }
 
         LinkStatus ls = linkUp ? kIOUserNetworkLinkStatusActive
@@ -781,7 +1085,6 @@ IMPL(AQC111NIC, OnItrComplete)
         Log("ITR: byte1=0x%02x linkUp=%d speed=0x%02x -> reportLinkStatus(0x%x, 0x%x)",
             byte1, (int)linkUp, speedCode, ls, media);
         reportLinkStatus(ls, media);
-        ivars->lastLinkUp = linkUp;
     } else if (status == kUSBHostReturnPipeStalled) {
         kern_return_t r = ivars->pipeItr->ClearStall(false);
         Log("ITR stall ClearStall -> 0x%x", r);
@@ -837,13 +1140,29 @@ IMPL(AQC111NIC, SetInterfaceEnable)
     Log("SetInterfaceEnable: %d", isEnable);
     if (isEnable) {
         ivars->interfaceEnabled = true;
+
+        kern_return_t r;
+        r = ivars->txsQueue->SetEnable(true); Log("SetInterfaceEnable: txsQueue SetEnable -> 0x%x", r);
+        r = ivars->txcQueue->SetEnable(true); Log("SetInterfaceEnable: txcQueue SetEnable -> 0x%x", r);
+        r = ivars->rxsQueue->SetEnable(true); Log("SetInterfaceEnable: rxsQueue SetEnable -> 0x%x", r);
+        r = ivars->rxcQueue->SetEnable(true); Log("SetInterfaceEnable: rxcQueue SetEnable -> 0x%x", r);
+
+        resetEnablePath(ivars);
         kern_return_t armRet = armAsyncIO(ivars);
         Log("SetInterfaceEnable: armAsyncIO -> 0x%x", armRet);
         hwEnable(ivars->interface, ivars->macAddress);
     } else {
         ivars->interfaceEnabled = false;
+        ensureRxStopped(ivars);
         disarmAsyncIO(ivars);
         hwDisable(ivars->interface);
+
+        kern_return_t r;
+        r = ivars->rxcQueue->SetEnable(false); Log("SetInterfaceEnable: rxcQueue SetEnable(false) -> 0x%x", r);
+        r = ivars->rxsQueue->SetEnable(false); Log("SetInterfaceEnable: rxsQueue SetEnable(false) -> 0x%x", r);
+        r = ivars->txcQueue->SetEnable(false); Log("SetInterfaceEnable: txcQueue SetEnable(false) -> 0x%x", r);
+        r = ivars->txsQueue->SetEnable(false); Log("SetInterfaceEnable: txsQueue SetEnable(false) -> 0x%x", r);
+
         ivars->lastLinkUp = false;
         reportLinkStatus(kIOUserNetworkLinkStatusInactive, kIOUserNetworkMediaEthernetAuto);
         Log("SetInterfaceEnable: reportLinkStatus inactive");

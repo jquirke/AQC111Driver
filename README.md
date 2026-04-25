@@ -59,17 +59,20 @@ The driver loads, forces Config 1, registers an Ethernet interface, opens all pi
 - NIC personality match and `Start()` completion
 - All three pipe callbacks (RX, ITR, timer diagnostic) confirmed firing
 - MAC address read from hardware
-- PHY bring-up now produces a real link-up event
+- PHY bring-up produces a real link-up event (`AQ_PHY_OPS` advertise all speeds, deferred medium enable)
 - Link status reporting (up/down, speed code) and media decoding
 - Manual `ifconfig enX up` / `ifconfig enX down` soft enable/disable path
 - Soft disable aborts RX/ITR, withdraws PHY advertisement, enters low power, and reports link down
+- Bulk RX completions arriving with real payload (confirmed: ARP, neighbour discovery frames)
+- RX aggregation buffer parsing: header is at the **end** of the buffer (last 8 bytes); parser confirmed accepting real hardware frames
+- Per-frame decode: destination/source MAC, EtherType, first bytes logged for every received frame
+- Skywalk queue `SetEnable` fix applied (pending runtime validation): all four packet queues now enabled in `SetInterfaceEnable`
 
 **What is not done yet:**
-- RX frame parsing: the DMA aggregation header sits at the **end** of the buffer (last 8 bytes), not the beginning — parsing logic needs fixing
+- End-to-end RX packet delivery to BSD / tcpdump not yet validated (Skywalk `enqueuePackets` path under test)
 - TX path not yet implemented
-- End-to-end packet flow not yet validated
-- Automatic lifecycle handling is still incomplete: attach/detach, repeated development cycles, and reattach can still regress into a stuck state that may require a reboot
-- The current validated control path is still manual (`ifconfig`), not a polished automatic bring-up/shutdown flow
+- DHCP / full round-trip ping not yet working
+- Automatic lifecycle handling is still incomplete: attach/detach and repeated development cycles can still regress into a stuck state requiring a reboot
 
 ---
 
