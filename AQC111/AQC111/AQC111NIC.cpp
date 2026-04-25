@@ -286,8 +286,8 @@ IMPL(AQC111NIC, Start)
     queues[2] = ivars->rxsQueue;
     queues[3] = ivars->rxcQueue;
 
-    ret = SetTxPacketHeadroom(2);
-    Log("Start: SetTxPacketHeadroom(2) -> 0x%x", ret);
+    ret = SetTxPacketHeadroom(8);
+    Log("Start: SetTxPacketHeadroom(8) -> 0x%x", ret);
 
     ret = RegisterEthernetInterface(macAddress, ivars->pool, queues, 4);
     if (ret != kIOReturnSuccess) {
