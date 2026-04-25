@@ -64,6 +64,12 @@ The driver loads, forces Config 1, registers an Ethernet interface, and delivers
 **What is not done yet:**
 - TX path not yet implemented
 - DHCP / full round-trip ping not yet working
+- RX checksum offload — hardware signals L3/L4 pass/fail in the RX descriptor; not consumed
+- TX checksum offload — `SFR_TXCOE_CTL` / `SFR_RXCOE_CTL` not programmed; not advertised to stack
+- TSO — firmware-based TCP segmentation via TX descriptor MSS field
+- Jumbo frames — hardware supports up to ~16 KB; currently hardcoded to 1500 MTU
+- VLAN offload — hardware supports 802.1Q insertion/stripping; RX descriptor carries tag
+- Wake-on-LAN — magic packet path exists in hardware; not wired up
 
 **Known operational issues:**
 
