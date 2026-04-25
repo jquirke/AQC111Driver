@@ -52,7 +52,7 @@ Anyone who has done kernel debugging on other platforms will recognise the value
 
 ## Current Status
 
-The driver loads, forces Config 1, registers an Ethernet interface, and delivers received Ethernet frames into the BSD network stack. Packets are visible in Wireshark and tcpdump. The full RX pipeline — USB bulk completions → aggregate frame parser → Skywalk queue → BPF — is confirmed working end-to-end.
+The driver loads, forces Config 1, registers an Ethernet interface, and is fully functional for basic Ethernet use. The complete bidirectional data path — RX and TX — is confirmed working end-to-end: ARP resolves, and `ping` succeeds.
 
 **What works:**
 - USB enumeration with Config 1 forced (vendor-specific high-performance path)
@@ -60,10 +60,10 @@ The driver loads, forces Config 1, registers an Ethernet interface, and delivers
 - PHY bring-up and link negotiation (1000baseT full-duplex confirmed)
 - `ifconfig enX up` / `ifconfig enX down` — link comes up and down correctly
 - End-to-end RX: frames arrive in Wireshark and tcpdump
+- End-to-end TX: ARP resolves, `ping` succeeds
 
 **What is not done yet:**
-- TX path not yet implemented
-- DHCP / full round-trip ping not yet working
+- DHCP / automatic IP address assignment
 - RX checksum offload — hardware signals L3/L4 pass/fail in the RX descriptor; not consumed
 - TX checksum offload — `SFR_TXCOE_CTL` / `SFR_RXCOE_CTL` not programmed; not advertised to stack
 - TSO — firmware-based TCP segmentation via TX descriptor MSS field

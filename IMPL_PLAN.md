@@ -2,126 +2,84 @@
 
 ## Architecture
 
-Single dext, Option A: `AQC111` inherits `IOUserNetworkEthernet` (which inherits `IOService`).
-Matches at device level (`IOProviderClass=IOUSBHostDevice`). `Start()` opens the device,
-sets Config 1, finds and opens the vendor interface and its 3 pipes, inits hardware, then
-registers the network interface. No second personality or second dext needed.
+Two DriverKit personalities in a single dext bundle:
 
-### File structure
+**Personality A — AQC111** (`IOUserService`, matches `IOUSBHostDevice`)
+- Forces Config 1 via `SetConfiguration(1, matchInterfaces: true)`
+- Holds USB device session open for the lifetime of the driver to pin Config 1
+- Calls `RegisterService()` to publish itself; triggers interface nub matching
+
+**Personality B — AQC111NIC** (`IOUserNetworkEthernet`, matches `IOUSBHostInterface` bInterfaceClass=255)
+- Receives the vendor interface as provider
+- Uses `CopyDevice()` for control transfers (Personality A holds the exclusive device session)
+- Opens bulk IN (EP2), bulk OUT (EP3), and interrupt (EP1) pipes
+- Runs hardware init, registers Skywalk Ethernet interface, handles RX/TX/ITR async IO
+
+### File Structure
 
 ```
 AQC111/AQC111/
-  AQC111.iig          driver class declaration (IOUserNetworkEthernet)
-  AQC111.cpp          Start/Stop/enable/disable/txPacketsAvailable
-  AQC111Hal.cpp       plain C++ helpers: vendorRead/Write, hwInit, hwStart, hwStop, PHY ops
-  AQC111Rx.cpp        RX ring: bulk IN URB pool, completion parsing, packet delivery
-  AQC111Tx.cpp        TX ring: txPacketsAvailable loop, descriptor prepend, URB submit
+  AQC111.iig          Personality A: IOUserService
+  AQC111.cpp          Personality A: Open device, SetConfiguration(1), RegisterService
+  AQC111NIC.iig       Personality B: IOUserNetworkEthernet
+  AQC111NIC.cpp       Personality B: init, RX/TX pipeline, interrupt handler, Skywalk
 ```
-
-### Endpoints (Config 1, vendor interface class=255)
-
-| EP  | Direction | Type      | Size  | Role           |
-|-----|-----------|-----------|-------|----------------|
-| EP1 | IN        | Interrupt | 16B   | Link status    |
-| EP2 | IN        | Bulk      | 1024B | RX data        |
-| EP3 | OUT       | Bulk      | 1024B | TX data        |
 
 ---
 
 ## Milestones
 
-### M1 — Pipes open
+### M1 — Config 1 forced ✓
 
-**Goal:** USB layer works end-to-end; no data path yet.
+- Personality A matches device by VID/PID
+- `SetConfiguration(1, true)` forces Config 1; interface nubs published
+- Personality A holds session open; Config 1 stays selected
 
-Tasks:
-- Change base class to `IOUserNetworkEthernet` in `.iig` and build settings
-- After `SetConfiguration(1, true)`, call `CopyInterface()` to obtain the vendor interface
-- Open vendor interface, open EP1/EP2/EP3 pipes
-- Log endpoint addresses and pipe open results
+### M2 — HW init + MAC address + interface registered ✓
 
-**Pass signal:** dext loads cleanly, logs show 3 pipes opened, device does not re-enumerate.
+- `vendorRead` / `vendorWrite` wrappers (`bRequest=AQ_ACCESS_MAC`)
+- MAC SFR init sequence (MEDIUM_STATUS_MODE, BM_INT_MASK, RX coalescing, BULK_OUT_CTRL, etc.)
+- MAC address read from SFR_NODE_ID (6 bytes at `0x10`)
+- Ethernet interface registered via `RegisterEthernetInterface`; visible as `en10`
 
----
+### M3 — PHY bring-up + link status ✓
 
-### M2 — HW init + MAC address
+- Interrupt pipe (EP1) armed; 16-byte ItrData parsed on each completion
+- Speed code → media word mapping; `reportLinkStatus` called
+- PHY powered on via `AQ_PHY_OPS` (bRequest=0x61), FWPhyAccess 4-byte struct
+- `ifconfig en10` shows `status: active, 1000baseT <full-duplex>`
 
-**Goal:** MAC SFRs configured, correct MAC address visible in `ifconfig`.
+### M4 — RX pipeline ✓
 
-Tasks:
-- Implement `vendorRead` / `vendorWrite` wrappers (bRequest=`AQ_ACCESS_MAC`)
-- Read firmware version (SFR 0xDA–0xDC) and log as sanity check
-- Run full MAC SFR init sequence from RE (SFR_MEDIUM_STATUS_MODE, SFR_BM_INT_MASK,
-  SFR_RXCOE_CTL, SFR_TXCOE_CTL, SFR_BULK_OUT_CTRL, etc.)
-- Read MAC address from SFR_NODE_ID (6 bytes at SFR 0x10), implement `getHardwareAddress()`
-- Register the network interface
+- Pool of 10 bulk IN URBs (EP2) pre-posted; re-armed on each completion
+- Aggregate buffer parser: 4-byte header → pkt_count / desc_offset → per-packet 8-byte descriptors
+- AQ_RX_HW_PAD (2 bytes) skipped; raw Ethernet frame delivered to Skywalk via `IOUserNetworkPacket`
+- Frames visible in Wireshark and tcpdump
 
-**Pass signal:** `ifconfig` shows `en` interface with MAC matching the label on the adapter.
+### M5 — TX pipeline ✓
 
----
+- `TxPacketAvailable` fires via `IODataQueueDispatchSource::SetDataAvailableHandler`
+- 8-byte LE descriptor prepended (bits 20:0 = frame_len) + raw Ethernet frame → EP3 bulk OUT
+- `OnTxComplete` returns packet to `txcQueue`; drains next queued packet
+- ARP resolves; `ping` succeeds
 
-### M3 — Link up via interrupt
-
-**Goal:** Interface goes active at correct speed after cable plug-in.
-
-Tasks:
-- Post a single URB to EP1 (interrupt IN, 16B buffer)
-- In completion handler: parse ItrData (AQ_LS_MASK=0x8000, AQ_SPEED_MASK=0x7F00>>8),
-  map speed code to IONetworkMedium, call `setLinkStatus()`
-- Re-post interrupt URB after each completion (perpetual re-arm)
-- Send initial `AQ_PHY_OPS` (bRequest=0x61) with MediumFlags advertising all speeds
-  (bits 0–3 set) and PHY_POWER_EN (bit 20)
-
-**Pass signal:** `ifconfig en0` shows `status: active` at 5000baseT; link light on adapter.
-
----
-
-### M4 — RX (receive only)
-
-**Goal:** Incoming packets visible in tcpdump; no TX yet.
+### M6 — DHCP + polish (pending)
 
 Tasks:
-- Pre-post N bulk IN URBs to EP2 (ring of ~10 slots, 16KB each as per RE)
-- In completion: parse 4-byte descriptor header (pkt_count = bits 12:0, desc_offset = bits 31:13 << 13)
-- Walk per-packet 8-byte descriptors at desc_offset; for each: check RX_OK (bit 11), DROP (bit 31),
-  extract pkt_len (bits 30:16), skip AQ_RX_HW_PAD=2 bytes, hand payload to `IOUserNetworkPacket`
-- Apply RX coalescing config to SFR_RX_BULKIN_QCTRL (profile selected by link speed)
-- Assign static IP to interface for testing (`ifconfig en0 192.168.x.x`)
+- Fix media re-seat: cycle `SFR_RX_CTL` (stop → restart) in `hwOnLinkUp`, matching Linux behavior
+- DHCP: `ipconfig set en10 DHCP` — acquire an IP address automatically
+- RX checksum offload: enable `SFR_RXCOE_CTL`; decode L3/L4 result bits from RX descriptor
+- TX checksum offload: enable `SFR_TXCOE_CTL`; advertise checksum capability to stack
+- Multicast hash filter (`SFR_MULTI_FILTER_ARRY`) and promiscuous mode
 
-**Pass signal:** from another machine, `ping <static IP>` — packets visible in
-`tcpdump -i en0` even though pings don't complete (no TX yet).
+**Pass signal:** DHCP address acquired; `iperf3` shows throughput in expected range for 1G/5G link.
 
----
+### M7 — Advanced hardware features (not planned)
 
-### M5 — TX (full duplex)
-
-**Goal:** Round-trip ping works.
-
-Tasks:
-- Implement `txPacketsAvailable()`: dequeue `IOUserNetworkPacket`, prepend 8-byte TX descriptor
-  header (bits 20:0 = length, bit 28 = drop-padding), submit to EP3
-- In TX completion: release packet buffer, signal queue ready for more
-- Handle back-pressure (stall queue when all TX slots in flight; unstall in onComplete)
-
-**Pass signal:** `ping` round-trips from the Mac. Full duplex confirmed.
-
----
-
-### M6 — Correctness + offload
-
-**Goal:** DHCP works, checksum offload active, ready for performance testing.
-
-Tasks:
-- Enable RX checksum offload: write SFR_RXCOE_CTL (IP/TCP/UDP/TCPv6/UDPv6 bits)
-- Enable TX checksum offload: write SFR_TXCOE_CTL
-- Implement `getChecksumSupport()` returning `0x67` for `kChecksumFamilyInet`
-- Implement `Rx::setChecksumResult()`: decode L3/L4 type + error bits from RX_PD,
-  call `setChecksumResult(mbuf, kChecksumFamilyInet, checked, valid, 0, 0)`
-- Implement multicast hash filter (SFR_MULTI_FILTER_ARRY) and promiscuous mode
-- DHCP: `ipconfig set en0 DHCP`
-
-**Pass signal:** DHCP address acquired; `iperf3` to a local host shows throughput in the
-expected range for a 5G link.
+- TSO (TX descriptor MSS field, bits 46:32)
+- Jumbo frames (MTU > 1500; hardware supports ~16 KB)
+- VLAN offload (RX descriptor bit 10; `SFR_VLAN_ID_CONTROL`)
+- Wake-on-LAN
 
 ---
 
@@ -129,15 +87,6 @@ expected range for a 5G link.
 
 | Area | Risk | Mitigation |
 |------|------|-----------|
-| M2: HW init order | MAC SFR sequence is long and order-sensitive; wrong order = no link | Follow hwStart sequence from RE_LOG.md exactly |
-| M3: PHY ops | MediumFlags 32-bit payload must be correct; wrong bits = PHY won't advertise | Cross-check with RE MediumFlags bit table |
-| M4: RX buffer parsing | pkt_count / desc_offset layout is fiddly; off-by-one = crashes or garbage | Start with N=1 URB, log raw descriptor bytes before parsing |
-| M4: IOUserNetworkPacket API | DriverKit packet API differs from mbuf; buffer ownership rules differ | Check NetworkingDriverKit sample for correct acquire/complete lifecycle |
-| General | dext state gets tangled between test runs | `systemextensionsctl uninstall` + reboot if multiple entries appear |
-
-## Notes
-
-- ICMP checksum offload: hardware supports it (SFR_RXCOE_CTL bits 3,7) but not worth implementing — skip.
-- IOUserNetworkEthernet requires `com.apple.developer.networking.driverkit` entitlement in addition to the USB entitlement.
-- TX descriptor MSS field (bits 46:32) and VLAN fields: leave zero for now (no TSO or VLAN tagging needed initially).
-- RX VLAN (bit 10 of RX_PD): skip for M4/M5; can be wired up in M6 polish if needed.
+| M6: RX CTL cycling | hwOnLinkUp must stop then restart RX precisely; wrong order = no RX | Mirror Linux `aqc111_rx_fixup` / link-up sequence exactly |
+| M6: DHCP | Requires correct ARP handling (already working) + IP stack integration | Should work once static-IP ping is solid |
+| General | Corpse budget (~2 unplug cycles/boot) exhausts quickly | Plan test runs to minimize unplugs; reboot to reset |
