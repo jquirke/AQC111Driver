@@ -975,11 +975,18 @@ txDrainOne(AQC111NIC_IVars *ivars)
     uint32_t txLen = 8 + dataLen;
     ivars->txBuf->SetLength(txLen);
 
+    Log("txDrainOne: desc=%016llx frame_len=%u usb_len=%u first16: "
+        "%02x %02x %02x %02x %02x %02x %02x %02x  "
+        "%02x %02x %02x %02x %02x %02x %02x %02x",
+        (unsigned long long)txDesc, dataLen, txLen,
+        txp[0],  txp[1],  txp[2],  txp[3],  txp[4],  txp[5],  txp[6],  txp[7],
+        txp[8],  txp[9],  txp[10], txp[11], txp[12], txp[13], txp[14], txp[15]);
+
     ivars->txInFlight = pkt;
     ivars->txBusy     = true;
 
     kern_return_t r = ivars->pipeTx->AsyncIO(ivars->txBuf, txLen, ivars->txCompleteAction, 0);
-    Log("txDrainOne: AsyncIO txLen=%u -> 0x%x", txLen, r);
+    Log("txDrainOne: AsyncIO -> 0x%x", r);
     if (r != kIOReturnSuccess) {
         ivars->txBusy     = false;
         ivars->txInFlight = nullptr;
