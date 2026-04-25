@@ -74,7 +74,7 @@ Tasks:
 
 **Pass signal:** DHCP address acquired; `iperf3` shows throughput in expected range for 1G/5G link.
 
-### M7 — Advanced hardware features (not planned)
+### M7 — Advanced hardware features (planned, post-stability)
 
 - TSO (TX descriptor MSS field, bits 46:32)
 - Jumbo frames (MTU > 1500; hardware supports ~16 KB)

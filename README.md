@@ -71,7 +71,7 @@ The driver loads, forces Config 1, registers an Ethernet interface, and is fully
 - VLAN offload — hardware supports 802.1Q insertion/stripping; RX descriptor carries tag
 - Wake-on-LAN — magic packet path exists in hardware; not wired up
 
-**Known operational issues:**
+**Current bugs:**
 
 1. **Media must be manually re-seated to start RX flow.** After `ifconfig enX up`, no RX frames arrive until the Ethernet cable is unplugged and replugged. The PHY negotiates link and the ITR fires correctly, but the hardware RX path stays silent until a link-down/link-up cycle. Likely cause: `hwOnLinkUp` needs to re-cycle `SFR_RX_CTL` (stop then restart), which is what the Linux driver does on every link-up event.
 

@@ -103,7 +103,7 @@ Speed codes: `0x0F`=5G, `0x10`=2.5G, `0x11`=1G, `0x13`=100M
 | `0x00B7` | SFR_ETH_MAC_PATH | `0x01`=RX_PATH_READY |
 | `0x00B9` | SFR_BULK_OUT_CTRL | `0x02`=EFF_EN |
 
-## Known Operational Issues
+## Current Bugs
 
 1. **Media re-seat required for RX flow.** After `ifconfig enX up`, no RX frames arrive until the cable is unplugged and replugged. `hwOnLinkUp` should cycle `SFR_RX_CTL` (stop then restart) as the Linux driver does on every link-up event.
 
