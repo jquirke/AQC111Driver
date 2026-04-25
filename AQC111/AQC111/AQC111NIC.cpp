@@ -115,7 +115,7 @@ struct AQC111NIC_IVars {
     bool                                dumpedRx432;
     bool                                dumpedRxOther;
     // TX path — one frame in flight at a time
-    IOBufferMemoryDescriptor           *txBuf;           // staging buffer: 2-byte hdr + frame
+    IOBufferMemoryDescriptor           *txBuf;           // staging buffer: 8-byte descriptor + frame
     OSAction                           *txPacketAction;  // TxPacketAvailable OSAction
     OSAction                           *txCompleteAction;// OnTxComplete OSAction
     IOUserNetworkPacket                *txInFlight;      // packet held during USB flight
@@ -317,8 +317,8 @@ IMPL(AQC111NIC, Start)
     ret = CreateActionOnTxComplete(0, &ivars->txCompleteAction);
     if (ret != kIOReturnSuccess) { Log("Start: CreateActionOnTxComplete failed: 0x%x", ret); goto fail; }
 
-    // Staging buffer: 2-byte LE length header + max Ethernet frame (1518 w/ VLAN)
-    ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionOut, 2 + 1518, 0, &ivars->txBuf);
+    // Staging buffer: 8-byte descriptor + max Ethernet frame (1518 w/ VLAN)
+    ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionOut, 8 + 1518, 0, &ivars->txBuf);
     if (ret != kIOReturnSuccess) { Log("Start: txBuf alloc failed: 0x%x", ret); goto fail; }
 
     // Post 10 outstanding RX bulk IN transfers.
@@ -935,8 +935,8 @@ IMPL(AQC111NIC, OnTimerFired)
 // --- TX path ---
 //
 // Wire format (SFR_BULK_OUT_EFF_EN=0x02 already set in hwEnable):
-//   [uint16_t frame_len LE][raw Ethernet frame]
-// Matches Linux aqc111_tx_fixup. One frame in flight at a time.
+//   [uint64_t descriptor LE: bits 20:0=frame_len, all others 0][raw Ethernet frame]
+// Matches Linux aqc111_tx_fixup and x86 kext. One frame in flight at a time.
 
 static void
 txDrainOne(AQC111NIC_IVars *ivars)
@@ -963,14 +963,16 @@ txDrainOne(AQC111NIC_IVars *ivars)
         return;
     }
 
-    // Build staging buffer: 2-byte LE length + raw frame
+    // Build USB TX buffer: 8-byte LE descriptor + raw Ethernet frame.
+    // Descriptor bits 20:0 = frame length; all other bits 0 (no VLAN, no TSO).
+    // Matches Linux aqc111_tx_fixup and x86 kext with SFR_BULK_OUT_EFF_EN=0x02.
     IOAddressSegment range;
     ivars->txBuf->GetAddressRange(&range);
     uint8_t *txp = (uint8_t *)range.address;
-    txp[0] = (uint8_t)(dataLen & 0xFF);
-    txp[1] = (uint8_t)(dataLen >> 8);
-    memcpy(txp + 2, frame, dataLen);
-    uint32_t txLen = 2 + dataLen;
+    uint64_t txDesc = (uint64_t)dataLen;  // bits 20:0 = length, all others 0
+    memcpy(txp, &txDesc, 8);
+    memcpy(txp + 8, frame, dataLen);
+    uint32_t txLen = 8 + dataLen;
     ivars->txBuf->SetLength(txLen);
 
     ivars->txInFlight = pkt;
