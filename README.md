@@ -52,27 +52,26 @@ Anyone who has done kernel debugging on other platforms will recognise the value
 
 ## Current Status
 
-The driver loads, forces Config 1, registers an Ethernet interface, opens all pipes, and successfully receives async IO callbacks. The MAC address is read from hardware. Link state is parsed from the interrupt pipe, and manual interface up/down now works end-to-end through `ifconfig`.
+The driver loads, forces Config 1, registers an Ethernet interface, and delivers received Ethernet frames into the BSD network stack. Packets are visible in Wireshark and tcpdump. The full RX pipeline — USB bulk completions → aggregate frame parser → Skywalk queue → BPF — is confirmed working end-to-end.
 
 **What works:**
-- Config 1 selection and session pinning
-- NIC personality match and `Start()` completion
-- All three pipe callbacks (RX, ITR, timer diagnostic) confirmed firing
-- MAC address read from hardware
-- PHY bring-up produces a real link-up event (`AQ_PHY_OPS` advertise all speeds, deferred medium enable)
-- Link status reporting (up/down, speed code) and media decoding
-- Manual `ifconfig enX up` / `ifconfig enX down` soft enable/disable path
-- Soft disable aborts RX/ITR, withdraws PHY advertisement, enters low power, and reports link down
-- Bulk RX completions arriving with real payload (confirmed: ARP, neighbour discovery frames)
-- RX aggregation buffer parsing: header is at the **end** of the buffer (last 8 bytes); parser confirmed accepting real hardware frames
-- Per-frame decode: destination/source MAC, EtherType, first bytes logged for every received frame
-- Skywalk queue `SetEnable` fix applied (pending runtime validation): all four packet queues now enabled in `SetInterfaceEnable`
+- USB enumeration with Config 1 forced (vendor-specific high-performance path)
+- Ethernet interface registered (`en10`, MAC read from hardware)
+- PHY bring-up and link negotiation (1000baseT full-duplex confirmed)
+- `ifconfig enX up` / `ifconfig enX down` — link comes up and down correctly
+- End-to-end RX: frames arrive in Wireshark and tcpdump
 
 **What is not done yet:**
-- End-to-end RX packet delivery to BSD / tcpdump not yet validated (Skywalk `enqueuePackets` path under test)
 - TX path not yet implemented
 - DHCP / full round-trip ping not yet working
-- Automatic lifecycle handling is still incomplete: attach/detach and repeated development cycles can still regress into a stuck state requiring a reboot
+
+**Known operational issues:**
+
+1. **Media must be manually re-seated to start RX flow.** After `ifconfig enX up`, no RX frames arrive until the Ethernet cable is unplugged and replugged. The PHY negotiates link and the ITR fires correctly, but the hardware RX path stays silent until a link-down/link-up cycle. Likely cause: `hwOnLinkUp` needs to re-cycle `SFR_RX_CTL` (stop then restart), which is what the Linux driver does on every link-up event.
+
+2. **USB re-enumeration flap on initial connect.** The adapter sometimes goes through one or two re-enumeration cycles when first plugged in before stabilising. This appears to be the device's own firmware initialisation; the driver tolerates it but adds latency before the interface is usable.
+
+3. **Teardown instability often requires a reboot.** The DriverKit corpse budget (~2 unplug cycles per boot before re-enumeration stalls) is exhausted quickly during development. `Stop()` correctly aborts and closes pipes, but the budget is a platform limit. A reboot resets it.
 
 ---
 
