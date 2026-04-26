@@ -99,7 +99,11 @@ struct AQC111NIC_IVars {
     // ITR pipe: one 16-byte buffer for link-status interrupt events
     IOBufferMemoryDescriptor           *itrBuf;
     OSAction                           *itrAction;
+    uint8_t                             fwMajor;
+    uint8_t                             fwMinor;
+    uint8_t                             fwRev;
     bool                                lastLinkUp;
+    uint8_t                             lastSpeedCode;   // cached from ITR; 0 = never seen
     bool                                interfaceEnabled;
     bool                                rxStarted;
     bool                                ioArmed;
@@ -220,6 +224,25 @@ IMPL(AQC111NIC, Start)
             rbRet,
             readback[0], readback[1], readback[2],
             readback[3], readback[4], readback[5]);
+    }
+
+    // Read firmware version (AQ_FW_VER_MAJOR/MINOR/REV at 0xDA/0xDB/0xDC).
+    // major >= 0x80 → FWPhyAccess (AQ_PHY_OPS bRequest=0x61).
+    // major <  0x80 → DirectPhyAccess (bRequest=0x31/0x32) — not supported by this driver.
+    {
+        uint8_t maj = 0, min = 0, rev = 0;
+        kern_return_t fr;
+        fr = aqRead(ivars->interface, 0xDA, &maj, 1);
+        if (fr == kIOReturnSuccess) fr = aqRead(ivars->interface, 0xDB, &min, 1);
+        if (fr == kIOReturnSuccess) fr = aqRead(ivars->interface, 0xDC, &rev, 1);
+        ivars->fwMajor = maj;
+        ivars->fwMinor = min;
+        ivars->fwRev   = rev;
+        Log("Start: firmware version %u.%u.%u (raw major=0x%02x) -> read 0x%x",
+            maj & 0x7F, min, rev, maj, fr);
+        if (fr != kIOReturnSuccess || (maj & 0x80) == 0) {
+            Log("Start: WARNING — unexpected firmware major=0x%02x; driver requires FWPhyAccess (>= 0x80)", maj);
+        }
     }
 
     ret = ivars->interface->CopyPipe(EP_ITR, &ivars->pipeItr);
@@ -793,7 +816,9 @@ resetEnablePath(AQC111NIC_IVars *ivars)
         Log("resetEnablePath: ClearStall TX -> 0x%x", r);
     }
 
-    ivars->lastLinkUp = false;
+    // Do NOT clear lastLinkUp / lastSpeedCode here — they are a cache of the
+    // last ITR state and must survive the disable/enable cycle so that
+    // SetInterfaceEnable(true) can reconcile without waiting for an interrupt edge.
     ivars->rxStarted = false;
 }
 
@@ -1172,13 +1197,27 @@ IMPL(AQC111NIC, OnItrComplete)
 {
     Log("OnItrComplete: status=0x%x bytes=%u", status, actualByteCount);
 
-    if (status == kIOReturnAborted) {
+    // True teardown: device removed (force close) or our own Abort in Stop().
+    if (status == kIOReturnAborted || status == kIOReturnNotAttached) {
         return;
     }
-    if (!ivars->interfaceEnabled || !ivars->ioArmed) {
-        Log("ITR disabled path — not reposting");
+    // Our own teardown path: Stop() clears ioArmed before calling Abort.
+    if (!ivars->ioArmed) {
+        Log("ITR: ioArmed=false — not reposting");
         return;
     }
+    if (status == kUSBHostReturnPipeStalled) {
+        kern_return_t r = ivars->pipeItr->ClearStall(false);
+        Log("ITR stall ClearStall -> 0x%x", r);
+        r = ivars->pipeItr->AsyncIO(ivars->itrBuf, 16, ivars->itrAction, 0);
+        Log("ITR stall repost -> 0x%x", r);
+        return;
+    }
+    // Transient non-success: log but fall through to repost — pipe must stay alive.
+    if (status != kIOReturnSuccess) {
+        Log("ITR: transient status=0x%x — reposting", status);
+    }
+
     if (status == kIOReturnSuccess && actualByteCount >= 2) {
         IOAddressSegment range;
         ivars->itrBuf->GetAddressRange(&range);
@@ -1188,38 +1227,39 @@ IMPL(AQC111NIC, OnItrComplete)
         bool    linkUp    = (byte1 >> 7) & 1;
         uint8_t speedCode = byte1 & 0x7F;
 
-        const uint32_t opts = kIOUserNetworkMediaOptionFullDuplex |
-                              kIOUserNetworkMediaOptionFlowControl;
-        MediaWord media = kIOUserNetworkMediaEthernetAuto;
-        if (linkUp) {
-            ivars->lastLinkUp = true;
-            ensureRxStarted(ivars, speedCode);
-            switch (speedCode) {
-                case 0x0F: media = kIOUserNetworkMediaEthernet5000BaseT | opts; break;
-                case 0x10: media = kIOUserNetworkMediaEthernet2500BaseT | opts; break;
-                case 0x11: media = kIOUserNetworkMediaEthernet1000BaseT | opts; break;
-                case 0x13: media = kIOUserNetworkMediaEthernet100BaseTX | opts; break;
-                default:   media = kIOUserNetworkMediaEthernet1000BaseT | opts; break;
-            }
-        } else {
-            ivars->lastLinkUp = false;
-            ensureRxStopped(ivars);
-        }
+        // Always cache link state — mirrors Linux aqc111_status() which caches
+        // link/speed from the interrupt regardless of whether the interface is
+        // fully open. SetInterfaceEnable(true) reads these to reconcile without
+        // waiting for another interrupt edge (fixes no-RX on first ifconfig up).
+        ivars->lastLinkUp = linkUp;
+        if (linkUp && speedCode != 0)
+            ivars->lastSpeedCode = speedCode;
 
-        LinkStatus ls = linkUp ? kIOUserNetworkLinkStatusActive
-                                : kIOUserNetworkLinkStatusInactive;
-        Log("ITR: byte1=0x%02x linkUp=%d speed=0x%02x -> reportLinkStatus(0x%x, 0x%x)",
-            byte1, (int)linkUp, speedCode, ls, media);
-        reportLinkStatus(ls, media);
-    } else if (status == kUSBHostReturnPipeStalled) {
-        kern_return_t r = ivars->pipeItr->ClearStall(false);
-        Log("ITR stall ClearStall -> 0x%x", r);
-        r = ivars->pipeItr->AsyncIO(ivars->itrBuf, 16, ivars->itrAction, 0);
-        Log("ITR stall repost -> 0x%x", r);
-        return;
-    } else if (status != kIOReturnSuccess) {
-        Log("ITR terminal error: status=0x%x — not reposting", status);
-        return;
+        if (ivars->interfaceEnabled) {
+            const uint32_t opts = kIOUserNetworkMediaOptionFullDuplex |
+                                  kIOUserNetworkMediaOptionFlowControl;
+            MediaWord media = kIOUserNetworkMediaEthernetAuto;
+            if (linkUp) {
+                ensureRxStarted(ivars, speedCode);
+                switch (speedCode) {
+                    case 0x0F: media = kIOUserNetworkMediaEthernet5000BaseT | opts; break;
+                    case 0x10: media = kIOUserNetworkMediaEthernet2500BaseT | opts; break;
+                    case 0x11: media = kIOUserNetworkMediaEthernet1000BaseT | opts; break;
+                    case 0x13: media = kIOUserNetworkMediaEthernet100BaseTX | opts; break;
+                    default:   media = kIOUserNetworkMediaEthernet1000BaseT | opts; break;
+                }
+            } else {
+                ensureRxStopped(ivars);
+            }
+            LinkStatus ls = linkUp ? kIOUserNetworkLinkStatusActive
+                                   : kIOUserNetworkLinkStatusInactive;
+            Log("ITR: byte1=0x%02x linkUp=%d speed=0x%02x -> reportLinkStatus(0x%x, 0x%x)",
+                byte1, (int)linkUp, speedCode, ls, media);
+            reportLinkStatus(ls, media);
+        } else {
+            Log("ITR: byte1=0x%02x linkUp=%d speed=0x%02x (cached, interfaceEnabled=false)",
+                byte1, (int)linkUp, speedCode);
+        }
     }
 
     kern_return_t r = ivars->pipeItr->AsyncIO(ivars->itrBuf, 16, ivars->itrAction, 0);
@@ -1277,6 +1317,15 @@ IMPL(AQC111NIC, SetInterfaceEnable)
         kern_return_t armRet = armAsyncIO(ivars);
         Log("SetInterfaceEnable: armAsyncIO -> 0x%x", armRet);
         hwEnable(ivars->interface, ivars->macAddress);
+
+        // Reconcile cached ITR state — mirrors Linux aqc111_link_reset().
+        // The device sends current link/speed on the first ITR arm (in Start()),
+        // before interfaceEnabled=true. We cache it in OnItrComplete and apply it
+        // here rather than waiting for another interrupt edge.
+        Log("SetInterfaceEnable: cached lastLinkUp=%d lastSpeedCode=0x%02x",
+            (int)ivars->lastLinkUp, ivars->lastSpeedCode);
+        if (ivars->lastLinkUp && ivars->lastSpeedCode != 0)
+            ensureRxStarted(ivars, ivars->lastSpeedCode);
     } else {
         ivars->interfaceEnabled = false;
         ensureRxStopped(ivars);
@@ -1289,7 +1338,6 @@ IMPL(AQC111NIC, SetInterfaceEnable)
         r = ivars->txcQueue->SetEnable(false); Log("SetInterfaceEnable: txcQueue SetEnable(false) -> 0x%x", r);
         r = ivars->txsQueue->SetEnable(false); Log("SetInterfaceEnable: txsQueue SetEnable(false) -> 0x%x", r);
 
-        ivars->lastLinkUp = false;
         reportLinkStatus(kIOUserNetworkLinkStatusInactive, kIOUserNetworkMediaEthernetAuto);
         Log("SetInterfaceEnable: reportLinkStatus inactive");
     }

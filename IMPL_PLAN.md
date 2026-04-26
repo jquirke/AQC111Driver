@@ -81,6 +81,21 @@ Tasks:
 - VLAN offload (RX descriptor bit 10; `SFR_VLAN_ID_CONTROL`)
 - Wake-on-LAN
 
+### M8 — PHY access polymorphism (planned, low priority)
+
+The AQC111U firmware exposes two PHY control interfaces selected by `fw_ver_major`:
+
+| `major` | Path | PHY commands |
+|---------|------|-------------|
+| `>= 0x80` | `FWPhyAccess` | `AQ_PHY_OPS` (bRequest=0x61), 4-byte struct |
+| `< 0x80` | `DirectPhyAccess` | `AQ_PHY_POWER` (bRequest=0x31) + MDIO via bRequest=0x32 |
+
+The x86 kext selects the path at `start()` time based on the raw major byte. The Linux driver does the same check in `bind()`.
+
+**Current state:** The driver reads and logs `fw_ver_major` in `Start()` and warns if it is not `>= 0x80`, but all PHY code unconditionally uses the `FWPhyAccess` path. This is correct for the DUT (TRENDnet TUC-ET5G, firmware 130.5.32, `major=0x82`).
+
+**Future work:** Gate all `hwEnable` / `hwDisable` PHY writes on `ivars->fwMajor >= 0x80`; implement the `DirectPhyAccess` path (bRequest=0x31 + MDIO) for older firmware devices. Until then the driver will start-fail gracefully (warning log) on `major < 0x80` hardware.
+
 ---
 
 ## Known Risk Points

@@ -70,6 +70,7 @@ The driver loads, forces Config 1, registers an Ethernet interface, and is fully
 - Jumbo frames — hardware supports up to ~16 KB; currently hardcoded to 1500 MTU
 - VLAN offload — hardware supports 802.1Q insertion/stripping; RX descriptor carries tag
 - Wake-on-LAN — magic packet path exists in hardware; not wired up
+- PHY access polymorphism — the AQC111U has two PHY control interfaces selected by firmware major version (`>= 0x80` → `FWPhyAccess` via bRequest=0x61; `< 0x80` → `DirectPhyAccess` via bRequest=0x31/0x32). The driver reads and logs the firmware version at start but unconditionally uses the `FWPhyAccess` path. This is correct for the DUT (firmware `major=0x82`). Support for older `DirectPhyAccess` devices is not implemented.
 
 **Current bugs:**
 
