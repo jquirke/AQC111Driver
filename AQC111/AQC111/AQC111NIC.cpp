@@ -238,8 +238,8 @@ IMPL(AQC111NIC, Start)
         ivars->fwMajor = maj;
         ivars->fwMinor = min;
         ivars->fwRev   = rev;
-        Log("Start: firmware version %u.%u.%u (raw major=0x%02x) -> read 0x%x",
-            maj & 0x7F, min, rev, maj, fr);
+        Log("Start: firmware version %u.%u.%u (major=0x%02x) -> read 0x%x",
+            maj, min, rev, maj, fr);
         if (fr != kIOReturnSuccess || (maj & 0x80) == 0) {
             Log("Start: WARNING — unexpected firmware major=0x%02x; driver requires FWPhyAccess (>= 0x80)", maj);
         }
@@ -311,6 +311,31 @@ IMPL(AQC111NIC, Start)
 
     ret = SetTxPacketHeadroom(8);
     Log("Start: SetTxPacketHeadroom(8) -> 0x%x", ret);
+
+    // Push media table to the framework before registering the interface.
+    // Without this the kernel has no media table → SIOCGIFMEDIA returns nothing →
+    // no "status:" line in ifconfig → networkd never auto-enables the interface.
+    {
+        const uint32_t opts = kIOUserNetworkMediaOptionFullDuplex |
+                              kIOUserNetworkMediaOptionFlowControl;
+        IOUserNetworkMediaType mediaTable[] = {
+            kIOUserNetworkMediaEthernetNone,
+            kIOUserNetworkMediaEthernetAuto,
+            kIOUserNetworkMediaEthernet100BaseTX | opts,
+            kIOUserNetworkMediaEthernet1000BaseT | opts,
+            kIOUserNetworkMediaEthernet2500BaseT | opts,
+            kIOUserNetworkMediaEthernet5000BaseT | opts,
+        };
+        uint32_t mediaCount = sizeof(mediaTable) / sizeof(mediaTable[0]);
+        ret = ReportAvailableMediaTypes(mediaTable, mediaCount);
+        Log("Start: ReportAvailableMediaTypes(%u) -> 0x%x", mediaCount, ret);
+        if (ret != kIOReturnSuccess) goto fail;
+    }
+
+    // Select None before registering — mirrors "no media selected yet" state at start.
+    ret = SelectMediaType(kIOUserNetworkMediaEthernetNone, nullptr);
+    Log("Start: SelectMediaType(None=0x%x) -> 0x%x", kIOUserNetworkMediaEthernetNone, ret);
+    if (ret != kIOReturnSuccess) goto fail;
 
     ret = RegisterEthernetInterface(macAddress, ivars->pool, queues, 4);
     if (ret != kIOReturnSuccess) {
@@ -384,8 +409,6 @@ IMPL(AQC111NIC, Start)
     }
     ivars->ioArmed = true;
     Log("Start: ITR transfer posted");
-
-    reportLinkStatus(kIOUserNetworkLinkStatusInactive, kIOUserNetworkMediaEthernetAuto);
 
     ret = RegisterService();
     Log("Start: RegisterService -> 0x%x", ret);
@@ -606,12 +629,17 @@ hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
     uint16_t w;
     uint32_t phyFlags;
 
-    // RE note: the x86 driver exits PHY low-power before advertisement.
-    // We do not have the MDIO helper path wired up yet, so perform the steps
-    // we can map directly first: explicit PHY power-on and stateful advertise.
-    b = 0x02;
-    ret = aqVendorOut(iface, 0x31, &b, 1);
-    Log("hwEnable: AQ_PHY_POWER=0x02 -> 0x%x", ret);
+    // Two-step AQ_PHY_OPS sequence mirrors x86 phyAccess->lowPower(false) then
+    // phyAccess->advertise(), and Linux aqc111_reset() + aqc111_set_phy_speed().
+    // Step 1: exit low-power (POWER_EN only, no advertise bits) so the firmware
+    // sees a clean "powered up, not yet advertising" state before we add speed
+    // advertisement in step 2. A single combined write may not restart autoneg
+    // if the firmware doesn't observe an intermediate state change.
+    // NOTE: bRequest=0x31 (AQ_PHY_POWER) is DirectPhyAccess only (major < 0x80)
+    // and must NOT be used here. This driver requires FWPhyAccess (major >= 0x80).
+    phyFlags = 1u << 19;  // AQ_PHY_POWER_EN only
+    ret = aqVendorOut(iface, 0x61, &phyFlags, sizeof(phyFlags));
+    Log("hwEnable: AQ_PHY_OPS step1 POWER_EN=0x%08x -> 0x%x", phyFlags, ret);
 
     ret = aqWrite(iface, 0x0010, mac.octet, 6);
     Log("hwEnable: SFR_NODE_ID -> 0x%x", ret);
@@ -659,18 +687,17 @@ hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
     }
     Log("hwEnable: reg[0x00B0] clear bit0 -> 0x%x", ret);
 
-    // AQ_PHY_OPS takes the little-endian MediumFlags dword, not a hardcoded
-    // 4-byte literal. Match the Linux/x86 model: advertise all rates, pause,
-    // asym pause, PHY power enabled, downshift enabled, retries=7.
+    // Step 2: full advertisement. Matches Linux aqc111_set_phy_speed() with
+    // autoneg=ENABLE, speed=SPEED_5000 (all rates). Retries=3 per Linux default.
     phyFlags = 0;
     phyFlags |= 0x0000000Fu;  // AQ_ADV_MASK: 100M, 1G, 2.5G, 5G
     phyFlags |= 1u << 16;     // AQ_PAUSE
     phyFlags |= 1u << 17;     // AQ_ASYM_PAUSE
     phyFlags |= 1u << 19;     // AQ_PHY_POWER_EN
     phyFlags |= 1u << 21;     // AQ_DOWNSHIFT
-    phyFlags |= 7u << 24;     // AQ_DSH_RETRIES default
+    phyFlags |= 3u << 24;     // AQ_DSH_RETRIES=3 (matches Linux aqc111_set_phy_speed default)
     ret = aqVendorOut(iface, 0x61, &phyFlags, sizeof(phyFlags));
-    Log("hwEnable: AQ_PHY_OPS flags=0x%08x -> 0x%x", phyFlags, ret);
+    Log("hwEnable: AQ_PHY_OPS step2 flags=0x%08x -> 0x%x", phyFlags, ret);
 
     b = 0x01;
     ret = aqWrite(iface, 0x00B7, &b, 1);
@@ -1253,9 +1280,9 @@ IMPL(AQC111NIC, OnItrComplete)
             }
             LinkStatus ls = linkUp ? kIOUserNetworkLinkStatusActive
                                    : kIOUserNetworkLinkStatusInactive;
-            Log("ITR: byte1=0x%02x linkUp=%d speed=0x%02x -> reportLinkStatus(0x%x, 0x%x)",
-                byte1, (int)linkUp, speedCode, ls, media);
-            reportLinkStatus(ls, media);
+            IOReturn lsRet = reportLinkStatus(ls, media);
+            Log("ITR: byte1=0x%02x linkUp=%d speed=0x%02x -> reportLinkStatus(0x%x, 0x%x) -> 0x%x",
+                byte1, (int)linkUp, speedCode, ls, media, lsRet);
         } else {
             Log("ITR: byte1=0x%02x linkUp=%d speed=0x%02x (cached, interfaceEnabled=false)",
                 byte1, (int)linkUp, speedCode);
@@ -1338,8 +1365,8 @@ IMPL(AQC111NIC, SetInterfaceEnable)
         r = ivars->txcQueue->SetEnable(false); Log("SetInterfaceEnable: txcQueue SetEnable(false) -> 0x%x", r);
         r = ivars->txsQueue->SetEnable(false); Log("SetInterfaceEnable: txsQueue SetEnable(false) -> 0x%x", r);
 
-        reportLinkStatus(kIOUserNetworkLinkStatusInactive, kIOUserNetworkMediaEthernetAuto);
-        Log("SetInterfaceEnable: reportLinkStatus inactive");
+        IOReturn lsRet = reportLinkStatus(kIOUserNetworkLinkStatusInactive, kIOUserNetworkMediaEthernetAuto);
+        Log("SetInterfaceEnable: reportLinkStatus(inactive, Auto) -> 0x%x", lsRet);
     }
     return kIOReturnSuccess;
 }

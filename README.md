@@ -76,9 +76,9 @@ The driver loads, forces Config 1, registers an Ethernet interface, and is fully
 
 1. **Media must be manually re-seated to start RX flow.** After `ifconfig enX up`, no RX frames arrive until the Ethernet cable is unplugged and replugged. The PHY negotiates link and the ITR fires correctly, but the hardware RX path stays silent until a link-down/link-up cycle. Likely cause: `hwOnLinkUp` needs to re-cycle `SFR_RX_CTL` (stop then restart), which is what the Linux driver does on every link-up event.
 
-2. **USB re-enumeration flap on initial connect.** The adapter sometimes goes through one or two re-enumeration cycles when first plugged in before stabilising. This appears to be the device's own firmware initialisation; the driver tolerates it but adds latency before the interface is usable.
+2. **USB re-enumeration flap on initial connect.** The adapter sometimes goes through one or two re-enumeration cycles when first plugged in before stabilising. This may be the device's own firmware initialisation, or it may be a heisenbug introduced by the USB bus analyser used during development — it has not been reproduced without the analyser attached. Needs careful examination; TBD.
 
-3. **Teardown instability often requires a reboot.** The DriverKit corpse budget (~2 unplug cycles per boot before re-enumeration stalls) is exhausted quickly during development. `Stop()` correctly aborts and closes pipes, but the budget is a platform limit. A reboot resets it.
+3. **Teardown leaves corpse processes that block reinstall.** After uninstall, both personalities leave orphaned dext processes that sysextd waits on indefinitely rather than force-killing. A reboot is not required — sending `SIGTERM` to all corpse processes after uninstall is almost always sufficient to allow reinstallation. The underlying cause (why `Stop()` RPCs go undeliverable and sysextd doesn't recover) should be studied and corrected.
 
 ---
 
