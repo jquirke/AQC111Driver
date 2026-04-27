@@ -63,7 +63,6 @@ The driver loads, forces Config 1, registers an Ethernet interface, and is fully
 - End-to-end TX: ARP resolves, `ping` succeeds
 
 **What is not done yet:**
-- DHCP / automatic IP address assignment
 - RX checksum offload — hardware signals L3/L4 pass/fail in the RX descriptor; not consumed
 - TX checksum offload — `SFR_TXCOE_CTL` / `SFR_RXCOE_CTL` not programmed; not advertised to stack
 - TSO — firmware-based TCP segmentation via TX descriptor MSS field
