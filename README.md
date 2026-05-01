@@ -117,10 +117,12 @@ If the system extension state becomes tangled (ENOEXEC on dext launch, stuck in 
 
 ## Diagnostics
 
-Stream dext logs (filter out runningboard noise):
+Stream dext logs:
 ```
-log stream --predicate 'eventMessage contains "AQC111" AND subsystem != "com.apple.runningboard"' --level debug
+log stream --predicate 'process == "kernel" AND eventMessage contains "AQC111"' --level debug
 ```
+
+DriverKit dext `os_log` output is attributed to the `kernel` process.
 
 ---
 
