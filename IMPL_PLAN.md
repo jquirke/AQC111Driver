@@ -162,6 +162,18 @@ A `kIOReturnNotResponding` (`0xe00002ed`, `IOReturn.h:182`, "device not respondi
 
 ---
 
+## Log Level Strategy (implemented, on branch `log-level-strategy`)
+
+DriverKit's `os/log.h` only exposes `OS_LOG_TYPE_DEFAULT` (no `os_log_debug`/`info`/subsystem API), so verbosity filtering is done in our own code: four level-gated macros (`LogE`/`LogI`/`LogD`/`LogV`) backed by a single `gLogLevel`, replacing the single `Log()` macro that previously fired everything — including per-frame hex dumps — at full volume. All call sites in `AQC111NIC.cpp`/`AQC111.cpp` reclassified: hex dumps → Verbose, per-completion bookkeeping → Debug, lifecycle → Info (default), failures → Error (always on).
+
+**Load-time config — confirmed working (rounds 1 & 2 tested):** `AQC111LogLevel` integer key in each `Info.plist` personality dict, read via `CopyProperties()` in `Start()`. Round 1 confirmed the absent-key fallback defaults correctly to Info. Round 2 confirmed setting the key to `3` (Verbose) and rebuilding actually raises the level. Shipped default is `1` (Info), set explicitly in both personalities.
+
+**Live config (stretch goal) — NOT working, needs follow-up.** `AQC111NIC::SetProperties(OSDictionary*)` was overridden per the SDK's doc comment ("a DriverKit subclass may implement this method"), with a companion CLI (`tools/set-log-level.swift`) calling `IORegistryEntrySetCFProperties()` against the matched service (found via `IOUserClass=AQC111NIC` property match — `IOServiceMatching("AQC111NIC")` does NOT work, since the registered `IOClass` is the generic `IOUserNetworkEthernet` proxy, not the dext subclass name). Result: `IORegistryEntrySetCFProperties` consistently returns `0xe00002c7` (`kIOReturnUnsupported`), with and without `sudo` — meaning the call likely isn't reaching our override, or this path is gated before userspace dexts.
+
+**TODO:** try overriding `UserSetProperties(OSContainer *properties) LOCAL` instead of `SetProperties` — a separate, plain-C++-override method also declared in `IOService.iig` that may be the actual route `IORegistryEntrySetCFProperties()` takes for DriverKit services (`SetProperties` is IORPC-dispatched; `UserSetProperties` is LOCAL/local-process-only, which might mean it's the one the kernel-side proxy actually calls into on this machine's DriverKit version). If that also fails, the live-update stretch goal likely needs a proper `IOUserClient` external method instead — downgrade and drop the `SetProperties` override/`tools/set-log-level.swift` at that point rather than leaving dead code. Not blocking: the load-time plist mechanism is confirmed sufficient for shipping.
+
+---
+
 ## Known Risk Points
 
 | Area | Risk | Mitigation |
