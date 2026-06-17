@@ -63,8 +63,7 @@ The driver loads, forces Config 1, registers an Ethernet interface, and is fully
 - End-to-end TX: ARP resolves, `ping` succeeds
 
 **What is not done yet:**
-- RX checksum offload — hardware signals L3/L4 pass/fail in the RX descriptor; not consumed
-- TX checksum offload — `SFR_TXCOE_CTL` / `SFR_RXCOE_CTL` not programmed; not advertised to stack
+- TX checksum offload — `SFR_TXCOE_CTL` not programmed; not advertised to stack (RX checksum offload is implemented — see M6a in `IMPL_PLAN.md`)
 - TSO — firmware-based TCP segmentation via TX descriptor MSS field
 - Jumbo frames — hardware supports up to ~16 KB; currently hardcoded to 1500 MTU
 - VLAN offload — hardware supports 802.1Q insertion/stripping; RX descriptor carries tag
@@ -75,6 +74,8 @@ The driver loads, forces Config 1, registers an Ethernet interface, and is fully
 **Current bugs:**
 
 1. **Teardown leaves corpse processes that block reinstall.** After uninstall, both personalities leave orphaned dext processes that sysextd waits on indefinitely rather than force-killing. A reboot is not required — sending `SIGTERM` to all corpse processes after uninstall is almost always sufficient to allow reinstallation. The underlying cause (why `Stop()` RPCs go undeliverable and sysextd doesn't recover) should be studied and corrected.
+
+2. **RX silently stops mid-session; TX keeps working.** Confirmed recurring (three occurrences so far). Root cause identified: a `kIOReturnNotResponding` device hiccup leaves USB pipes stalled afterward, and the driver has three separate gaps in stall recovery — one per pipe (RX, ITR, TX) — each missing a different shape of the same problem (stall-as-completion-status on RX not handled outside the `kUSBHostReturnPipeStalled` case; stall-as-resubmission-return-value on ITR and TX never checked at all). Recovery requires unplugging/re-enumerating the device. Fix plan documented in `IMPL_PLAN.md`; not yet implemented — collecting more occurrences first to confirm it covers all observed patterns before spending implementation effort.
 
 ---
 
