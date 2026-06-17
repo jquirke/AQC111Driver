@@ -93,6 +93,7 @@ struct RxParseInfo {
     uint32_t packetCount;
 };
 static bool parseRxLayout(const uint8_t *buf, uint32_t actualByteCount, RxParseInfo *info);
+static uint32_t linkSpeedMbps(uint8_t speedCode);
 // Reads the permanent 6-byte MAC address from device EEPROM via AQ_FLASH_PARAMETERS.
 // RE: bmRequestType=0xC0 IN|Vendor|Device, bRequest=0x20, wValue=0, wIndex=0, wLength=6.
 static kern_return_t
@@ -112,6 +113,18 @@ readMACAddress(IOUSBHostInterface *iface, IOUserNetworkMACAddress *out)
     }
     OSSafeReleaseNULL(buf);
     return ret;
+}
+
+static uint32_t
+linkSpeedMbps(uint8_t speedCode)
+{
+    switch (speedCode) {
+        case 0x0F: return 5000;
+        case 0x10: return 2500;
+        case 0x11: return 1000;
+        case 0x13: return 100;
+        default:   return 0;
+    }
 }
 
 struct AQC111NIC_IVars {
@@ -748,6 +761,9 @@ hwOnLinkUp(IOUSBHostInterface *iface, uint8_t speedCode)
     uint16_t medium;
     uint8_t b;
     uint8_t coalesce[5] = { 0x07, 0x00, 0x01, 0x1E, 0xFF };
+    uint32_t speedMbps = linkSpeedMbps(speedCode);
+
+    LogI("hwOnLinkUp: link speed %u Mbps (code=0x%02x)", speedMbps, speedCode);
 
     // Mirror the Linux/x86 receive-start sequence on actual link-up.
     rxCtl = 0x0000;
@@ -769,7 +785,7 @@ hwOnLinkUp(IOUSBHostInterface *iface, uint8_t speedCode)
         coalesce[4] = 0x00;
     }
     r = aqWrite(iface, 0x002E, coalesce, sizeof(coalesce));
-    LogI("hwOnLinkUp: coalescing(speed=0x%02x) -> 0x%x", speedCode, r);
+    LogI("hwOnLinkUp: coalescing(speed=%u Mbps code=0x%02x) -> 0x%x", speedMbps, speedCode, r);
 
     medium = 0x0002 | 0x0010 | 0x0020;  // full duplex + RX/TX flow control
     if (speedCode == 0x0F || speedCode == 0x10) {
@@ -827,7 +843,7 @@ ensureRxStarted(AQC111NIC_IVars *ivars, uint8_t speedCode)
     }
     hwOnLinkUp(ivars->interface, speedCode);
     ivars->rxStarted = true;
-    LogI("ensureRxStarted: started speed=0x%02x", speedCode);
+    LogI("ensureRxStarted: started link speed %u Mbps (code=0x%02x)", linkSpeedMbps(speedCode), speedCode);
 }
 
 static void
@@ -1277,11 +1293,11 @@ IMPL(AQC111NIC, OnItrComplete)
             LinkStatus ls = linkUp ? kIOUserNetworkLinkStatusActive
                                    : kIOUserNetworkLinkStatusInactive;
             IOReturn lsRet = reportLinkStatus(ls, media);
-            LogD("ITR: byte1=0x%02x linkUp=%d speed=0x%02x -> reportLinkStatus(0x%x, 0x%x) -> 0x%x",
-                byte1, (int)linkUp, speedCode, ls, media, lsRet);
+            LogI("ITR: link %s speed %u Mbps (code=0x%02x) -> reportLinkStatus(0x%x, 0x%x) -> 0x%x",
+                linkUp ? "up" : "down", linkUp ? linkSpeedMbps(speedCode) : 0, speedCode, ls, media, lsRet);
         } else {
-            LogD("ITR: byte1=0x%02x linkUp=%d speed=0x%02x (cached, interfaceEnabled=false)",
-                byte1, (int)linkUp, speedCode);
+            LogD("ITR: byte1=0x%02x linkUp=%d speed=%u Mbps code=0x%02x (cached, interfaceEnabled=false)",
+                byte1, (int)linkUp, linkUp ? linkSpeedMbps(speedCode) : 0, speedCode);
         }
     }
 
