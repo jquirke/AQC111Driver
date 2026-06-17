@@ -16,7 +16,33 @@
 
 #include "AQC111.h"
 
-#define Log(fmt, ...) os_log(OS_LOG_DEFAULT, "AQC111-A [" __DATE__ " " __TIME__ "] - " fmt, ##__VA_ARGS__)
+// Log levels — see AQC111NIC.cpp / IMPL_PLAN.md "Log Level Strategy" for the
+// full rationale. This personality logs little, but uses the same scheme for
+// consistency and so "AQC111LogLevel" works the same way across both.
+#define kLogLevelError      0
+#define kLogLevelInfo       1
+#define kLogLevelDebug      2
+#define kLogLevelVerbose    3
+static volatile uint8_t gLogLevel = kLogLevelInfo;
+
+#define LogE(fmt, ...) do { if (gLogLevel >= kLogLevelError) os_log(OS_LOG_DEFAULT, "AQC111-A [" __DATE__ " " __TIME__ "] - " fmt, ##__VA_ARGS__); } while (0)
+#define LogI(fmt, ...) do { if (gLogLevel >= kLogLevelInfo)  os_log(OS_LOG_DEFAULT, "AQC111-A [" __DATE__ " " __TIME__ "] - " fmt, ##__VA_ARGS__); } while (0)
+
+static void
+applyLogLevelFromDictionary(OSDictionary *dict)
+{
+    if (dict == nullptr) {
+        return;
+    }
+    OSNumber *num = OSDynamicCast(OSNumber, dict->getObject("AQC111LogLevel"));
+    if (num == nullptr) {
+        return;
+    }
+    uint32_t level = num->unsigned32BitValue();
+    if (level <= kLogLevelVerbose) {
+        gLogLevel = (uint8_t)level;
+    }
+}
 
 struct AQC111_IVars {
     IOUSBHostDevice *device;
@@ -44,19 +70,28 @@ IMPL(AQC111, Start)
 
     ret = Start(provider, SUPERDISPATCH);
     if (ret != kIOReturnSuccess) {
-        Log("super Start failed: 0x%x", ret);
+        LogE("super Start failed: 0x%x", ret);
         return ret;
+    }
+
+    {
+        OSDictionary *props = nullptr;
+        if (CopyProperties(&props) == kIOReturnSuccess && props != nullptr) {
+            applyLogLevelFromDictionary(props);
+        }
+        OSSafeReleaseNULL(props);
+        LogI("Start: gLogLevel=%u (0=Error 1=Info 2=Debug 3=Verbose)", gLogLevel);
     }
 
     ivars->device = OSDynamicCast(IOUSBHostDevice, provider);
     if (ivars->device == nullptr) {
-        Log("provider is not IOUSBHostDevice");
+        LogE("provider is not IOUSBHostDevice");
         return kIOReturnError;
     }
 
     ret = ivars->device->Open(this, 0, 0);
     if (ret != kIOReturnSuccess) {
-        Log("device Open failed: 0x%x", ret);
+        LogE("device Open failed: 0x%x", ret);
         return ret;
     }
 
@@ -65,20 +100,20 @@ IMPL(AQC111, Start)
     // and the stack reverts to CDC immediately.
     ret = ivars->device->SetConfiguration(1, true);
     if (ret != kIOReturnSuccess) {
-        Log("SetConfiguration(1) failed: 0x%x — aborting, will not RegisterService", ret);
+        LogE("SetConfiguration(1) failed: 0x%x — aborting, will not RegisterService", ret);
         return ret;
     }
-    Log("SetConfiguration(1) -> success");
+    LogI("SetConfiguration(1) -> success");
 
     ret = RegisterService();
-    Log("RegisterService -> 0x%x", ret);
+    LogI("RegisterService -> 0x%x", ret);
     return ret;
 }
 
 kern_return_t
 IMPL(AQC111, Stop)
 {
-    Log("Stop");
+    LogI("Stop");
     // Close and release the device BEFORE calling SUPERDISPATCH.
     // IOService::Stop_Impl schedules an async cleanup block on the service's
     // auto-created "-Default" queue. If the device is still open when that

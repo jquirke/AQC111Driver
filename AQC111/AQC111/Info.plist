@@ -40,6 +40,10 @@
 			<integer>57434</integer>
 			<key>idVendor</key>
 			<integer>8436</integer>
+			<!-- Load-time log verbosity: 0=Error 1=Info 2=Debug 3=Verbose.
+			     See IMPL_PLAN.md "Log Level Strategy". -->
+			<key>AQC111LogLevel</key>
+			<integer>1</integer>
 		</dict>
 		<!-- Personality B: USB Ethernet NIC.
 		     Matches the Config 1 vendor-specific interface (class 255) published
@@ -71,6 +75,10 @@
 			<integer>57434</integer>
 			<key>idVendor</key>
 			<integer>8436</integer>
+			<!-- Load-time log verbosity: 0=Error 1=Info 2=Debug 3=Verbose.
+			     See IMPL_PLAN.md "Log Level Strategy". -->
+			<key>AQC111LogLevel</key>
+			<integer>1</integer>
 		</dict>
 	</dict>
 </dict>

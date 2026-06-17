@@ -108,6 +108,11 @@ public:
 
     virtual kern_return_t
     GetHardwareAssists(uint32_t * hardwareAssists) override LOCAL;
+
+    // Live log-level control — see "AQC111LogLevel" handling, IMPL_PLAN.md
+    // "Log Level Strategy". Callable via IORegistryEntrySetCFProperties().
+    virtual kern_return_t
+    SetProperties(OSDictionary * properties) override;
 };
 
 #endif /* AQC111NIC_h */
