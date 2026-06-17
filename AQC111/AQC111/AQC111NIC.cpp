@@ -51,7 +51,6 @@ static void hwOnLinkUp(IOUSBHostInterface *iface, uint8_t speedCode);
 static void hwOnLinkDown(IOUSBHostInterface *iface);
 static void ensureRxStarted(struct AQC111NIC_IVars *ivars, uint8_t speedCode);
 static void ensureRxStopped(struct AQC111NIC_IVars *ivars);
-static void resetEnablePath(struct AQC111NIC_IVars *ivars);
 static void dumpRxBytes(const uint8_t *buf, uint32_t actualByteCount, uint32_t slot, IOReturn status);
 struct RxParseInfo {
     uint32_t headerOffset;
@@ -369,7 +368,13 @@ IMPL(AQC111NIC, Start)
     ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionOut, 8 + 1518, 0, &ivars->txBuf);
     if (ret != kIOReturnSuccess) { Log("Start: txBuf alloc failed: 0x%x", ret); goto fail; }
 
-    // Post 10 outstanding RX bulk IN transfers.
+    // Allocate RX buffers and completion actions. USB I/O is NOT posted here —
+    // arming happens in SetInterfaceEnable(true), AFTER hwEnable powers the PHY.
+    // This mirrors the x86 driver (AqPacificDriver::enable: hwStart → Rx::start
+    // → Itr::start) and Linux (aqc111_reset → usbnet_status_start). Posting the
+    // ITR URB before the PHY is alive causes the first completion to capture
+    // an autoneg-in-progress state, and the device may not re-signal once
+    // autoneg settles — see notes/itr_ordering_analysis.md.
     for (int i = 0; i < RX_SLOTS; i++) {
         ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionIn, RX_BUF_SIZE, 0, &ivars->rxBufs[i]);
         if (ret != kIOReturnSuccess) {
@@ -382,16 +387,9 @@ IMPL(AQC111NIC, Start)
             goto fail;
         }
         *(uint32_t *)ivars->rxActions[i]->GetReference() = (uint32_t)i;
-
-        ret = ivars->pipeRx->AsyncIO(ivars->rxBufs[i], RX_BUF_SIZE, ivars->rxActions[i], 0);
-        if (ret != kIOReturnSuccess) {
-            Log("Start: rxAsyncIO[%d] failed: 0x%x", i, ret);
-            goto fail;
-        }
     }
-    Log("Start: %d RX transfers posted", RX_SLOTS);
+    Log("Start: %d RX buffers allocated", RX_SLOTS);
 
-    // Post one ITR (interrupt IN) transfer for link-status events.
     ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionIn, 16, 0, &ivars->itrBuf);
     if (ret != kIOReturnSuccess) {
         Log("Start: itrBuf alloc failed: 0x%x", ret);
@@ -402,13 +400,7 @@ IMPL(AQC111NIC, Start)
         Log("Start: itrAction create failed: 0x%x", ret);
         goto fail;
     }
-    ret = ivars->pipeItr->AsyncIO(ivars->itrBuf, 16, ivars->itrAction, 0);
-    if (ret != kIOReturnSuccess) {
-        Log("Start: itrAsyncIO failed: 0x%x", ret);
-        goto fail;
-    }
-    ivars->ioArmed = true;
-    Log("Start: ITR transfer posted");
+    Log("Start: ITR buffer allocated");
 
     ret = RegisterService();
     Log("Start: RegisterService -> 0x%x", ret);
@@ -699,17 +691,10 @@ hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
     ret = aqVendorOut(iface, 0x61, &phyFlags, sizeof(phyFlags));
     Log("hwEnable: AQ_PHY_OPS step2 flags=0x%08x -> 0x%x", phyFlags, ret);
 
-    b = 0x01;
-    ret = aqWrite(iface, 0x00B7, &b, 1);
-    Log("hwEnable: ETH_MAC_PATH=0x01 -> 0x%x", ret);
-
-    b = 0x02;
-    ret = aqWrite(iface, 0x00B9, &b, 1);
-    Log("hwEnable: BULK_OUT_CTRL=0x02 -> 0x%x", ret);
-
-    uint8_t coalesce[5] = { 0x07, 0x00, 0x01, 0x1E, 0xFF };
-    ret = aqWrite(iface, 0x002E, coalesce, 5);
-    Log("hwEnable: coalescing -> 0x%x", ret);
+    // NOTE: ETH_MAC_PATH, BULK_OUT_CTRL, and coalescing are intentionally
+    // NOT programmed here. x86 hwStart and Linux aqc111_reset both stop at
+    // advertise(). MAC-path / bulk-out / coalescing are programmed on the
+    // link-up edge via hwOnLinkUp() once autoneg actually settles.
 }
 
 static void
@@ -815,38 +800,6 @@ ensureRxStopped(AQC111NIC_IVars *ivars)
     hwOnLinkDown(ivars->interface);
     ivars->rxStarted = false;
     Log("ensureRxStopped: stopped");
-}
-
-static void
-resetEnablePath(AQC111NIC_IVars *ivars)
-{
-    if (ivars == nullptr) {
-        return;
-    }
-
-    // `ifconfig up` needs to be strong enough to recreate the transient RX-working
-    // state seen earlier, not just leave previously armed USB state in place.
-    ensureRxStopped(ivars);
-    disarmAsyncIO(ivars);
-    hwDisable(ivars->interface);
-
-    if (ivars->pipeItr != nullptr) {
-        kern_return_t r = ivars->pipeItr->ClearStall(false);
-        Log("resetEnablePath: ClearStall ITR -> 0x%x", r);
-    }
-    if (ivars->pipeRx != nullptr) {
-        kern_return_t r = ivars->pipeRx->ClearStall(false);
-        Log("resetEnablePath: ClearStall RX -> 0x%x", r);
-    }
-    if (ivars->pipeTx != nullptr) {
-        kern_return_t r = ivars->pipeTx->ClearStall(false);
-        Log("resetEnablePath: ClearStall TX -> 0x%x", r);
-    }
-
-    // Do NOT clear lastLinkUp / lastSpeedCode here — they are a cache of the
-    // last ITR state and must survive the disable/enable cycle so that
-    // SetInterfaceEnable(true) can reconcile without waiting for an interrupt edge.
-    ivars->rxStarted = false;
 }
 
 static void
@@ -1332,6 +1285,28 @@ IMPL(AQC111NIC, SetInterfaceEnable)
 {
     Log("SetInterfaceEnable: %d", isEnable);
     if (isEnable) {
+        // If a previous enable cycle left USB I/O armed (no intervening
+        // disable), tear it down before bringing the PHY back up.
+        if (ivars->ioArmed) {
+            ensureRxStopped(ivars);
+            disarmAsyncIO(ivars);
+            hwDisable(ivars->interface);
+        }
+
+        // ClearStall every pipe — safe on fresh pipes, required after Abort.
+        if (ivars->pipeItr) {
+            kern_return_t r = ivars->pipeItr->ClearStall(false);
+            Log("SetInterfaceEnable: ClearStall ITR -> 0x%x", r);
+        }
+        if (ivars->pipeRx) {
+            kern_return_t r = ivars->pipeRx->ClearStall(false);
+            Log("SetInterfaceEnable: ClearStall RX -> 0x%x", r);
+        }
+        if (ivars->pipeTx) {
+            kern_return_t r = ivars->pipeTx->ClearStall(false);
+            Log("SetInterfaceEnable: ClearStall TX -> 0x%x", r);
+        }
+
         ivars->interfaceEnabled = true;
 
         kern_return_t r;
@@ -1340,19 +1315,15 @@ IMPL(AQC111NIC, SetInterfaceEnable)
         r = ivars->rxsQueue->SetEnable(true); Log("SetInterfaceEnable: rxsQueue SetEnable -> 0x%x", r);
         r = ivars->rxcQueue->SetEnable(true); Log("SetInterfaceEnable: rxcQueue SetEnable -> 0x%x", r);
 
-        resetEnablePath(ivars);
-        kern_return_t armRet = armAsyncIO(ivars);
-        Log("SetInterfaceEnable: armAsyncIO -> 0x%x", armRet);
+        // PHY bring-up MUST precede armAsyncIO. See notes/itr_ordering_analysis.md.
+        // Posting ITR before hwEnable causes the first URB completion to capture
+        // a stale autoneg-in-progress state; the device may not re-signal once
+        // autoneg actually completes, leaving the interface stuck "inactive"
+        // until a physical cable transition.
         hwEnable(ivars->interface, ivars->macAddress);
 
-        // Reconcile cached ITR state — mirrors Linux aqc111_link_reset().
-        // The device sends current link/speed on the first ITR arm (in Start()),
-        // before interfaceEnabled=true. We cache it in OnItrComplete and apply it
-        // here rather than waiting for another interrupt edge.
-        Log("SetInterfaceEnable: cached lastLinkUp=%d lastSpeedCode=0x%02x",
-            (int)ivars->lastLinkUp, ivars->lastSpeedCode);
-        if (ivars->lastLinkUp && ivars->lastSpeedCode != 0)
-            ensureRxStarted(ivars, ivars->lastSpeedCode);
+        kern_return_t armRet = armAsyncIO(ivars);
+        Log("SetInterfaceEnable: armAsyncIO -> 0x%x", armRet);
     } else {
         ivars->interfaceEnabled = false;
         ensureRxStopped(ivars);
