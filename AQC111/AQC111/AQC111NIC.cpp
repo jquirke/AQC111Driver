@@ -42,6 +42,30 @@
 #define RX_SLOTS        10
 #define RX_BUF_SIZE     0x10000   // 64KB per slot
 
+// SFR_RXCOE_CTL: per-protocol RX checksum offload enable (see IMPL_PLAN.md M6a).
+// TODO: most other SFR register addresses in this file are still raw hex
+// literals (e.g. 0x000B, 0x0022, 0x00B7) — refactor to named constants
+// incrementally rather than in one large pass.
+#define SFR_RXCOE_CTL       0x0034
+#define SFR_RXCOE_IP        0x01
+#define SFR_RXCOE_TCP       0x02
+#define SFR_RXCOE_UDP       0x04
+#define SFR_RXCOE_TCPV6     0x20
+#define SFR_RXCOE_UDPV6     0x40
+
+// RX Packet Descriptor checksum sub-fields (lower 16 bits of pd; see
+// IMPL_PLAN.md M6a — cross-checked against Linux aqc111.h and x86 kext RE).
+#define AQ_RX_PD_L4_ERR         0x01
+#define AQ_RX_PD_L3_ERR         0x02
+#define AQ_RX_PD_L4_TYPE_MASK   0x1C
+#define AQ_RX_PD_L4_TYPE_SHIFT  2
+#define AQ_RX_PD_L4_UDP         1
+#define AQ_RX_PD_L4_TCP         4
+#define AQ_RX_PD_L3_TYPE_MASK   0x60
+#define AQ_RX_PD_L3_TYPE_SHIFT  5
+#define AQ_RX_PD_L3_IPV4        1
+#define AQ_RX_PD_L3_IPV6        2
+
 static kern_return_t aqWrite(IOUSBHostInterface *iface, uint16_t addr, const void *data, uint16_t len);
 static kern_return_t aqRead(IOUSBHostInterface *iface, uint16_t addr, void *data, uint16_t len);
 static kern_return_t aqVendorOut(IOUSBHostInterface *iface, uint8_t request, const void *data, uint16_t len);
@@ -117,12 +141,16 @@ struct AQC111NIC_IVars {
     bool                                dumpedRx80;
     bool                                dumpedRx432;
     bool                                dumpedRxOther;
+    bool                                dumpedRxCsum;
     // TX path — one frame in flight at a time
     IOBufferMemoryDescriptor           *txBuf;           // staging buffer: 8-byte descriptor + frame
     OSAction                           *txPacketAction;  // TxPacketAvailable OSAction
     OSAction                           *txCompleteAction;// OnTxComplete OSAction
     IOUserNetworkPacket                *txInFlight;      // packet held during USB flight
     bool                                txBusy;
+    // OS-controlled enable mask (kIOUserNetworkHWAssist* bits), set via
+    // SetHardwareAssists. See IMPL_PLAN.md M6a.
+    uint32_t                            hwAssistMask;
 };
 
 bool
@@ -130,7 +158,15 @@ AQC111NIC::init()
 {
     if (!super::init()) return false;
     ivars = IONewZero(AQC111NIC_IVars, 1);
-    return ivars != nullptr;
+    if (ivars == nullptr) return false;
+    // Default capenable to everything we advertise via getFeatureFlags() —
+    // the OS queries GetHardwareAssists for the *current* enabled set but
+    // never calls SetHardwareAssists to turn anything on by default; it only
+    // uses that to change state later (e.g. `ifconfig -rxcsum`). Confirmed
+    // empirically: SetHardwareAssists never fires during Start(), only
+    // GetHardwareAssists. See IMPL_PLAN.md M6a.
+    ivars->hwAssistMask = kIOUserNetworkHWAssistRxChecksum;
+    return true;
 }
 
 void
@@ -719,6 +755,14 @@ hwOnLinkUp(IOUSBHostInterface *iface, uint8_t speedCode)
     r = aqWrite(iface, 0x00B9, &b, 1);
     Log("hwOnLinkUp: BULK_OUT_CTRL=0x02 -> 0x%x", r);
 
+    // Hardware won't populate the RX descriptor's checksum status bits at all
+    // unless this is set. Written unconditionally; forwarding the result to
+    // the stack is gated separately in OnRxComplete on the OS-controlled
+    // hwAssistMask (see IMPL_PLAN.md M6a).
+    b = SFR_RXCOE_IP | SFR_RXCOE_TCP | SFR_RXCOE_UDP | SFR_RXCOE_TCPV6 | SFR_RXCOE_UDPV6;
+    r = aqWrite(iface, SFR_RXCOE_CTL, &b, 1);
+    Log("hwOnLinkUp: RXCOE_CTL=0x%02x -> 0x%x", b, r);
+
     if (speedCode == 0x13) {
         coalesce[1] = 0xA0;
         coalesce[2] = 0x00;
@@ -1137,6 +1181,38 @@ IMPL(AQC111NIC, OnRxComplete)
                 IOReturn prepRet = pkt->prepareWithQueue(ivars->rxcQueue, kIOUserNetworkPacketDirectionRx);
                 IOReturn offRet = pkt->setDataOffsetAndLength(0, frame_len);
                 IOReturn lhlRet = pkt->setLinkHeaderLength(14);
+
+                if (ivars->hwAssistMask & kIOUserNetworkHWAssistRxChecksum) {
+                    uint16_t csumBits = (uint16_t)pd;
+                    bool     l4Err  = csumBits & AQ_RX_PD_L4_ERR;
+                    bool     l3Err  = csumBits & AQ_RX_PD_L3_ERR;
+                    uint8_t  l4Type = (csumBits & AQ_RX_PD_L4_TYPE_MASK) >> AQ_RX_PD_L4_TYPE_SHIFT;
+                    uint8_t  l3Type = (csumBits & AQ_RX_PD_L3_TYPE_MASK) >> AQ_RX_PD_L3_TYPE_SHIFT;
+
+                    IOUserNetworkPacketRxChecksumFlags csumFlags = 0;
+                    if (l3Type == AQ_RX_PD_L3_IPV4 && !l3Err) {
+                        csumFlags |= kIOUserNetworkPacketRxCsumIPChecked | kIOUserNetworkPacketRxCsumIPValid;
+                    }
+                    if ((l4Type == AQ_RX_PD_L4_UDP || l4Type == AQ_RX_PD_L4_TCP) && !l4Err) {
+                        csumFlags |= kIOUserNetworkPacketRxCsumDataValid;
+                    }
+                    IOUserNetworkPacketRxChecksumFlags readback = 0;
+                    uint16_t readbackValue = 0;
+                    if (csumFlags != 0) {
+                        pkt->setRxChecksumInfo(csumFlags, 0);
+                        // Readback proves the packet object actually persisted what we set —
+                        // a direct round-trip on our own object, immune to the Skywalk
+                        // BSD-compat capability synthesis that makes ifconfig untrustworthy
+                        // for this. See IMPL_PLAN.md M6a.
+                        pkt->getRxChecksumInfo(&readback, &readbackValue);
+                    }
+                    if (l3Err || l4Err || !ivars->dumpedRxCsum) {
+                        ivars->dumpedRxCsum = true;
+                        Log("RX[%u] frame[%u] checksum: l3Type=%u l3Err=%d l4Type=%u l4Err=%d csumFlags=0x%x readback=0x%x",
+                            slot, i, l3Type, l3Err, l4Type, l4Err, csumFlags, readback);
+                    }
+                }
+
                 pkt->setCompletionStatus(kIOReturnSuccess);
                 IOUserNetworkPacket *packetArray[1] = { pkt };
                 IOReturn enqRet = ivars->rxcQueue->enqueuePackets(packetArray, 1);
@@ -1267,15 +1343,23 @@ kern_return_t
 IMPL(AQC111NIC, SetHardwareAssists)
 {
     Log("SetHardwareAssists: 0x%x", hardwareAssists);
+    ivars->hwAssistMask = hardwareAssists;
     return kIOReturnSuccess;
 }
 
 kern_return_t
 IMPL(AQC111NIC, GetHardwareAssists)
 {
-    Log("GetHardwareAssists");
-    *hardwareAssists = 0;
+    Log("GetHardwareAssists -> 0x%x", ivars->hwAssistMask);
+    *hardwareAssists = ivars->hwAssistMask;
     return kIOReturnSuccess;
+}
+
+uint32_t
+AQC111NIC::getFeatureFlags()
+{
+    Log("getFeatureFlags -> 0x%x", kIOUserNetworkHWAssistRxChecksum);
+    return kIOUserNetworkHWAssistRxChecksum;
 }
 
 // --- Dispatched overrides ---

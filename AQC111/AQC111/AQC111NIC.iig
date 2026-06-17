@@ -108,6 +108,10 @@ public:
 
     virtual kern_return_t
     GetHardwareAssists(uint32_t * hardwareAssists) override LOCAL;
+
+    // RX checksum offload capability declaration — see IMPL_PLAN.md M6a
+    virtual uint32_t
+    getFeatureFlags() override LOCALONLY;
 };
 
 #endif /* AQC111NIC_h */
