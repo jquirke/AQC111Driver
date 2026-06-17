@@ -70,14 +70,11 @@ The driver loads, forces Config 1, registers an Ethernet interface, and is fully
 - VLAN offload — hardware supports 802.1Q insertion/stripping; RX descriptor carries tag
 - Wake-on-LAN — magic packet path exists in hardware; not wired up
 - PHY access polymorphism — the AQC111U has two PHY control interfaces selected by firmware major version (`>= 0x80` → `FWPhyAccess` via bRequest=0x61; `< 0x80` → `DirectPhyAccess` via bRequest=0x31/0x32). The driver reads and logs the firmware version at start but unconditionally uses the `FWPhyAccess` path. This is correct for the DUT (firmware `major=0x82`). Support for older `DirectPhyAccess` devices is not implemented.
+- TX ring depth — the TX path submits one frame at a time and waits for USB completion before submitting the next (`txBusy`/`txInFlight` single-slot gate). RX uses 10 outstanding buffers in flight; TX has no equivalent pipelining, which caps achievable throughput well short of the link's 5 Gbps ceiling under sustained load.
 
 **Current bugs:**
 
-1. **Media must be manually re-seated to start RX flow.** After `ifconfig enX up`, no RX frames arrive until the Ethernet cable is unplugged and replugged. The PHY negotiates link and the ITR fires correctly, but the hardware RX path stays silent until a link-down/link-up cycle. Likely cause: `hwOnLinkUp` needs to re-cycle `SFR_RX_CTL` (stop then restart), which is what the Linux driver does on every link-up event.
-
-2. **USB re-enumeration flap on initial connect.** The adapter sometimes goes through one or two re-enumeration cycles when first plugged in before stabilising. This may be the device's own firmware initialisation, or it may be a heisenbug introduced by the USB bus analyser used during development — it has not been reproduced without the analyser attached. Needs careful examination; TBD.
-
-3. **Teardown leaves corpse processes that block reinstall.** After uninstall, both personalities leave orphaned dext processes that sysextd waits on indefinitely rather than force-killing. A reboot is not required — sending `SIGTERM` to all corpse processes after uninstall is almost always sufficient to allow reinstallation. The underlying cause (why `Stop()` RPCs go undeliverable and sysextd doesn't recover) should be studied and corrected.
+1. **Teardown leaves corpse processes that block reinstall.** After uninstall, both personalities leave orphaned dext processes that sysextd waits on indefinitely rather than force-killing. A reboot is not required — sending `SIGTERM` to all corpse processes after uninstall is almost always sufficient to allow reinstallation. The underlying cause (why `Stop()` RPCs go undeliverable and sysextd doesn't recover) should be studied and corrected.
 
 ---
 

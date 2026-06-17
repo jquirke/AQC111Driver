@@ -4,3 +4,6 @@ AQC111/build/
 
 # macOS
 .DS_Store
+
+# Working notes (not yet ready for tracking)
+notes/
