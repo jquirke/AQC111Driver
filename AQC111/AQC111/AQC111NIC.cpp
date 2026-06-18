@@ -174,6 +174,9 @@ applyLogLevelFromDictionary(OSDictionary *dict)
 static kern_return_t aqWrite(IOUSBHostInterface *iface, uint16_t addr, const void *data, uint16_t len);
 static kern_return_t aqRead(IOUSBHostInterface *iface, uint16_t addr, void *data, uint16_t len);
 static kern_return_t aqVendorOut(IOUSBHostInterface *iface, uint8_t request, const void *data, uint16_t len);
+static kern_return_t aqWrite16(IOUSBHostInterface *iface, uint16_t addr, uint16_t value);
+static kern_return_t aqRead16(IOUSBHostInterface *iface, uint16_t addr, uint16_t *value);
+static kern_return_t aqVendorOut32(IOUSBHostInterface *iface, uint8_t request, uint32_t value);
 static void disarmAsyncIO(struct AQC111NIC_IVars *ivars);
 static void hwDisable(IOUSBHostInterface *iface);
 static void hwOnLinkUp(struct AQC111NIC_IVars *ivars, uint8_t speedCode);
@@ -190,6 +193,51 @@ struct RxParseInfo {
 };
 static bool parseRxLayout(const uint8_t *buf, uint32_t actualByteCount, RxParseInfo *info);
 static uint32_t linkSpeedMbps(uint8_t speedCode);
+
+static uint16_t
+readLe16(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t
+readLe32(const uint8_t *p)
+{
+    return (uint32_t)p[0] |
+        ((uint32_t)p[1] << 8) |
+        ((uint32_t)p[2] << 16) |
+        ((uint32_t)p[3] << 24);
+}
+
+static uint64_t
+readLe64(const uint8_t *p)
+{
+    return (uint64_t)readLe32(p) | ((uint64_t)readLe32(p + 4) << 32);
+}
+
+static void
+writeLe16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+}
+
+static void
+writeLe32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF);
+    p[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+static void
+writeLe64(uint8_t *p, uint64_t v)
+{
+    writeLe32(p, (uint32_t)(v & 0xFFFFFFFFULL));
+    writeLe32(p + 4, (uint32_t)((v >> 32) & 0xFFFFFFFFULL));
+}
+
 // Reads the permanent 6-byte MAC address from device EEPROM via AQ_FLASH_PARAMETERS.
 // RE: bmRequestType=0xC0 IN|Vendor|Device, bRequest=0x20, wValue=0, wIndex=0, wLength=6.
 static kern_return_t
@@ -787,6 +835,33 @@ aqRead(IOUSBHostInterface *iface, uint16_t addr, void *data, uint16_t len)
 }
 
 static kern_return_t
+aqWrite16(IOUSBHostInterface *iface, uint16_t addr, uint16_t value)
+{
+    uint8_t data[2];
+    writeLe16(data, value);
+    return aqWrite(iface, addr, data, sizeof(data));
+}
+
+static kern_return_t
+aqRead16(IOUSBHostInterface *iface, uint16_t addr, uint16_t *value)
+{
+    uint8_t data[2];
+    kern_return_t ret = aqRead(iface, addr, data, sizeof(data));
+    if (ret == kIOReturnSuccess && value != nullptr) {
+        *value = readLe16(data);
+    }
+    return ret;
+}
+
+static kern_return_t
+aqVendorOut32(IOUSBHostInterface *iface, uint8_t request, uint32_t value)
+{
+    uint8_t data[4];
+    writeLe32(data, value);
+    return aqVendorOut(iface, request, data, sizeof(data));
+}
+
+static kern_return_t
 armAsyncIO(AQC111NIC_IVars *ivars)
 {
     kern_return_t ret;
@@ -850,7 +925,7 @@ hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
     // NOTE: bRequest=0x31 (AQ_PHY_POWER) is DirectPhyAccess only (major < 0x80)
     // and must NOT be used here. This driver requires FWPhyAccess (major >= 0x80).
     phyFlags = 1u << 19;  // AQ_PHY_POWER_EN only
-    ret = aqVendorOut(iface, 0x61, &phyFlags, sizeof(phyFlags));
+    ret = aqVendorOut32(iface, 0x61, phyFlags);
     LogI("hwEnable: AQ_PHY_OPS step1 POWER_EN=0x%08x -> 0x%x", phyFlags, ret);
 
     ret = aqWrite(iface, 0x0010, mac.octet, 6);
@@ -884,10 +959,10 @@ hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
     LogI("hwEnable: reg[0x000B] clear bit7 -> 0x%x", ret);
 
     w = 0;
-    ret = aqRead(iface, 0x0022, &w, 2);
+    ret = aqRead16(iface, 0x0022, &w);
     if (ret == kIOReturnSuccess) {
         w &= (uint16_t)~0x0100;
-        ret = aqWrite(iface, 0x0022, &w, 2);
+        ret = aqWrite16(iface, 0x0022, w);
     }
     LogI("hwEnable: reg[0x0022] clear bit8 -> 0x%x", ret);
 
@@ -908,7 +983,7 @@ hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
     phyFlags |= 1u << 19;     // AQ_PHY_POWER_EN
     phyFlags |= 1u << 21;     // AQ_DOWNSHIFT
     phyFlags |= 3u << 24;     // AQ_DSH_RETRIES=3 (matches Linux aqc111_set_phy_speed default)
-    ret = aqVendorOut(iface, 0x61, &phyFlags, sizeof(phyFlags));
+    ret = aqVendorOut32(iface, 0x61, phyFlags);
     LogI("hwEnable: AQ_PHY_OPS step2 flags=0x%08x -> 0x%x", phyFlags, ret);
 
     // NOTE: ETH_MAC_PATH, BULK_OUT_CTRL, and coalescing are intentionally
@@ -938,14 +1013,14 @@ applyMtuToHardware(AQC111NIC_IVars *ivars)
     };
     uint32_t mtu = ivars->currentMtu;
 
-    r = aqRead(iface, AQ_REG_MEDIUM_MODE, &medium, 2);
+    r = aqRead16(iface, AQ_REG_MEDIUM_MODE, &medium);
     if (r == kIOReturnSuccess) {
         if (mtu > AQC111_MIN_MTU) {
             medium |= AQ_MEDIUM_JUMBO_FRAME_ENABLE;
         } else {
             medium &= (uint16_t)~AQ_MEDIUM_JUMBO_FRAME_ENABLE;
         }
-        r = aqWrite(iface, AQ_REG_MEDIUM_MODE, &medium, 2);
+        r = aqWrite16(iface, AQ_REG_MEDIUM_MODE, medium);
     }
     if (r != kIOReturnSuccess && firstError == kIOReturnSuccess) {
         firstError = r;
@@ -1021,7 +1096,7 @@ hwOnLinkUp(AQC111NIC_IVars *ivars, uint8_t speedCode)
 
     // Mirror the Linux/x86 receive-start sequence on actual link-up.
     rxCtl = 0x0000;
-    r = aqWrite(iface, 0x000B, &rxCtl, 2);
+    r = aqWrite16(iface, 0x000B, rxCtl);
     LogI("hwOnLinkUp: RX_CTL=0x0000 -> 0x%x", r);
 
     b = 0x01;
@@ -1059,11 +1134,11 @@ hwOnLinkUp(AQC111NIC_IVars *ivars, uint8_t speedCode)
     if (ivars->currentMtu > AQC111_MIN_MTU) {
         medium |= AQ_MEDIUM_JUMBO_FRAME_ENABLE;
     }
-    r = aqWrite(iface, AQ_REG_MEDIUM_MODE, &medium, 2);
+    r = aqWrite16(iface, AQ_REG_MEDIUM_MODE, medium);
     LogI("hwOnLinkUp: MEDIUM_STATUS_MODE=0x%04x -> 0x%x", medium, r);
 
     medium |= AQ_MEDIUM_RECEIVE_ENABLE;
-    r = aqWrite(iface, AQ_REG_MEDIUM_MODE, &medium, 2);
+    r = aqWrite16(iface, AQ_REG_MEDIUM_MODE, medium);
     LogI("hwOnLinkUp: MEDIUM_STATUS_MODE|=RECEIVE_EN => 0x%04x -> 0x%x", medium, r);
 
     b = 0x10;  // SFR_VLAN_CONTROL_VSO
@@ -1074,7 +1149,7 @@ hwOnLinkUp(AQC111NIC_IVars *ivars, uint8_t speedCode)
     // (0x0046, 0x009e). Keep this patch minimal and focus first on the
     // must-have RX producer enables.
     rxCtl = 0x0288;  // default hwSetFilters: IPE | START | AB
-    r = aqWrite(iface, 0x000B, &rxCtl, 2);
+    r = aqWrite16(iface, 0x000B, rxCtl);
     LogI("hwOnLinkUp: RX_CTL=0x%04x -> 0x%x", rxCtl, r);
 }
 
@@ -1086,15 +1161,15 @@ hwOnLinkDown(IOUSBHostInterface *iface)
     uint16_t medium;
 
     rxCtl = 0x0000;
-    r = aqWrite(iface, 0x000B, &rxCtl, 2);
+    r = aqWrite16(iface, 0x000B, rxCtl);
     LogI("hwOnLinkDown: RX_CTL=0x0000 -> 0x%x", r);
 
     medium = 0;
-    r = aqRead(iface, 0x0022, &medium, 2);
+    r = aqRead16(iface, 0x0022, &medium);
     LogI("hwOnLinkDown: read MEDIUM_STATUS_MODE -> 0x%x val=0x%04x", r, medium);
     if (r == kIOReturnSuccess) {
         medium &= (uint16_t)~0x0100;
-        r = aqWrite(iface, 0x0022, &medium, 2);
+        r = aqWrite16(iface, 0x0022, medium);
     }
     LogI("hwOnLinkDown: MEDIUM_STATUS_MODE&=~RECEIVE_EN => 0x%04x -> 0x%x", medium, r);
 }
@@ -1167,7 +1242,7 @@ parseRxLayoutCandidate(const uint8_t *buf, uint32_t actualByteCount, uint32_t he
         return false;
     }
 
-    uint32_t header    = *(const uint32_t *)(buf + headerOffset);
+    uint32_t header    = readLe32(buf + headerOffset);
     uint32_t pktCount  = header & 0x1FFF;
     uint32_t descOff   = (header & 0xFFFFE000) >> 13;
     uint32_t descBytes = pktCount * 8;
@@ -1182,7 +1257,7 @@ parseRxLayoutCandidate(const uint8_t *buf, uint32_t actualByteCount, uint32_t he
 
     uint32_t pktOffset = packetBaseOffset;
     for (uint32_t i = 0; i < pktCount; i++) {
-        uint64_t pd      = *(const uint64_t *)(buf + descOff + i * 8);
+        uint64_t pd      = readLe64(buf + descOff + i * 8);
         uint32_t pktLen  = (uint32_t)((pd & 0x7FFF0000) >> 16);
 
         if (pktLen == 0) {
@@ -1235,14 +1310,14 @@ hwDisable(IOUSBHostInterface *iface)
     // of actively undoing what hwEnable/hwOnLinkUp set up, rather than
     // relying on the next hwOnLinkUp to overwrite it correctly anyway.
     w = 0x0000;
-    r = aqWrite(iface, 0x000B, &w, 2);
+    r = aqWrite16(iface, 0x000B, w);
     LogI("hwDisable: RX_CTL=0x0000 -> 0x%x", r);
 
     w = 0;
-    r = aqRead(iface, 0x0022, &w, 2);
+    r = aqRead16(iface, 0x0022, &w);
     LogI("hwDisable: read MEDIUM_STATUS_MODE -> 0x%x val=0x%04x", r, w);
     w &= ~(uint16_t)0x0100;
-    r = aqWrite(iface, 0x0022, &w, 2);
+    r = aqWrite16(iface, 0x0022, w);
     LogI("hwDisable: MEDIUM_STATUS_MODE=0x%04x (clear RECEIVE_EN) -> 0x%x", w, r);
 
     b = 0x00;
@@ -1258,11 +1333,11 @@ hwDisable(IOUSBHostInterface *iface)
     LogI("hwDisable: BMRX_DMA=0x00 -> 0x%x", r);
 
     phyFlags = 0;
-    r = aqVendorOut(iface, 0x61, &phyFlags, sizeof(phyFlags));
+    r = aqVendorOut32(iface, 0x61, phyFlags);
     LogI("hwDisable: AQ_PHY_OPS withdraw advertise flags=0x%08x -> 0x%x", phyFlags, r);
 
     phyFlags = (1u << 18) | (1u << 19);
-    r = aqVendorOut(iface, 0x61, &phyFlags, sizeof(phyFlags));
+    r = aqVendorOut32(iface, 0x61, phyFlags);
     LogI("hwDisable: AQ_PHY_OPS lowPower flags=0x%08x -> 0x%x", phyFlags, r);
 }
 
@@ -1328,7 +1403,7 @@ txDrainOne(AQC111NIC_IVars *ivars)
     ivars->txBuf->GetAddressRange(&range);
     uint8_t *txp = (uint8_t *)range.address;
     uint64_t txDesc = (uint64_t)dataLen;  // bits 20:0 = length, all others 0
-    memcpy(txp, &txDesc, 8);
+    writeLe64(txp, txDesc);
     memcpy(txp + 8, frame, dataLen);
     uint32_t txLen = 8 + dataLen;
     ivars->txBuf->SetLength(txLen);
@@ -1465,7 +1540,7 @@ IMPL(AQC111NIC, OnRxComplete)
     uint32_t delivered  = 0;
 
     for (uint32_t i = 0; i < layout.packetCount; i++) {
-        uint64_t pd      = *(const uint64_t *)(buf + layout.descriptorOffset + i * 8);
+        uint64_t pd      = readLe64(buf + layout.descriptorOffset + i * 8);
         bool     drop    = (pd >> 31) & 1;
         bool     ok      = (pd >> 11) & 1;
         uint32_t pkt_len = (uint32_t)((pd & 0x7FFF0000) >> 16);

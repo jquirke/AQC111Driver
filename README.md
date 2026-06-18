@@ -73,11 +73,6 @@ The driver loads, forces Config 1, registers an Ethernet interface, and is fully
   path that support MTU 16334 end-to-end
 - VLAN offload — hardware supports 802.1Q insertion/stripping; RX descriptor carries tag
 - Wake-on-LAN — magic packet path exists in hardware; not wired up
-- Explicit little-endian packing/unpacking audit — several multi-byte USB
-  register payloads and RX/TX descriptors still rely on the current DriverKit
-  host being little-endian rather than using byte-explicit helpers. This is
-  not a known behavior bug on Apple Silicon, but the code should be made
-  explicit.
 - PHY access polymorphism — the AQC111U has two PHY control interfaces selected by firmware major version (`>= 0x80` → `FWPhyAccess` via bRequest=0x61; `< 0x80` → `DirectPhyAccess` via bRequest=0x31/0x32). The driver reads and logs the firmware version at start but unconditionally uses the `FWPhyAccess` path. This is correct for the DUT (firmware `major=0x82`). Support for older `DirectPhyAccess` devices is not implemented.
 - TX ring depth — the TX path submits one frame at a time and waits for USB completion before submitting the next (`txBusy`/`txInFlight` single-slot gate). RX uses 10 outstanding buffers in flight; TX has no equivalent pipelining, which caps achievable throughput well short of the link's 5 Gbps ceiling under sustained load.
 
