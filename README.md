@@ -87,10 +87,11 @@ This dext requires two entitlements that are not available by default:
 |-------------|---------|
 | `com.apple.developer.driverkit.transport.usb` | USB DriverKit access |
 | `com.apple.developer.driverkit.family.networking` | Skywalk / `IOUserNetworkEthernet` |
+| `com.apple.developer.driverkit.allow-any-userclient-access` | Allows the diagnostic log-level tool to open the NIC `IOUserClient` |
 
 Both are available for **development** through the Apple Developer portal (request via the Additional Capabilities form). Distribution entitlements require a separate request to Apple and are granted case-by-case. The author holds distribution-level entitlements for both.
 
-The provisioning profile must include all three dext entitlements (`driverkit`, `transport.usb`, `family.networking`). Build with `CODE_SIGN_STYLE=Manual` pointing at that profile; Xcode's built-in codesign is sufficient — no post-build re-sign script is needed.
+The provisioning profile must include all dext entitlements (`driverkit`, `transport.usb`, `family.networking`, and `allow-any-userclient-access`). Build with `CODE_SIGN_STYLE=Manual` pointing at that profile; Xcode's built-in codesign is sufficient — no post-build re-sign script is needed.
 
 **SIP does not need to be disabled.** The driver builds and loads under normal SIP-on operation. Disabling SIP (`csrutil disable` / `amfi_get_out_of_my_way=1`) is a last resort for development iteration when provisioning is unavailable, but it is not required and should not be the normal workflow.
 

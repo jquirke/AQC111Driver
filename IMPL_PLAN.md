@@ -143,7 +143,9 @@ The x86 kext selects the path at `start()` time based on the raw major byte. The
 
 ### Bug fix plan — RX stall recovery gaps (confirmed root cause, 2026-06-18, awaiting more occurrences before implementing)
 
-**Symptom** (see README "Current bugs" #2): RX silently stops delivering frames mid-session; TX keeps working; recovery requires unplugging/re-enumerating the device. Recurred 3 times in one day (2026-06-18). Logs of all three occurrences saved at `notes/rx_stall_occurrence_{1,2,3}.log` for pattern comparison as more examples are collected.
+**Symptom** (see README "Current bugs" #2): RX silently stops delivering frames mid-session; TX keeps working; recovery requires unplugging/re-enumerating the device. Recurred 4 times in one day (2026-06-18). Logs saved at `notes/rx_stall_occurrence_{1,2,3}.log` and `notes/rx_stall_occurrence_4_power.log`.
+
+**Likely trigger identified, occurrence 4:** preceded by `DK: IOUserServer(...)::systemPower(0x11) effective 0 current 1` — a system sleep/power-state transition. `SetInterfaceEnable(0)` fires, `hwOnLinkDown`'s first register write returns `kIOReturnNotResponding` as the device powers down, teardown finishes, then 44s of total silence (machine asleep). On wake, `hwEnable` resumes and hits one more `NotResponding` (unchecked, ignored), RX/ITR rearm and recover cleanly — but TX hits exactly the already-diagnosed gap below and **stays stalled for 7+ seconds across multiple retries** in this capture, never self-recovering. This reframes the trigger from "random bus hiccup" to "sleep/wake (or USB power management) reliably exercises this code path" — worth testing explicitly via deliberate sleep/wake cycles rather than waiting for it to recur incidentally.
 
 **Root cause, confirmed via occurrence 3** (the first occurrence to capture actual error codes — occurrences 1 and 2 showed total silence with no error status at all, which is consistent with the same underlying issue manifesting slightly differently):
 
@@ -159,6 +161,20 @@ A `kIOReturnNotResponding` (`0xe00002ed`, `IOReturn.h:182`, "device not respondi
 3. General principle to apply everywhere a pipe's `AsyncIO()` is called for (re)submission: a `kUSBHostReturnPipeStalled` return value from the submission call is just as actionable as one arriving via a completion callback — both need `ClearStall()`. Today only the completion-callback path has this wired up, and only for RX/ITR, not TX.
 
 **Why wait:** Only occurrence 3 has produced a concrete, decoded error trail; occurrences 1 and 2 showed no error status at all before the freeze, so it's not yet certain the same fix covers all observed patterns. Collecting more occurrences (saved the same way, `notes/rx_stall_occurrence_N.log`) before implementing, to confirm the fix addresses the actual recurring pattern rather than just the one well-captured instance.
+
+---
+
+## Log Level Strategy (implemented, on branch `log-level-strategy`)
+
+DriverKit's `os/log.h` only exposes `OS_LOG_TYPE_DEFAULT` (no `os_log_debug`/`info`/subsystem API), so verbosity filtering is done in our own code: four level-gated macros (`LogE`/`LogI`/`LogD`/`LogV`) backed by a single `gLogLevel`, replacing the single `Log()` macro that previously fired everything — including per-frame hex dumps — at full volume. All call sites in `AQC111NIC.cpp`/`AQC111.cpp` reclassified: hex dumps → Verbose, per-completion bookkeeping → Debug, lifecycle → Info (default), failures → Error (always on).
+
+**Load-time config — confirmed working (rounds 1 & 2 tested):** `AQC111LogLevel` integer key in each `Info.plist` personality dict, read via `CopyProperties()` in `Start()`. Round 1 confirmed the absent-key fallback defaults correctly to Info. Round 2 confirmed setting the key to `3` (Verbose) and rebuilding actually raises the level. Shipped default is `1` (Info), set explicitly in both personalities.
+
+**Live config — implemented and confirmed working via `IOUserClient`.** The supported DriverKit IPC surface is `IOServiceOpen(service)` → that service's `NewUserClient()` → `IOUserClient::ExternalMethod()`. `AQC111NIC::NewUserClient()` creates a small `AQC111LogUserClient` from the NIC personality's `AQC111LogUserClientProperties` plist entry (`IOClass=IOUserUserClient`, `IOUserClass=AQC111LogUserClient`, `IOUserClientEntitlements=false`). `tools/set-log-level.swift` matches `IOClass=IOUserNetworkEthernet` plus `IOPropertyMatch={ IOUserClass=AQC111NIC }`, opens the NIC service, and calls selector `0` via `IOConnectCallScalarMethod()` with one scalar (`0=Error`, `1=Info`, `2=Debug`, `3=Verbose`). The user client validates the scalar and updates the NIC-local `gLogLevel`; confirmed by kernel logs showing debug/verbose TX logs stop after setting level `1`.
+
+Important finding: opening the plain `AQC111` USB-device personality creates a user client in the wrong control domain for this purpose. It logs that `AQC111SetNICLogLevel()` ran, but the active NIC TX/RX path can still read a separate `gLogLevel` value. Do not rely on C++ globals being shared across DriverKit personalities. The live-control endpoint must be opened on `AQC111NIC`, where the hot-path logs actually run.
+
+The first attempted live path, `IORegistryEntrySetCFProperties()` against the `AQC111NIC` service, consistently returned `0xe00002c7` (`kIOReturnUnsupported`) before reaching the override. The suspected `UserSetProperties(OSContainer*) LOCAL` alternate is present in generated SDK headers but gated behind `PRIVATE_WIFI_ONLY` in `IOService.iig`, so it is not a usable public DriverKit override. Keep live diagnostics on `IOUserClient`.
 
 ---
 

@@ -1,0 +1,34 @@
+//
+//  AQC111LogUserClient.iig
+//  AQC111 — diagnostic user client for live log-level control
+//
+
+#ifndef AQC111LogUserClient_h
+#define AQC111LogUserClient_h
+
+#include <DriverKit/IOUserClient.iig>
+
+class AQC111LogUserClient: public IOUserClient
+{
+public:
+    virtual bool
+    init() override;
+
+    virtual void
+    free() override;
+
+    virtual kern_return_t
+    Start(IOService * provider) override;
+
+    virtual kern_return_t
+    Stop(IOService * provider) override;
+
+    virtual kern_return_t
+    ExternalMethod(uint64_t selector,
+                   IOUserClientMethodArguments * arguments,
+                   const IOUserClientMethodDispatch * dispatch,
+                   OSObject * target,
+                   void * reference) override LOCALONLY;
+};
+
+#endif /* AQC111LogUserClient_h */

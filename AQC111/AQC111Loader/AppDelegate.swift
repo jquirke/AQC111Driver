@@ -1,4 +1,5 @@
 import Cocoa
+import IOKit
 import SystemExtensions
 import OSLog
 
@@ -9,10 +10,51 @@ private let dextID = "au.com.jquirke.AQC111Driver"
 final class AppDelegate: NSObject, NSApplicationDelegate, OSSystemExtensionRequestDelegate {
 
     static func main() {
+        if CommandLine.arguments.count == 3,
+           CommandLine.arguments[1] == "--set-log-level" {
+            exit(setLogLevelCommand(CommandLine.arguments[2]))
+        }
+
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
         app.run()
+    }
+
+    private static func setLogLevelCommand(_ argument: String) -> Int32 {
+        guard let level = UInt32(argument), level <= 3 else {
+            fputs("Usage: AQC111Loader --set-log-level <0-3>  (0=Error 1=Info 2=Debug 3=Verbose)\n", stderr)
+            return 1
+        }
+
+        let matching = IOServiceMatching("IOUserNetworkEthernet") as NSMutableDictionary
+        matching["IOPropertyMatch"] = ["IOUserClass": "AQC111NIC"]
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, matching)
+        guard service != 0 else {
+            fputs("AQC111NIC service not found; is the dext loaded and the network interface attached?\n", stderr)
+            return 1
+        }
+        defer { IOObjectRelease(service) }
+
+        var connection: io_connect_t = 0
+        var result = IOServiceOpen(service, mach_task_self_, 0, &connection)
+        guard result == KERN_SUCCESS else {
+            fputs(String(format: "IOServiceOpen failed: 0x%x\n", result), stderr)
+            return 1
+        }
+        defer { IOServiceClose(connection) }
+
+        var input: [UInt64] = [UInt64(level)]
+        result = input.withUnsafeBufferPointer { buffer in
+            IOConnectCallScalarMethod(connection, 0, buffer.baseAddress, 1, nil, nil)
+        }
+        guard result == KERN_SUCCESS else {
+            fputs(String(format: "IOConnectCallScalarMethod(set log level) failed: 0x%x\n", result), stderr)
+            return 1
+        }
+
+        print("Set AQC111LogLevel=\(level).")
+        return 0
     }
 
     var window: NSWindow!

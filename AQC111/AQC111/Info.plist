@@ -15,11 +15,6 @@
 	</dict>
 	<key>IOKitPersonalities</key>
 	<dict>
-		<!-- Personality A: USB config selector.
-		     Matches the device node, forces Config 1 (vendor-specific, 5Gbps),
-		     and holds the device session open to prevent reversion to Config 2 (CDC).
-		     SetConfiguration(1, true) causes the USB stack to publish
-		     IOUSBHostInterface nubs for Config 1, which Personality B matches. -->
 		<key>AQC111-Device</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
@@ -40,11 +35,9 @@
 			<integer>57434</integer>
 			<key>idVendor</key>
 			<integer>8436</integer>
+			<key>AQC111LogLevel</key>
+			<integer>1</integer>
 		</dict>
-		<!-- Personality B: USB Ethernet NIC.
-		     Matches the Config 1 vendor-specific interface (class 255) published
-		     by Personality A. Provider is IOUSBHostInterface, which is required
-		     for IOUSBHostPipe AsyncIO completions to be delivered to this dext. -->
 		<key>AQC111-NIC</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
@@ -71,6 +64,17 @@
 			<integer>57434</integer>
 			<key>idVendor</key>
 			<integer>8436</integer>
+			<key>AQC111LogLevel</key>
+			<integer>1</integer>
+			<key>AQC111LogUserClientProperties</key>
+			<dict>
+				<key>IOClass</key>
+				<string>IOUserUserClient</string>
+				<key>IOUserClientEntitlements</key>
+				<false/>
+				<key>IOUserClass</key>
+				<string>AQC111LogUserClient</string>
+			</dict>
 		</dict>
 	</dict>
 </dict>

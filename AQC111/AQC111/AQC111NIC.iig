@@ -34,6 +34,9 @@ public:
     virtual kern_return_t
     Stop(IOService * provider) override;
 
+    virtual kern_return_t
+    NewUserClient(uint32_t type, IOUserClient ** userClient) override;
+
     // USB RX completion — called once per completed bulk IN transfer
     virtual void
     OnRxComplete(OSAction * action,
