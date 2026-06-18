@@ -61,9 +61,10 @@ The driver loads, forces Config 1, registers an Ethernet interface, and is fully
 - `ifconfig enX up` / `ifconfig enX down` — link comes up and down correctly
 - End-to-end RX: frames arrive in Wireshark and tcpdump
 - End-to-end TX: ARP resolves, `ping` succeeds
+- RX checksum offload — validated end-to-end against deterministic good/bad-checksum test traffic, including the IP/TCP error-interaction edge case; see `TESTING.md` and `IMPL_PLAN.md` M6a
 
 **What is not done yet:**
-- TX checksum offload — `SFR_TXCOE_CTL` not programmed; not advertised to stack (RX checksum offload is implemented — see M6a in `IMPL_PLAN.md`)
+- TX checksum offload — `SFR_TXCOE_CTL` not programmed; not advertised to stack
 - TSO — firmware-based TCP segmentation via TX descriptor MSS field
 - Jumbo frames — hardware supports up to ~16 KB; currently hardcoded to 1500 MTU
 - VLAN offload — hardware supports 802.1Q insertion/stripping; RX descriptor carries tag
@@ -122,6 +123,10 @@ log stream --predicate 'process == "kernel" AND eventMessage contains "AQC111"' 
 ```
 
 DriverKit dext `os_log` output is attributed to the `kernel` process.
+
+**Log verbosity is runtime-controllable** (see `IMPL_PLAN.md` "Log Level Strategy"): defaults to Info via the `AQC111LogLevel` key in `Info.plist`, and can be raised/lowered live without reinstalling via `tools/set-log-level.swift <0-3>` (0=Error, 1=Info, 2=Debug, 3=Verbose — Debug/Verbose include per-packet and hex-dump logging, off by default).
+
+Test methodology and results for features that need more than "it compiled" as evidence — e.g. the RX checksum offload validation — are tracked in `TESTING.md`.
 
 ---
 
