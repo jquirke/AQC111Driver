@@ -62,9 +62,9 @@ The driver loads, forces Config 1, registers an Ethernet interface, and is fully
 - End-to-end RX: frames arrive in Wireshark and tcpdump
 - End-to-end TX: ARP resolves, `ping` succeeds
 - RX checksum offload — validated end-to-end against deterministic good/bad-checksum test traffic, including the IP/TCP error-interaction edge case; see `TESTING.md` and `IMPL_PLAN.md` M6a
+- TX checksum offload — validated end-to-end including a genuine hardware-reset negative control; see `TESTING.md` and `IMPL_PLAN.md` M6b
 
 **What is not done yet:**
-- TX checksum offload — `SFR_TXCOE_CTL` not programmed; not advertised to stack
 - TSO — firmware-based TCP segmentation via TX descriptor MSS field
 - Jumbo frames — hardware supports up to ~16 KB; currently hardcoded to 1500 MTU
 - VLAN offload — hardware supports 802.1Q insertion/stripping; RX descriptor carries tag

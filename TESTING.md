@@ -7,6 +7,90 @@ it proved. Organized by feature, newest entries at the top of each section.
 
 ---
 
+## TX Checksum Offload
+
+Validated 2026-06-18 against the same remote Linux test host used for M6a,
+using `ping -b en9` (binds the socket directly to the interface, bypassing
+a stale ARP-cloned route that was sending test traffic out `en0` instead —
+see "Reusable Methodology Notes").
+
+### Methodology
+
+Unlike RX, there's no per-packet TX descriptor checksum bit to verify
+(confirmed against both Linux `aqc111_tx_fixup()` and the RE'd x86 TX
+descriptor layout — neither has one). TX checksum offload is a pure
+link-level register toggle (`SFR_TXCOE_CTL`), so the test is: does the OS
+stop computing the checksum itself once we declare the capability, and
+does hardware actually fill in a correct value afterward?
+
+- Driver-side: the `txDrainOne` debug dump (`LogV`, extended from 16 to 64
+  bytes this session specifically to reach the IP header checksum field)
+  shows exactly what we hand to the USB pipe, before the chip touches it.
+- `getTxChecksumInfo()` logged per packet (diagnostic only, not required
+  for correctness — see `IMPL_PLAN.md`).
+- **Local capture (`tcpdump`/Wireshark on `en9`, this machine) is not
+  useful for proving hardware did the work** — it taps at the same point
+  as our own driver-side dump (before the chip), confirmed by it showing
+  the identical `0x0000` placeholder. Initial confusion mid-session about
+  "why does Wireshark show a populated checksum outgoing" turned out to be
+  inspecting the wrong packet (an RX reply, not the TX request) — see
+  methodology notes below on correlating by IP ID before drawing
+  conclusions from a capture.
+- Remote-side capture/behavior is what actually proves hardware involvement,
+  same principle as M6a's negative control: a standard Linux host's
+  `ip_rcv()` validates the IP header checksum before any ICMP processing,
+  so getting a reply is reasonably strong evidence of a valid checksum —
+  **with one important caveat found this session, see Test 2.**
+
+### Test 1 — TX checksum offload enabled
+
+`getTxChecksumInfo` reports `flags=0x4` (`kIOUserNetworkPacketTxCsumIPHdr`
+only — correct, since this traffic is ICMP and we only declared TX
+hwassist for IP header + TCP + UDP, not ICMP, matching the x86 kext's
+"skip ICMP, not worth it" precedent from M6a). Driver's outgoing buffer
+shows IP header checksum `00 00` (OS recognized the declared capability
+and stopped computing it itself — direct proof of "stack consumption",
+the one thing M6a couldn't get without `dtrace`). Remote host received the
+ping and replied normally.
+
+### Test 2 — negative control, attempt 1 (invalid — sticky hardware register)
+
+Temporarily commented out the `SFR_TXCOE_CTL` write in `hwOnLinkUp` and
+rebuilt, expecting the checksum to stay at the invalid `0x0000` placeholder
+and the remote to silently drop it (mirroring M6a's bad-checksum RX test).
+Instead: checksum stayed `0x0000` as expected, **but the remote still
+replied** — seemingly contradicting the "Linux validates checksums" logic
+relied on for the RX negative control.
+
+**Root cause: the SFR register is sticky.** `hwDisable()` never writes
+`SFR_RXCOE_CTL`/`SFR_TXCOE_CTL` back to `0` — confirmed by reading the
+code, no such write exists anywhere in the file. The AQC111U chip itself
+never loses power across a dext Stop/Start cycle (only an actual USB
+unplug/re-enumeration or an explicit write changes its registers), so the
+hardware was still running with `0x67` left over from an earlier successful
+test run, regardless of what the *current* build's code did. Skipping the
+*enable* write doesn't disable anything if it was already enabled from
+before — this is a real, generally-useful gotcha for testing any SFR
+register on this hardware, not specific to checksum offload.
+
+### Test 2 — negative control, attempt 2 (valid)
+
+Physically unplugged and replugged the USB device — a genuine hardware
+reset, not just a driver restart — with the `SFR_TXCOE_CTL` write still
+disabled in code. Result: checksum stayed `0x0000`, and this time **the
+remote correctly ignored it** (no reply). Re-enabled the write (reverted
+the temporary change) to close the loop.
+
+### Conclusion
+
+Confirmed both directions with a real positive/negative pair, same rigor
+as M6a: hardware enabled → OS leaves checksum blank, chip fills in a
+correct value, remote responds. Hardware genuinely disabled (verified via
+physical reset, not just a skipped write) → checksum stays invalid, remote
+silently drops it. TX checksum offload is considered validated.
+
+---
+
 ## M6a — RX Checksum Offload
 
 Validated 2026-06-18 against a remote test host capable of sending
@@ -109,4 +193,33 @@ detection → driver flag computation → `IOUserNetworkPacket` persistence
   `tcpdump` running concurrently, matched by sub-second timestamp, is
   what closes the gap between "the wire shows X" and "the driver did Y for
   that exact packet" — without that correlation, two separate true
-  observations don't actually prove they're about the same packet.
+  observations don't actually prove they're about the same packet. Same
+  principle applies to correlating by IP ID / sequence number when
+  comparing a local capture against a driver log line — confirm it's
+  literally the same packet before concluding two observations disagree.
+- **A local capture on the same machine that's transmitting is not
+  reliable for proving hardware did something to a packet on the way out.**
+  It taps at the same point the driver itself sees the buffer, before any
+  hardware fixup — confirmed empirically during TX checksum offload
+  testing. Capture on a third party (the remote end, a span port, or a
+  separate machine) when the question is "what actually went out on the
+  wire," not on the transmitting host itself.
+- **SFR hardware registers on this chip are sticky across dext
+  Stop/Start cycles.** The chip never loses power just because the driver
+  process restarts, and nothing in this driver's `hwDisable()` resets
+  `SFR_RXCOE_CTL`/`SFR_TXCOE_CTL` (or, likely, most other SFR registers) to
+  a known state. If you're testing "what happens when register X is NOT
+  set," skipping the write in code is not sufficient if it was set by an
+  earlier test run — a register can stay enabled from a previous session
+  even though the current build's code never wrote it. A genuine test
+  requires a real hardware reset (physical USB unplug/replug), not just a
+  driver restart. Caught this exact false negative during TX checksum
+  offload negative-control testing.
+- **A "standard" remote host's behavior is still not automatically
+  trustworthy** — it can have its own offload/virtualization quirks (e.g.
+  a VM's virtio-net path may skip real checksum verification as a
+  performance optimization between hypervisor and guest). A positive
+  result (the remote responded) is supporting evidence, not proof, unless
+  corroborated by an independent check like Wireshark's own checksum
+  validation on a capture taken at/near the remote, or by a working
+  negative control proving the remote really does reject what it should.

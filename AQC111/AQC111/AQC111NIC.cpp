@@ -104,6 +104,26 @@ applyLogLevelFromDictionary(OSDictionary *dict)
 #define SFR_RXCOE_TCPV6     0x20
 #define SFR_RXCOE_UDPV6     0x40
 
+// SFR_TXCOE_CTL: same per-protocol bit layout as SFR_RXCOE_CTL, TX direction
+// (see IMPL_PLAN.md TX checksum offload). Pure link-level toggle — unlike RX,
+// there is no per-packet TX descriptor checksum bit (confirmed against both
+// Linux aqc111_tx_fixup and the RE'd x86 TX descriptor layout); once enabled
+// the hardware auto-detects and fixes up every outgoing IP/TCP/UDP frame.
+#define SFR_TXCOE_CTL       0x0035
+#define SFR_TXCOE_IP        0x01
+#define SFR_TXCOE_TCP       0x02
+#define SFR_TXCOE_UDP       0x04
+#define SFR_TXCOE_TCPV6     0x20
+#define SFR_TXCOE_UDPV6     0x40
+
+// Full hwAssist capability mask this driver declares via getFeatureFlags()
+// and self-initializes hwAssistMask to. Shared by both so they can't drift.
+#define AQC111_HWASSIST_MASK ( \
+    kIOUserNetworkHWAssistRxChecksum | \
+    kIOUserNetworkHWAssistTxChecksumIPHdr | \
+    kIOUserNetworkHWAssistTxChecksumTCP | \
+    kIOUserNetworkHWAssistTxChecksumUDP)
+
 // RX Packet Descriptor checksum sub-fields (lower 16 bits of pd; see
 // IMPL_PLAN.md M6a — cross-checked against Linux aqc111.h and x86 kext RE).
 #define AQ_RX_PD_L4_ERR         0x01
@@ -228,7 +248,7 @@ AQC111NIC::init()
     // uses that to change state later (e.g. `ifconfig -rxcsum`). Confirmed
     // empirically: SetHardwareAssists never fires during Start(), only
     // GetHardwareAssists. See IMPL_PLAN.md M6a.
-    ivars->hwAssistMask = kIOUserNetworkHWAssistRxChecksum;
+    ivars->hwAssistMask = AQC111_HWASSIST_MASK;
     return true;
 }
 
@@ -865,6 +885,13 @@ hwOnLinkUp(IOUSBHostInterface *iface, uint8_t speedCode)
     r = aqWrite(iface, SFR_RXCOE_CTL, &b, 1);
     LogI("hwOnLinkUp: RXCOE_CTL=0x%02x -> 0x%x", b, r);
 
+    // TX checksum offload: pure link-level toggle, no per-packet descriptor
+    // bit (see IMPL_PLAN.md TX checksum offload). Once enabled, hardware
+    // auto-detects and fixes up every outgoing IP/TCP/UDP frame's checksum.
+    b = SFR_TXCOE_IP | SFR_TXCOE_TCP | SFR_TXCOE_UDP | SFR_TXCOE_TCPV6 | SFR_TXCOE_UDPV6;
+    r = aqWrite(iface, SFR_TXCOE_CTL, &b, 1);
+    LogI("hwOnLinkUp: TXCOE_CTL=0x%02x -> 0x%x", b, r);
+
     if (speedCode == 0x13) {
         coalesce[1] = 0xA0;
         coalesce[2] = 0x00;
@@ -1043,6 +1070,16 @@ hwDisable(IOUSBHostInterface *iface)
     uint16_t w;
     uint8_t  b;
 
+    // TODO: SFR_RXCOE_CTL/SFR_TXCOE_CTL are never cleared here (or anywhere
+    // in this file). They're sticky across dext Stop/Start cycles since the
+    // chip itself doesn't lose power — confirmed empirically during TX
+    // checksum offload negative-control testing (see TESTING.md). Linux's
+    // aqc111_stop()/link_reset(down) also never clears them, so this isn't
+    // unique to us, but it's still "leave hardware in an undefined state on
+    // teardown" — investigate whether hwDisable() should explicitly write
+    // 0x00 to both registers, matching the rest of this function's pattern
+    // of actively undoing what hwEnable/hwOnLinkUp set up, rather than
+    // relying on the next hwOnLinkUp to overwrite it correctly anyway.
     w = 0x0000;
     r = aqWrite(iface, 0x000B, &w, 2);
     LogI("hwDisable: RX_CTL=0x0000 -> 0x%x", r);
@@ -1107,6 +1144,20 @@ txDrainOne(AQC111NIC_IVars *ivars)
 
     LogD("txDrainOne: pkt=%p offset=%u len=%u", pkt, (unsigned)dataOffset, dataLen);
 
+    // Diagnostic only — the hardware auto-detects IP/TCP/UDP headers and
+    // fixes up the checksum itself once SFR_TXCOE_CTL is enabled, so we
+    // don't need start/stuff to do the work. Logging what the OS actually
+    // requested per-packet, mirroring the RX checksum readback pattern, for
+    // verification (see IMPL_PLAN.md TX checksum offload / TESTING.md).
+    {
+        IOUserNetworkPacketTxChecksumFlags txCsumFlags = 0;
+        uint16_t txCsumStart = 0;
+        uint16_t txCsumStuff = 0;
+        pkt->getTxChecksumInfo(&txCsumFlags, &txCsumStart, &txCsumStuff);
+        LogD("txDrainOne: getTxChecksumInfo flags=0x%x start=%u stuff=%u",
+            txCsumFlags, txCsumStart, txCsumStuff);
+    }
+
     if (dataLen == 0 || dataLen > 1514) {
         LogE("txDrainOne: bad len=%u, dropping", dataLen);
         pkt->setCompletionStatus(kIOReturnError);
@@ -1132,6 +1183,23 @@ txDrainOne(AQC111NIC_IVars *ivars)
         (unsigned long long)txDesc, dataLen, txLen,
         txp[0],  txp[1],  txp[2],  txp[3],  txp[4],  txp[5],  txp[6],  txp[7],
         txp[8],  txp[9],  txp[10], txp[11], txp[12], txp[13], txp[14], txp[15]);
+    // Deeper dump for TX checksum offload verification — covers Ethernet
+    // header (14) + IP header (20, +options) + start of TCP/UDP header
+    // including the checksum field, so the before/after-offload comparison
+    // (software-computed vs. left-zeroed-for-hardware) is actually visible.
+    // See IMPL_PLAN.md TX checksum offload / TESTING.md.
+    if (txLen >= 64) {
+        LogV("txDrainOne: bytes16-63: "
+            "%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  "
+            "%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  "
+            "%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x",
+            txp[16], txp[17], txp[18], txp[19], txp[20], txp[21], txp[22], txp[23],
+            txp[24], txp[25], txp[26], txp[27], txp[28], txp[29], txp[30], txp[31],
+            txp[32], txp[33], txp[34], txp[35], txp[36], txp[37], txp[38], txp[39],
+            txp[40], txp[41], txp[42], txp[43], txp[44], txp[45], txp[46], txp[47],
+            txp[48], txp[49], txp[50], txp[51], txp[52], txp[53], txp[54], txp[55],
+            txp[56], txp[57], txp[58], txp[59], txp[60], txp[61], txp[62], txp[63]);
+    }
 
     ivars->txInFlight = pkt;
     ivars->txBusy     = true;
@@ -1463,8 +1531,8 @@ IMPL(AQC111NIC, GetHardwareAssists)
 uint32_t
 AQC111NIC::getFeatureFlags()
 {
-    LogI("getFeatureFlags -> 0x%x", kIOUserNetworkHWAssistRxChecksum);
-    return kIOUserNetworkHWAssistRxChecksum;
+    LogI("getFeatureFlags -> 0x%x", AQC111_HWASSIST_MASK);
+    return AQC111_HWASSIST_MASK;
 }
 
 // --- Dispatched overrides ---
