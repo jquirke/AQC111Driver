@@ -7,6 +7,179 @@ it proved. Organized by feature, newest entries at the top of each section.
 
 ---
 
+## Jumbo Frames / MTU Control
+
+Validated 2026-06-19 on the TRENDnet TUC-ET5G as `en9` for MTU control,
+standard-MTU stability, max-configured-MTU stability, and jumbo ICMP traffic
+up to the peer's supported limit. Full 16 KB-class jumbo traffic is not yet
+tested because the available peer tops out below that.
+
+### Methodology
+
+- Built and installed a driver that reports max MTU `16334` through both the
+  deprecated `GetMaxTransferUnit` path and the modern `getMaxTransferUnit`
+  path.
+- Raised driver log verbosity to level `3` so each MTU setter invocation and
+  hardware write is visible.
+- Used macOS `networksetup` to query the OS-visible valid MTU range for the
+  Network Services hardware port.
+- Used `ifconfig en9 mtu <value>` to exercise MTU transitions.
+- Watched `log stream` for `applyMtuToHardware` output:
+  - medium-mode jumbo bit state
+  - RX bulk-in coalescing profile bytes
+  - pause-watermark low/high bytes
+- Confirmed the BSD-visible interface MTU using `ifconfig en9 | grep mtu`.
+
+### Test 1 — OS-visible MTU range
+
+Before jumbo support, macOS reported:
+
+```text
+networksetup -listvalidMTUrange 'TRENDnet USB 5G Adapter'
+Valid MTU Range: 1280-1500
+```
+
+After implementing the MTU accessors, macOS reports:
+
+```text
+networksetup -listvalidMTUrange 'TRENDnet USB 5G Adapter'
+Valid MTU Range: 1280-16334
+```
+
+This confirms the OS now sees the driver's advertised jumbo-capable maximum
+transfer unit.
+
+### Test 2 — MTU 9000
+
+Command:
+
+```sh
+sudo ifconfig en9 mtu 9000
+ifconfig en9 | grep mtu
+```
+
+Observed driver log:
+
+```text
+requested=9000 effective=9000
+applyMtuToHardware: mtu=9000 MEDIUM_STATUS_MODE jumbo=1 val=0x0172 -> 0x0
+applyMtuToHardware: mtu=9000 coalesce=07 00 01 1e ff -> 0x0
+applyMtuToHardware: mtu=9000 pause_watermark=20 10 -> 0x0
+```
+
+Observed interface state:
+
+```text
+en9: ... mtu 9000
+```
+
+Expected and observed: jumbo enabled, standard high-speed coalescing profile
+retained because `9000 <= 12500`, and pause watermark set to `0x1020`
+(`20 10` on the wire).
+
+### Test 3 — MTU 16334
+
+Command:
+
+```sh
+sudo ifconfig en9 mtu 16334
+```
+
+Observed driver log:
+
+```text
+getMaxTransferUnit -> 16334
+requested=16334 effective=16334
+applyMtuToHardware: mtu=16334 MEDIUM_STATUS_MODE jumbo=1 val=0x0172 -> 0x0
+applyMtuToHardware: mtu=16334 coalesce=07 00 01 18 ff -> 0x0
+applyMtuToHardware: mtu=16334 pause_watermark=20 1a -> 0x0
+```
+
+Expected and observed: max MTU accepted, jumbo enabled, jumbo RX bulk-in
+coalescing profile selected, and pause watermark set to `0x1a20`
+(`20 1a` on the wire).
+
+### Test 4 — Return to MTU 1500
+
+Command:
+
+```sh
+sudo ifconfig en9 mtu 1500
+```
+
+Observed driver log:
+
+```text
+getMaxTransferUnit -> 16334
+requested=1500 effective=1500
+applyMtuToHardware: mtu=1500 MEDIUM_STATUS_MODE jumbo=0 val=0x0132 -> 0x0
+applyMtuToHardware: mtu=1500 coalesce=07 00 01 1e ff -> 0x0
+applyMtuToHardware: mtu=1500 pause_watermark=10 08 -> 0x0
+```
+
+Expected and observed: jumbo bit cleared, high-speed standard-MTU coalescing
+profile restored, and pause watermark set to `0x0810` (`10 08` on the wire).
+
+### Test 5 — jumbo ICMP traffic to peer limit
+
+The peer supports jumbo frames up to roughly the 9 KB class, not the AQC111U
+driver's full `16334` MTU ceiling. With both ends configured for the supported
+path MTU, `tcpdump` on `en9` captured repeated jumbo ICMP request/reply pairs:
+
+```text
+sudo tcpdump -ni en9 icmp
+00:56:03.153291 IP 169.254.50.50 > 169.254.124.250: ICMP echo request, id 18602, seq 53, length 9174
+00:56:03.153501 IP 169.254.124.250 > 169.254.50.50: ICMP echo reply, id 18602, seq 53, length 9174
+00:56:04.154878 IP 169.254.50.50 > 169.254.124.250: ICMP echo request, id 18602, seq 54, length 9174
+00:56:04.155071 IP 169.254.124.250 > 169.254.50.50: ICMP echo reply, id 18602, seq 54, length 9174
+00:56:05.157086 IP 169.254.50.50 > 169.254.124.250: ICMP echo request, id 18602, seq 55, length 9174
+00:56:05.157281 IP 169.254.124.250 > 169.254.50.50: ICMP echo reply, id 18602, seq 55, length 9174
+00:56:06.157845 IP 169.254.50.50 > 169.254.124.250: ICMP echo request, id 18602, seq 56, length 9174
+00:56:06.158123 IP 169.254.124.250 > 169.254.50.50: ICMP echo reply, id 18602, seq 56, length 9174
+00:56:07.158820 IP 169.254.50.50 > 169.254.124.250: ICMP echo request, id 18602, seq 57, length 9174
+00:56:07.159096 IP 169.254.124.250 > 169.254.50.50: ICMP echo reply, id 18602, seq 57, length 9174
+```
+
+`tcpdump`'s displayed IPv4 length of `9174`, plus the 14-byte Ethernet
+header, means the Ethernet frames are roughly `9188` bytes without FCS. That
+is well beyond standard Ethernet's `1514` byte frame length, and the paired
+request/reply traffic proves both jumbo RX and jumbo TX work at this size.
+
+### Test 6 — streaming stability at MTU 1500 and MTU 16334
+
+Regression soak with normal 4K video streaming after touching shared link-up,
+RX buffer-pool sizing, TX staging-buffer sizing, and MTU hardware programming.
+
+Results:
+
+- MTU 1500: 4K streaming stable; no observed driver instability.
+- MTU 16334: 4K streaming stable; no observed driver instability.
+
+This validates ordinary traffic stability at both standard MTU and the
+driver's maximum configured MTU. It does not by itself prove full-size 16 KB
+jumbo frames on the wire because the streaming workload does not necessarily
+emit maximum-sized packets.
+
+### Pending — full 16 KB-class jumbo traffic
+
+Still to run with a peer and full L2 path configured for MTU `16334`:
+
+- `ping`/`ping6` with don't-fragment semantics and payload sized near the
+  driver's maximum MTU.
+- `iperf3` or equivalent sustained traffic.
+- `tcpdump`/Wireshark confirmation from the peer or a third-party capture
+  point that full-size frames move intact.
+- Interface error-counter check before/after.
+
+### Conclusion
+
+MTU reporting and hardware programming are validated for `1500`, `9000`, and
+`16334`. Jumbo traffic is validated up to the peer-supported 9 KB class.
+Ordinary 4K streaming is stable at both MTU `1500` and configured MTU `16334`.
+Full 16 KB-class jumbo traffic remains untested.
+
+---
+
 ## TX Checksum Offload
 
 Validated 2026-06-18 against the same remote Linux test host used for M6a,

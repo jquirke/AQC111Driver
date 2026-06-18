@@ -507,7 +507,9 @@ if (hal[0x5c] < 0x5eb) {
 // write command: 0x0002000200220140 (bRequest=AQ_ACCESS_MAC OUT, wValue=0x0022, wLength=2)
 ```
 
-Then a tiered mapping of hal[0x5c] (MTU) to a buffer size value (written to unknown register, TBD):
+Then a tiered mapping of hal[0x5c] (MTU) to the pause-watermark value written
+as a 16-bit little-endian register pair at `SFR_PAUSE_WATERLVL_LOW` (`0x0054`)
+and `SFR_PAUSE_WATERLVL_HIGH` (`0x0055`), matching the Linux `aqc111` driver:
 
 ```c
 uint16_t buf_size;
@@ -516,7 +518,8 @@ else if (hal[0x5c] < 0x252b) buf_size = 0x1020;  // MTU < 9515  (jumbo tier 1)
 else if (hal[0x5c] < 0x30e3) buf_size = 0x1420;  // MTU < 12515 (jumbo tier 2)
 else                          buf_size = 0x1a20;  // MTU ≥ 12515 (jumbo tier 3)
 // standard MTU 1514 → 0x0810
-// written to register 0x0054: raw 0x0002000200540140
+// written to SFR_PAUSE_WATERLVL_LOW/HIGH starting at 0x0054:
+// raw 0x0002000200540140
 ```
 
 Register 0x0022 known bits:
@@ -1745,4 +1748,3 @@ setChecksumResult(mbuf, kChecksumFamilyInet, checked, valid, 0, 0);
 `checked` is the set of checksums the hardware examined; `valid` is the subset that passed. The IOKit stack uses this to skip software re-verification of valid checksums.
 
 IPv6 IP-header checksum (`kChecksumIP`) is never added to `checked` for IPv6 frames — correct, since IPv6 has no header checksum.
-

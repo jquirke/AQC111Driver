@@ -107,6 +107,12 @@ public:
     GetMaxTransferUnit(uint32_t * mtu) override LOCAL;
 
     virtual kern_return_t
+    setMaxTransferUnit(uint32_t mtu) override LOCALONLY;
+
+    virtual uint32_t
+    getMaxTransferUnit() override LOCALONLY;
+
+    virtual kern_return_t
     SetHardwareAssists(uint32_t hardwareAssists) override LOCAL;
 
     virtual kern_return_t

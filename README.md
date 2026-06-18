@@ -63,12 +63,21 @@ The driver loads, forces Config 1, registers an Ethernet interface, and is fully
 - End-to-end TX: ARP resolves, `ping` succeeds
 - RX checksum offload — validated end-to-end against deterministic good/bad-checksum test traffic, including the IP/TCP error-interaction edge case; see `TESTING.md` and `IMPL_PLAN.md` M6a
 - TX checksum offload — validated end-to-end including a genuine hardware-reset negative control; see `TESTING.md` and `IMPL_PLAN.md` M6b
+- Jumbo MTU control — reports and applies MTU up to 16334; jumbo ICMP traffic
+  validated to the available peer's 9 KB-class limit, with 4K streaming stable
+  at both MTU 1500 and configured MTU 16334; see `TESTING.md`
 
 **What is not done yet:**
 - TSO — firmware-based TCP segmentation via TX descriptor MSS field
-- Jumbo frames — hardware supports up to ~16 KB; currently hardcoded to 1500 MTU
+- Full 16 KB-class jumbo traffic validation — requires a matching peer and L2
+  path that support MTU 16334 end-to-end
 - VLAN offload — hardware supports 802.1Q insertion/stripping; RX descriptor carries tag
 - Wake-on-LAN — magic packet path exists in hardware; not wired up
+- Explicit little-endian packing/unpacking audit — several multi-byte USB
+  register payloads and RX/TX descriptors still rely on the current DriverKit
+  host being little-endian rather than using byte-explicit helpers. This is
+  not a known behavior bug on Apple Silicon, but the code should be made
+  explicit.
 - PHY access polymorphism — the AQC111U has two PHY control interfaces selected by firmware major version (`>= 0x80` → `FWPhyAccess` via bRequest=0x61; `< 0x80` → `DirectPhyAccess` via bRequest=0x31/0x32). The driver reads and logs the firmware version at start but unconditionally uses the `FWPhyAccess` path. This is correct for the DUT (firmware `major=0x82`). Support for older `DirectPhyAccess` devices is not implemented.
 - TX ring depth — the TX path submits one frame at a time and waits for USB completion before submitting the next (`txBusy`/`txInFlight` single-slot gate). RX uses 10 outstanding buffers in flight; TX has no equivalent pipelining, which caps achievable throughput well short of the link's 5 Gbps ceiling under sustained load.
 

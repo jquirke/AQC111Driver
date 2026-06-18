@@ -93,6 +93,13 @@ applyLogLevelFromDictionary(OSDictionary *dict)
 #define RX_SLOTS        10
 #define RX_BUF_SIZE     0x10000   // 64KB per slot
 
+#define AQC111_MIN_MTU          1500
+#define AQC111_MAX_MTU          16334
+#define AQC111_ETH_HEADER_LEN   14
+#define AQC111_TX_DESC_LEN      8
+#define AQC111_MAX_FRAME_LEN    (AQC111_MAX_MTU + AQC111_ETH_HEADER_LEN)
+#define AQC111_TX_BUF_SIZE      (AQC111_TX_DESC_LEN + AQC111_MAX_FRAME_LEN)
+
 // SFR_RXCOE_CTL: per-protocol RX checksum offload enable (see IMPL_PLAN.md M6a).
 // TODO: most other SFR register addresses in this file are still raw hex
 // literals (e.g. 0x000B, 0x0022, 0x00B7) — refactor to named constants
@@ -115,6 +122,33 @@ applyLogLevelFromDictionary(OSDictionary *dict)
 #define SFR_TXCOE_UDP       0x04
 #define SFR_TXCOE_TCPV6     0x20
 #define SFR_TXCOE_UDPV6     0x40
+
+#define AQ_REG_MEDIUM_MODE              0x0022
+#define AQ_MEDIUM_XGMII_MODE            0x0001
+#define AQ_MEDIUM_FULL_DUPLEX           0x0002
+#define AQ_MEDIUM_RX_FLOW_CONTROL       0x0010
+#define AQ_MEDIUM_TX_FLOW_CONTROL       0x0020
+#define AQ_MEDIUM_JUMBO_FRAME_ENABLE    0x0040
+#define AQ_MEDIUM_RECEIVE_ENABLE        0x0100
+
+#define AQ_REG_RX_BULK_QUEUE_CTRL       0x002E
+#define AQ_REG_PAUSE_WATERMARK          0x0054
+
+#define AQ_PAUSE_WATERMARK_LOW_BYTE     0
+#define AQ_PAUSE_WATERMARK_HIGH_BYTE    1
+#define AQ_PAUSE_WATERMARK_LEN          2
+
+#define AQ_RX_BULK_QUEUE_CTRL_TIME      0x01
+#define AQ_RX_BULK_QUEUE_CTRL_IFG       0x02
+#define AQ_RX_BULK_QUEUE_CTRL_SIZE      0x04
+#define AQ_RX_BULK_QUEUE_CTRL_ALL       (AQ_RX_BULK_QUEUE_CTRL_TIME | AQ_RX_BULK_QUEUE_CTRL_IFG | AQ_RX_BULK_QUEUE_CTRL_SIZE)
+
+#define AQ_RX_BULK_COALESCE_CTRL        0
+#define AQ_RX_BULK_COALESCE_TIMER_LOW   1
+#define AQ_RX_BULK_COALESCE_TIMER_HIGH  2
+#define AQ_RX_BULK_COALESCE_SIZE        3
+#define AQ_RX_BULK_COALESCE_IFG         4
+#define AQ_RX_BULK_COALESCE_LEN         5
 
 // Full hwAssist capability mask this driver declares via getFeatureFlags()
 // and self-initializes hwAssistMask to. Shared by both so they can't drift.
@@ -142,8 +176,9 @@ static kern_return_t aqRead(IOUSBHostInterface *iface, uint16_t addr, void *data
 static kern_return_t aqVendorOut(IOUSBHostInterface *iface, uint8_t request, const void *data, uint16_t len);
 static void disarmAsyncIO(struct AQC111NIC_IVars *ivars);
 static void hwDisable(IOUSBHostInterface *iface);
-static void hwOnLinkUp(IOUSBHostInterface *iface, uint8_t speedCode);
+static void hwOnLinkUp(struct AQC111NIC_IVars *ivars, uint8_t speedCode);
 static void hwOnLinkDown(IOUSBHostInterface *iface);
+static kern_return_t applyMtuToHardware(struct AQC111NIC_IVars *ivars);
 static void ensureRxStarted(struct AQC111NIC_IVars *ivars, uint8_t speedCode);
 static void ensureRxStopped(struct AQC111NIC_IVars *ivars);
 static void dumpRxBytes(const uint8_t *buf, uint32_t actualByteCount, uint32_t slot, IOReturn status);
@@ -186,6 +221,18 @@ linkSpeedMbps(uint8_t speedCode)
         case 0x13: return 100;
         default:   return 0;
     }
+}
+
+static uint32_t
+clampMtu(uint32_t mtu)
+{
+    if (mtu < AQC111_MIN_MTU) {
+        return AQC111_MIN_MTU;
+    }
+    if (mtu > AQC111_MAX_MTU) {
+        return AQC111_MAX_MTU;
+    }
+    return mtu;
 }
 
 struct AQC111NIC_IVars {
@@ -234,7 +281,24 @@ struct AQC111NIC_IVars {
     // OS-controlled enable mask (kIOUserNetworkHWAssist* bits), set via
     // SetHardwareAssists. See IMPL_PLAN.md M6a.
     uint32_t                            hwAssistMask;
+    uint32_t                            currentMtu;
 };
+
+static kern_return_t
+setCurrentMtu(AQC111NIC_IVars *ivars, uint32_t requestedMtu, const char *caller)
+{
+    uint32_t mtu = clampMtu(requestedMtu);
+
+    LogI("%s: requested=%u effective=%u%s", caller, requestedMtu, mtu,
+        requestedMtu == mtu ? "" : " (clamped)");
+
+    ivars->currentMtu = mtu;
+
+    if (ivars->interface == nullptr) {
+        return kIOReturnSuccess;
+    }
+    return applyMtuToHardware(ivars);
+}
 
 bool
 AQC111NIC::init()
@@ -249,6 +313,7 @@ AQC111NIC::init()
     // empirically: SetHardwareAssists never fires during Start(), only
     // GetHardwareAssists. See IMPL_PLAN.md M6a.
     ivars->hwAssistMask = AQC111_HWASSIST_MASK;
+    ivars->currentMtu = AQC111_MIN_MTU;
     return true;
 }
 
@@ -403,7 +468,7 @@ IMPL(AQC111NIC, Start)
 
     poolOptions.packetCount = 64;
     poolOptions.bufferCount = 64;
-    poolOptions.bufferSize  = 2048;
+    poolOptions.bufferSize  = AQC111_MAX_FRAME_LEN;
     poolOptions.maxBuffersPerPacket = 1;
     poolOptions.memorySegmentSize = 0;
     poolOptions.poolFlags = PoolFlagMapToDext;
@@ -492,8 +557,8 @@ IMPL(AQC111NIC, Start)
     ret = CreateActionOnTxComplete(0, &ivars->txCompleteAction);
     if (ret != kIOReturnSuccess) { LogE("Start: CreateActionOnTxComplete failed: 0x%x", ret); goto fail; }
 
-    // Staging buffer: 8-byte descriptor + max Ethernet frame (1518 w/ VLAN)
-    ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionOut, 8 + 1518, 0, &ivars->txBuf);
+    // Staging buffer: 8-byte descriptor + max supported Ethernet frame.
+    ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionOut, AQC111_TX_BUF_SIZE, 0, &ivars->txBuf);
     if (ret != kIOReturnSuccess) { LogE("Start: txBuf alloc failed: 0x%x", ret); goto fail; }
 
     // Allocate RX buffers and completion actions. USB I/O is NOT posted here —
@@ -852,14 +917,104 @@ hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
     // link-up edge via hwOnLinkUp() once autoneg actually settles.
 }
 
+static kern_return_t
+applyMtuToHardware(AQC111NIC_IVars *ivars)
+{
+    if (ivars == nullptr || ivars->interface == nullptr) {
+        return kIOReturnNotReady;
+    }
+
+    IOUSBHostInterface *iface = ivars->interface;
+    kern_return_t firstError = kIOReturnSuccess;
+    kern_return_t r;
+    uint16_t medium = 0;
+    uint8_t pauseWatermark[AQ_PAUSE_WATERMARK_LEN];
+    uint8_t coalesce[AQ_RX_BULK_COALESCE_LEN] = {
+        AQ_RX_BULK_QUEUE_CTRL_ALL,
+        0x00,
+        0x01,
+        0x1E,
+        0xFF,
+    };
+    uint32_t mtu = ivars->currentMtu;
+
+    r = aqRead(iface, AQ_REG_MEDIUM_MODE, &medium, 2);
+    if (r == kIOReturnSuccess) {
+        if (mtu > AQC111_MIN_MTU) {
+            medium |= AQ_MEDIUM_JUMBO_FRAME_ENABLE;
+        } else {
+            medium &= (uint16_t)~AQ_MEDIUM_JUMBO_FRAME_ENABLE;
+        }
+        r = aqWrite(iface, AQ_REG_MEDIUM_MODE, &medium, 2);
+    }
+    if (r != kIOReturnSuccess && firstError == kIOReturnSuccess) {
+        firstError = r;
+    }
+    LogI("applyMtuToHardware: mtu=%u MEDIUM_STATUS_MODE jumbo=%d val=0x%04x -> 0x%x",
+        mtu, mtu > AQC111_MIN_MTU, medium, r);
+
+    if (ivars->lastSpeedCode == 0x13) {
+        coalesce[AQ_RX_BULK_COALESCE_TIMER_LOW] = 0xA0;
+        coalesce[AQ_RX_BULK_COALESCE_TIMER_HIGH] = 0x00;
+        coalesce[AQ_RX_BULK_COALESCE_SIZE] = 0x14;
+        coalesce[AQ_RX_BULK_COALESCE_IFG] = 0x00;
+    }
+    if (mtu > 12500) {
+        coalesce[AQ_RX_BULK_COALESCE_CTRL] = AQ_RX_BULK_QUEUE_CTRL_ALL;
+        coalesce[AQ_RX_BULK_COALESCE_TIMER_LOW] = 0x00;
+        coalesce[AQ_RX_BULK_COALESCE_TIMER_HIGH] = 0x01;
+        coalesce[AQ_RX_BULK_COALESCE_SIZE] = 0x18;
+        coalesce[AQ_RX_BULK_COALESCE_IFG] = 0xFF;
+    }
+
+    r = aqWrite(iface, AQ_REG_RX_BULK_QUEUE_CTRL, coalesce, sizeof(coalesce));
+    if (r != kIOReturnSuccess && firstError == kIOReturnSuccess) {
+        firstError = r;
+    }
+    LogI("applyMtuToHardware: mtu=%u coalesce=%02x %02x %02x %02x %02x -> 0x%x",
+        mtu,
+        coalesce[AQ_RX_BULK_COALESCE_CTRL],
+        coalesce[AQ_RX_BULK_COALESCE_TIMER_LOW],
+        coalesce[AQ_RX_BULK_COALESCE_TIMER_HIGH],
+        coalesce[AQ_RX_BULK_COALESCE_SIZE],
+        coalesce[AQ_RX_BULK_COALESCE_IFG],
+        r);
+
+    if (mtu <= 4500) {
+        pauseWatermark[AQ_PAUSE_WATERMARK_LOW_BYTE] = 0x10;
+        pauseWatermark[AQ_PAUSE_WATERMARK_HIGH_BYTE] = 0x08;
+    } else if (mtu <= 9500) {
+        pauseWatermark[AQ_PAUSE_WATERMARK_LOW_BYTE] = 0x20;
+        pauseWatermark[AQ_PAUSE_WATERMARK_HIGH_BYTE] = 0x10;
+    } else if (mtu <= 12500) {
+        pauseWatermark[AQ_PAUSE_WATERMARK_LOW_BYTE] = 0x20;
+        pauseWatermark[AQ_PAUSE_WATERMARK_HIGH_BYTE] = 0x14;
+    } else {
+        pauseWatermark[AQ_PAUSE_WATERMARK_LOW_BYTE] = 0x20;
+        pauseWatermark[AQ_PAUSE_WATERMARK_HIGH_BYTE] = 0x1A;
+    }
+
+    r = aqWrite(iface, AQ_REG_PAUSE_WATERMARK, pauseWatermark, sizeof(pauseWatermark));
+    if (r != kIOReturnSuccess && firstError == kIOReturnSuccess) {
+        firstError = r;
+    }
+    LogI("applyMtuToHardware: mtu=%u pause_watermark=%02x %02x -> 0x%x",
+        mtu,
+        pauseWatermark[AQ_PAUSE_WATERMARK_LOW_BYTE],
+        pauseWatermark[AQ_PAUSE_WATERMARK_HIGH_BYTE],
+        r);
+
+    return firstError;
+}
+
 static void
-hwOnLinkUp(IOUSBHostInterface *iface, uint8_t speedCode)
+hwOnLinkUp(AQC111NIC_IVars *ivars, uint8_t speedCode)
 {
     kern_return_t r;
+    IOUSBHostInterface *iface = ivars->interface;
     uint16_t rxCtl;
     uint16_t medium;
     uint8_t b;
-    uint8_t coalesce[5] = { 0x07, 0x00, 0x01, 0x1E, 0xFF };
     uint32_t speedMbps = linkSpeedMbps(speedCode);
 
     LogI("hwOnLinkUp: link speed %u Mbps (code=0x%02x)", speedMbps, speedCode);
@@ -892,24 +1047,23 @@ hwOnLinkUp(IOUSBHostInterface *iface, uint8_t speedCode)
     r = aqWrite(iface, SFR_TXCOE_CTL, &b, 1);
     LogI("hwOnLinkUp: TXCOE_CTL=0x%02x -> 0x%x", b, r);
 
-    if (speedCode == 0x13) {
-        coalesce[1] = 0xA0;
-        coalesce[2] = 0x00;
-        coalesce[3] = 0x14;
-        coalesce[4] = 0x00;
-    }
-    r = aqWrite(iface, 0x002E, coalesce, sizeof(coalesce));
-    LogI("hwOnLinkUp: coalescing(speed=%u Mbps code=0x%02x) -> 0x%x", speedMbps, speedCode, r);
+    ivars->lastSpeedCode = speedCode;
+    r = applyMtuToHardware(ivars);
+    LogI("hwOnLinkUp: applyMtuToHardware(mtu=%u speed=%u Mbps code=0x%02x) -> 0x%x",
+        ivars->currentMtu, speedMbps, speedCode, r);
 
-    medium = 0x0002 | 0x0010 | 0x0020;  // full duplex + RX/TX flow control
+    medium = AQ_MEDIUM_FULL_DUPLEX | AQ_MEDIUM_RX_FLOW_CONTROL | AQ_MEDIUM_TX_FLOW_CONTROL;
     if (speedCode == 0x0F || speedCode == 0x10) {
-        medium |= 0x0001;  // XGMIIMODE for 5G / 2.5G
+        medium |= AQ_MEDIUM_XGMII_MODE;  // XGMII mode for 5G / 2.5G
     }
-    r = aqWrite(iface, 0x0022, &medium, 2);
+    if (ivars->currentMtu > AQC111_MIN_MTU) {
+        medium |= AQ_MEDIUM_JUMBO_FRAME_ENABLE;
+    }
+    r = aqWrite(iface, AQ_REG_MEDIUM_MODE, &medium, 2);
     LogI("hwOnLinkUp: MEDIUM_STATUS_MODE=0x%04x -> 0x%x", medium, r);
 
-    medium |= 0x0100;  // RECEIVE_EN
-    r = aqWrite(iface, 0x0022, &medium, 2);
+    medium |= AQ_MEDIUM_RECEIVE_ENABLE;
+    r = aqWrite(iface, AQ_REG_MEDIUM_MODE, &medium, 2);
     LogI("hwOnLinkUp: MEDIUM_STATUS_MODE|=RECEIVE_EN => 0x%04x -> 0x%x", medium, r);
 
     b = 0x10;  // SFR_VLAN_CONTROL_VSO
@@ -955,7 +1109,7 @@ ensureRxStarted(AQC111NIC_IVars *ivars, uint8_t speedCode)
         LogI("ensureRxStarted: already started");
         return;
     }
-    hwOnLinkUp(ivars->interface, speedCode);
+    hwOnLinkUp(ivars, speedCode);
     ivars->rxStarted = true;
     LogI("ensureRxStarted: started link speed %u Mbps (code=0x%02x)", linkSpeedMbps(speedCode), speedCode);
 }
@@ -1158,8 +1312,10 @@ txDrainOne(AQC111NIC_IVars *ivars)
             txCsumFlags, txCsumStart, txCsumStuff);
     }
 
-    if (dataLen == 0 || dataLen > 1514) {
-        LogE("txDrainOne: bad len=%u, dropping", dataLen);
+    uint32_t maxFrameLen = ivars->currentMtu + AQC111_ETH_HEADER_LEN;
+    if (dataLen == 0 || dataLen > maxFrameLen) {
+        LogE("txDrainOne: bad len=%u max=%u mtu=%u, dropping",
+            dataLen, maxFrameLen, ivars->currentMtu);
         pkt->setCompletionStatus(kIOReturnError);
         ivars->txcQueue->EnqueuePacket(pkt);
         return;
@@ -1320,6 +1476,13 @@ IMPL(AQC111NIC, OnRxComplete)
             if (frame_len < 14) {
                 LogD("RX[%u] frame[%u] too short for Ethernet: pkt_len=%u frame_len=%u",
                     slot, i, pkt_len, frame_len);
+                pkt_offset += pkt_len;
+                continue;
+            }
+            if (frame_len > ivars->currentMtu + AQC111_ETH_HEADER_LEN) {
+                LogE("RX[%u] frame[%u] too large: pkt_len=%u frame_len=%u max=%u mtu=%u",
+                    slot, i, pkt_len, frame_len,
+                    ivars->currentMtu + AQC111_ETH_HEADER_LEN, ivars->currentMtu);
                 pkt_offset += pkt_len;
                 continue;
             }
@@ -1500,16 +1663,28 @@ IMPL(AQC111NIC, OnItrComplete)
 kern_return_t
 IMPL(AQC111NIC, SetMTU)
 {
-    LogI("SetMTU: %u", mtu);
-    return kIOReturnSuccess;
+    return setCurrentMtu(ivars, mtu, "SetMTU");
 }
 
 kern_return_t
 IMPL(AQC111NIC, GetMaxTransferUnit)
 {
-    LogI("GetMaxTransferUnit");
-    *mtu = 1500;
+    LogI("GetMaxTransferUnit -> %u", AQC111_MAX_MTU);
+    *mtu = AQC111_MAX_MTU;
     return kIOReturnSuccess;
+}
+
+IOReturn
+AQC111NIC::setMaxTransferUnit(uint32_t mtu)
+{
+    return setCurrentMtu(ivars, mtu, "setMaxTransferUnit");
+}
+
+uint32_t
+AQC111NIC::getMaxTransferUnit()
+{
+    LogI("getMaxTransferUnit -> %u", AQC111_MAX_MTU);
+    return AQC111_MAX_MTU;
 }
 
 kern_return_t
