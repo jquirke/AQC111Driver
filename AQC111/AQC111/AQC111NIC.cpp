@@ -205,7 +205,6 @@ struct AQC111NIC_IVars {
     bool                                dumpedRx80;
     bool                                dumpedRx432;
     bool                                dumpedRxOther;
-    bool                                dumpedRxCsum;
     // TX path — one frame in flight at a time
     IOBufferMemoryDescriptor           *txBuf;           // staging buffer: 8-byte descriptor + frame
     OSAction                           *txPacketAction;  // TxPacketAvailable OSAction
@@ -1296,7 +1295,13 @@ IMPL(AQC111NIC, OnRxComplete)
                     if (l3Type == AQ_RX_PD_L3_IPV4 && !l3Err) {
                         csumFlags |= kIOUserNetworkPacketRxCsumIPChecked | kIOUserNetworkPacketRxCsumIPValid;
                     }
-                    if ((l4Type == AQ_RX_PD_L4_UDP || l4Type == AQ_RX_PD_L4_TCP) && !l4Err) {
+                    // Also gated on !l3Err: a corrupted IP header means the source/dest
+                    // addresses feeding the TCP/UDP pseudo-header checksum are unreliable,
+                    // so the hardware's L4 check can't be trusted even if it reports clean.
+                    // Matches Linux aqc111_rx_checksum's combined L3_ERR||L4_ERR gate; the
+                    // x86 kext RE checks these independently, but the safety principle here
+                    // (never assert validity on an uncertain packet) favors the stricter read.
+                    if ((l4Type == AQ_RX_PD_L4_UDP || l4Type == AQ_RX_PD_L4_TCP) && !l4Err && !l3Err) {
                         csumFlags |= kIOUserNetworkPacketRxCsumDataValid;
                     }
                     IOUserNetworkPacketRxChecksumFlags readback = 0;
@@ -1309,11 +1314,8 @@ IMPL(AQC111NIC, OnRxComplete)
                         // for this. See IMPL_PLAN.md M6a.
                         pkt->getRxChecksumInfo(&readback, &readbackValue);
                     }
-                    if (l3Err || l4Err || !ivars->dumpedRxCsum) {
-                        ivars->dumpedRxCsum = true;
-                        LogD("RX[%u] frame[%u] checksum: l3Type=%u l3Err=%d l4Type=%u l4Err=%d csumFlags=0x%x readback=0x%x",
-                            slot, i, l3Type, l3Err, l4Type, l4Err, csumFlags, readback);
-                    }
+                    LogD("RX[%u] frame[%u] checksum: l3Type=%u l3Err=%d l4Type=%u l4Err=%d csumFlags=0x%x readback=0x%x",
+                        slot, i, l3Type, l3Err, l4Type, l4Err, csumFlags, readback);
                 }
 
                 pkt->setCompletionStatus(kIOReturnSuccess);
