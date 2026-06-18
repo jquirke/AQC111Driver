@@ -143,7 +143,9 @@ The x86 kext selects the path at `start()` time based on the raw major byte. The
 
 ### Bug fix plan — RX stall recovery gaps (confirmed root cause, 2026-06-18, awaiting more occurrences before implementing)
 
-**Symptom** (see README "Current bugs" #2): RX silently stops delivering frames mid-session; TX keeps working; recovery requires unplugging/re-enumerating the device. Recurred 3 times in one day (2026-06-18). Logs of all three occurrences saved at `notes/rx_stall_occurrence_{1,2,3}.log` for pattern comparison as more examples are collected.
+**Symptom** (see README "Current bugs" #2): RX silently stops delivering frames mid-session; TX keeps working; recovery requires unplugging/re-enumerating the device. Recurred 4 times in one day (2026-06-18). Logs saved at `notes/rx_stall_occurrence_{1,2,3}.log` and `notes/rx_stall_occurrence_4_power.log`.
+
+**Likely trigger identified, occurrence 4:** preceded by `DK: IOUserServer(...)::systemPower(0x11) effective 0 current 1` — a system sleep/power-state transition. `SetInterfaceEnable(0)` fires, `hwOnLinkDown`'s first register write returns `kIOReturnNotResponding` as the device powers down, teardown finishes, then 44s of total silence (machine asleep). On wake, `hwEnable` resumes and hits one more `NotResponding` (unchecked, ignored), RX/ITR rearm and recover cleanly — but TX hits exactly the already-diagnosed gap below and **stays stalled for 7+ seconds across multiple retries** in this capture, never self-recovering. This reframes the trigger from "random bus hiccup" to "sleep/wake (or USB power management) reliably exercises this code path" — worth testing explicitly via deliberate sleep/wake cycles rather than waiting for it to recur incidentally.
 
 **Root cause, confirmed via occurrence 3** (the first occurrence to capture actual error codes — occurrences 1 and 2 showed total silence with no error status at all, which is consistent with the same underlying issue manifesting slightly differently):
 
