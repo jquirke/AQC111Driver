@@ -34,6 +34,9 @@ public:
     virtual kern_return_t
     Stop(IOService * provider) override;
 
+    virtual kern_return_t
+    NewUserClient(uint32_t type, IOUserClient ** userClient) override;
+
     // USB RX completion — called once per completed bulk IN transfer
     virtual void
     OnRxComplete(OSAction * action,
@@ -109,10 +112,6 @@ public:
     virtual kern_return_t
     GetHardwareAssists(uint32_t * hardwareAssists) override LOCAL;
 
-    // Live log-level control — see "AQC111LogLevel" handling, IMPL_PLAN.md
-    // "Log Level Strategy". Callable via IORegistryEntrySetCFProperties().
-    virtual kern_return_t
-    SetProperties(OSDictionary * properties) override;
 };
 
 #endif /* AQC111NIC_h */

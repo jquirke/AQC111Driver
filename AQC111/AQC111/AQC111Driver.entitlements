@@ -6,6 +6,8 @@
 	<true/>
 	<key>com.apple.developer.driverkit.family.networking</key>
 	<true/>
+	<key>com.apple.developer.driverkit.allow-any-userclient-access</key>
+	<true/>
 	<key>com.apple.developer.driverkit.transport.usb</key>
 	<array>
 		<dict>

@@ -36,7 +36,7 @@
 			<key>idVendor</key>
 			<integer>8436</integer>
 			<key>AQC111LogLevel</key>
-			<integer>3</integer>
+			<integer>1</integer>
 		</dict>
 		<key>AQC111-NIC</key>
 		<dict>
@@ -65,7 +65,16 @@
 			<key>idVendor</key>
 			<integer>8436</integer>
 			<key>AQC111LogLevel</key>
-			<integer>3</integer>
+			<integer>1</integer>
+			<key>AQC111LogUserClientProperties</key>
+			<dict>
+				<key>IOClass</key>
+				<string>IOUserUserClient</string>
+				<key>IOUserClientEntitlements</key>
+				<false/>
+				<key>IOUserClass</key>
+				<string>AQC111LogUserClient</string>
+			</dict>
 		</dict>
 	</dict>
 </dict>

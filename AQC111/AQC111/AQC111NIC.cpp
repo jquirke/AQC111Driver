@@ -34,7 +34,7 @@
 // os_log_debug/info/subsystem-category API like userspace macOS os_log), so
 // verbosity filtering happens here rather than via the OS logging system.
 // gLogLevel defaults to Info and can be raised via the "AQC111LogLevel"
-// personality property (load-time, see Start()) or live via SetProperties().
+// personality property (load-time, see Start()) or live via IOUserClient.
 // See IMPL_PLAN.md "Log Level Strategy".
 #define kLogLevelError      0
 #define kLogLevelInfo       1
@@ -42,14 +42,31 @@
 #define kLogLevelVerbose    3
 static volatile uint8_t gLogLevel = kLogLevelInfo;
 
-#define LogE(fmt, ...) do { if (gLogLevel >= kLogLevelError)   os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] - " fmt, ##__VA_ARGS__); } while (0)
-#define LogI(fmt, ...) do { if (gLogLevel >= kLogLevelInfo)    os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] - " fmt, ##__VA_ARGS__); } while (0)
-#define LogD(fmt, ...) do { if (gLogLevel >= kLogLevelDebug)   os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] - " fmt, ##__VA_ARGS__); } while (0)
-#define LogV(fmt, ...) do { if (gLogLevel >= kLogLevelVerbose) os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] - " fmt, ##__VA_ARGS__); } while (0)
+#define LogE(fmt, ...) do { if (gLogLevel >= kLogLevelError)   os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] Error(level=%u) - " fmt,   gLogLevel, ##__VA_ARGS__); } while (0)
+#define LogI(fmt, ...) do { if (gLogLevel >= kLogLevelInfo)    os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] Info(level=%u) - " fmt,    gLogLevel, ##__VA_ARGS__); } while (0)
+#define LogD(fmt, ...) do { if (gLogLevel >= kLogLevelDebug)   os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] Debug(level=%u) - " fmt,   gLogLevel, ##__VA_ARGS__); } while (0)
+#define LogV(fmt, ...) do { if (gLogLevel >= kLogLevelVerbose) os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] Verbose(level=%u) - " fmt, gLogLevel, ##__VA_ARGS__); } while (0)
 
-// Shared by the load-time read (Start() via CopyProperties) and the live
-// update path (SetProperties()) — looks up "AQC111LogLevel" in the given
-// dictionary and applies it to gLogLevel if present and valid.
+extern "C" kern_return_t
+AQC111SetNICLogLevel(uint32_t level)
+{
+    if (level > kLogLevelVerbose) {
+        return kIOReturnBadArgument;
+    }
+    gLogLevel = (uint8_t)level;
+    os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] - log level set to %u (0=Error 1=Info 2=Debug 3=Verbose)", level);
+    return kIOReturnSuccess;
+}
+
+extern "C" uint32_t
+AQC111GetNICLogLevel(void)
+{
+    return gLogLevel;
+}
+
+// Shared by the load-time read (Start() via CopyProperties) and any future
+// property-based path — looks up "AQC111LogLevel" in the given dictionary and
+// applies it to gLogLevel if present and valid.
 static void
 applyLogLevelFromDictionary(OSDictionary *dict)
 {
@@ -559,6 +576,33 @@ IMPL(AQC111NIC, Stop)
     kern_return_t ret = Stop(provider, SUPERDISPATCH);
     LogI("Stop: after SUPERDISPATCH ret=0x%x", ret);
     return ret;
+}
+
+kern_return_t
+IMPL(AQC111NIC, NewUserClient)
+{
+    IOService *service = nullptr;
+
+    if (type != 0) {
+        LogE("NewUserClient: unsupported type=%u", type);
+        return kIOReturnUnsupported;
+    }
+
+    kern_return_t ret = Create(this, "AQC111LogUserClientProperties", &service);
+    if (ret != kIOReturnSuccess || service == nullptr) {
+        LogE("NewUserClient: Create(AQC111LogUserClientProperties) -> 0x%x service=%p", ret, service);
+        return ret;
+    }
+
+    *userClient = OSDynamicCast(IOUserClient, service);
+    if (*userClient == nullptr) {
+        LogE("NewUserClient: created service is not IOUserClient");
+        OSSafeReleaseNULL(service);
+        return kIOReturnUnsupported;
+    }
+
+    LogI("NewUserClient: created log user client=%p", *userClient);
+    return kIOReturnSuccess;
 }
 
 // --- Hardware register access ---
@@ -1334,15 +1378,6 @@ IMPL(AQC111NIC, GetHardwareAssists)
 {
     LogI("GetHardwareAssists");
     *hardwareAssists = 0;
-    return kIOReturnSuccess;
-}
-
-kern_return_t
-IMPL(AQC111NIC, SetProperties)
-{
-    LogI("SetProperties: gLogLevel was %u", gLogLevel);
-    applyLogLevelFromDictionary(properties);
-    LogI("SetProperties: gLogLevel now %u", gLogLevel);
     return kIOReturnSuccess;
 }
 

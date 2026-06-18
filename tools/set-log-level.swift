@@ -2,12 +2,10 @@
 //
 //  set-log-level.swift
 //  Live log-level control for the running AQC111NIC dext — see
-//  IMPL_PLAN.md "Log Level Strategy". Calls IORegistryEntrySetCFProperties
-//  against the matched AQC111NIC service, which routes to our
-//  SetProperties() override (AQC111NIC.cpp). No restart required.
+//  IMPL_PLAN.md "Log Level Strategy". Opens the AQC111LogUserClient and
+//  calls selector 0 with the requested log level. No restart required.
 //
 //  Usage: ./set-log-level.swift <0-3>   (0=Error 1=Info 2=Debug 3=Verbose)
-//  May require sudo depending on IOKit property-set permissions.
 //
 
 import IOKit
@@ -18,23 +16,37 @@ guard CommandLine.arguments.count == 2, let level = UInt32(CommandLine.arguments
     exit(1)
 }
 
-// IOServiceMatching("AQC111NIC") doesn't work here: DriverKit services are
-// published with IOClass=IOUserNetworkEthernet (the generic kernel-side
-// proxy), not the actual dext subclass name. "IOUserClass" is the property
-// that actually carries "AQC111NIC" (confirmed via `ioreg -r -c AQC111NIC`).
-let matching = ["IOUserClass": "AQC111NIC"] as CFDictionary
+// Open the NIC personality directly. Most logging is emitted from AQC111NIC,
+// and DriverKit user-client calls are delivered to the service passed to
+// IOServiceOpen(). Opening the AQC111 USB-device personality updates that
+// personality's process-local copy, not necessarily the NIC instance.
+let matching = IOServiceMatching("IOUserNetworkEthernet") as NSMutableDictionary
+matching["IOPropertyMatch"] = ["IOUserClass": "AQC111NIC"]
 let service = IOServiceGetMatchingService(kIOMainPortDefault, matching)
 guard service != 0 else {
-    print("AQC111NIC service not found — is the dext loaded and the interface attached?")
+    print("AQC111NIC service not found — is the dext loaded and the network interface attached?")
     exit(1)
 }
 defer { IOObjectRelease(service) }
 
-let props: [String: Any] = ["AQC111LogLevel": level]
-let result = IORegistryEntrySetCFProperties(service, props as CFDictionary)
-if result == KERN_SUCCESS {
-    print("Set AQC111LogLevel=\(level). Check `log stream` to confirm.")
-} else {
-    print(String(format: "IORegistryEntrySetCFProperties failed: 0x%x (try sudo?)", result))
+var connection: io_connect_t = 0
+var result = IOServiceOpen(service, mach_task_self_, 0, &connection)
+guard result == KERN_SUCCESS else {
+    print(String(format: "IOServiceOpen failed: 0x%x", result))
+    if result == kIOReturnNotPermitted {
+        print("The dext must be signed with com.apple.developer.driverkit.allow-any-userclient-access, or the caller must have userclient-access for au.com.jquirke.AQC111Driver.")
+    }
     exit(1)
 }
+defer { IOServiceClose(connection) }
+
+var input: [UInt64] = [UInt64(level)]
+result = input.withUnsafeBufferPointer { buffer in
+    IOConnectCallScalarMethod(connection, 0, buffer.baseAddress, 1, nil, nil)
+}
+guard result == KERN_SUCCESS else {
+    print(String(format: "IOConnectCallScalarMethod(set log level) failed: 0x%x", result))
+    exit(1)
+}
+
+print("Set AQC111LogLevel=\(level). Check `log stream` to confirm.")
