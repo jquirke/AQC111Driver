@@ -8,6 +8,8 @@ Tested device: **TRENDnet TUC-ET5G** (VID `0x20f4`, PID `0xe05a`).
 
 Thanks to Apple for approving the `driverkit.transport.usb` and `driverkit.family.networking` entitlements for this project, making it possible to develop a proper DriverKit driver for this hardware.
 
+As far as could be determined, this is the first published open-source DriverKit + Skywalk (`IOUserNetworkEthernet`) driver for real, physical hardware — public DriverKit networking examples are otherwise limited to Apple's own sample code. Large parts of what's needed to make a real network driver work this way (queue topology, OSAction dispatch quirks, checksum/MTU capability negotiation, sticky hardware registers across driver restarts, and more) are weakly documented or entirely undocumented by Apple. This project is published in that spirit as much as for the driver itself: a working reference for the parts of DriverKit networking that aren't covered by sample code, so the next person doesn't have to rediscover them from scratch.
+
 ---
 
 ## Background
@@ -52,7 +54,7 @@ Anyone who has done kernel debugging on other platforms will recognise the value
 
 ## Current Status
 
-The driver loads, forces Config 1, registers an Ethernet interface, and is fully functional for basic Ethernet use. The complete bidirectional data path — RX and TX — is confirmed working end-to-end: ARP resolves, and `ping` succeeds.
+The driver loads, forces Config 1, registers an Ethernet interface, and has grown well past basic Ethernet connectivity: RX and TX hardware checksum offload, jumbo frame/MTU control, and runtime-controllable diagnostics are all implemented and validated (see below). The complete bidirectional data path — RX and TX — is confirmed working end-to-end: ARP resolves, and `ping` succeeds.
 
 **What works:**
 - USB enumeration with Config 1 forced (vendor-specific high-performance path)
