@@ -145,10 +145,29 @@ MTU was previously hardcoded to 1500: `SetMTU()` was a no-op stub, `GetMaxTransf
 
 Replaced raw pointer-cast reads/writes of multi-byte device payloads (e.g. `*(const uint64_t *)(buf + ...)`) — host-endian-fragile and technically unaligned-access UB even though harmless on Apple Silicon today — with explicit `readLe16/32/64`/`writeLe16/32/64` helpers and typed `aqRead16`/`aqWrite16`/`aqVendorOut32` wrappers. Applied to RX aggregate-header parsing, RX packet descriptor parsing, TX descriptor construction, and all 16-bit SFR/32-bit PHY-firmware register access. Wire bytes unchanged on Apple Silicon (verification: signing-disabled build passes); the value is portability and removing UB, not a behavior change.
 
+### M6e — 802.1Q VLAN support design (planned, not yet implemented)
+
+Two genuinely separate DriverKit mechanisms, researched before planning (including a second model's independent read on a public-docs ambiguity — see `RE_LOG.md` "Open Items" for the related kext RE side-investigation):
+
+1. **Software VLAN accommodation** (`kIOUserNetworkHWAssistSoftwareVlan` / `IOUserNetworkEthernet::SetSoftwareVlanSupport(bool)`) — maps to BSD's `IFNET_VLAN_MTU`: the driver promises to tolerate frames 4 bytes longer than the configured MTU so the OS's `vlan(4)` pseudo-interface layer can add/remove tags entirely in software, above the driver. Well-documented, low-risk, same capability-declaration pattern as checksum/MTU.
+2. **True hardware tag insert/strip** (`IOUserNetworkPacket::getVlanTag()`/`setVlanTag()`, `NDK_24`) — the AQC111U genuinely supports this in silicon: RX descriptor bit 10 (tag present) + tag in bits 63:32 (shift `0x20`); TX descriptor bit 29 (insert tag) + tag in bits 63:48 (shift `0x30`) — confirmed via `RE_LOG.md`, matches Linux's `aqc111_rx_fixup`'s `__vlan_hwaccel_put_tag`/`aqc111_tx_fixup`'s `vlan_get_tag`. The capability gate the SDK docs reference (`kFeatureHardwareVlan`) **does not exist as a public constant anywhere in this SDK** — confirmed by grepping the entire `NetworkingDriverKit.framework/Headers/` tree and reading the full `hwAssist` enum in `IOUserNetworkTypes.h` line by line; treated as a stale/internal doc-comment name, not a constant to chase in a newer SDK. Build behind the existing `kIOUserNetworkHWAssistSoftwareVlan` declaration and verify empirically whether it's actually what gates `getVlanTag`/`setVlanTag` — **treat success as empirical, not documented**, same discipline as every other capability negotiation this session.
+
+**Existing fact found during research**: `hwOnLinkUp()` already writes `SFR_VLAN_ID_CONTROL` (`0x002B`) `= 0x10` (`SFR_VLAN_CONTROL_VSO`, "VLAN Stripping On") — inherited unmodified from the original x86 kext RE'd link-up sequence, currently unused by our own RX parsing. Hardware-side VLAN detection may already be enabled; likely just need to start reading the descriptor bit, not turn on a new hardware feature.
+
+**Out of scope for this pass**: hardware VLAN ID *filtering* (`SFR_VLAN_ID_ADDRESS`/`SFR_VLAN_ID_DATA0`, Linux's `aqc111_vlan_rx_add_vid`/`kill_vid`, `NETIF_F_HW_VLAN_CTAG_FILTER`) — a separate, optional performance feature (hardware-side allow-list of VLAN IDs); software-side VLAN demuxing works fine without it.
+
+**Concrete bug to fix regardless of which layer is used**: `txDrainOne()`'s size check and `OnRxComplete()`'s upper-bound check both gate on `ivars->currentMtu + AQC111_ETH_HEADER_LEN` (14) with no allowance for a VLAN tag — a software-tagged frame at MTU 1500 is 1518 bytes and would be rejected as "too large" by both checks today.
+
+**Plan**:
+0. **Baseline test first, before any code changes** — verify whether software VLAN tagging already works against the *current, unmodified* driver via `vlan(4)` (the OS might already clamp its own effective MTU to `physical_MTU - 4` rather than adding 4 bytes on top, in which case the size-check bug above may not actually manifest in practice).
+1. Layer 1 (software accommodation): declare `SetSoftwareVlanSupport` override (mirrors `SetWakeOnMagicPacketEnable`'s existing pattern), OR `kIOUserNetworkHWAssistSoftwareVlan` into `AQC111_HWASSIST_MASK`, fix the size-check `+4` gap.
+2. Layer 2 (hardware tag, behind empirical verification): RX extracts bit 10 + tag from `pd` bits 63:32 (masked to 12-bit VID, matching Linux's explicit `VLAN_VID_MASK`) and calls `setVlanTag()`; TX calls `getVlanTag()` and, if present, sets TX descriptor bit 29 + tag in bits 63:48. If `getVlanTag`/`setVlanTag` turn out not to be wired to anything observable, Layer 2 is shelved as "API present, not functionally available," and Layer 1 remains the supported path.
+
+**Verification**: same rigor as RX/TX checksum offload — remote/third-party capture vantage point (not the transmitting Mac), positive test (real `802.1Q, ID: 100` tag on the wire, confirmed via Wireshark's own parsing, not just IP-level connectivity), negative test (mismatched VLAN IDs between the two ends, expect complete silence — same methodology as the bad-checksum negative control), and a check that VLAN tagging doesn't perturb the existing checksum-offload classification logging. Results to land in `TESTING.md` "VLAN Support" once run.
+
 ### M7 — Advanced hardware features (planned, post-stability)
 
 - TSO (TX descriptor MSS field, bits 46:32)
-- VLAN offload (RX descriptor bit 10; `SFR_VLAN_ID_CONTROL`)
 - Wake-on-LAN
 
 ### M8 — PHY access polymorphism (planned, low priority)
