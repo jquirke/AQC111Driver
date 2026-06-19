@@ -134,6 +134,10 @@ applyLogLevelFromDictionary(OSDictionary *dict)
 
 #define AQ_REG_RX_BULK_QUEUE_CTRL       0x002E
 #define AQ_REG_PAUSE_WATERMARK          0x0054
+#define AQ_REG_VLAN_CONTROL             0x002B
+
+#define AQ_VLAN_CONTROL_NONE            0x00
+#define AQ_VLAN_CONTROL_STRIP_ENABLE    0x10
 
 #define AQ_PAUSE_WATERMARK_LOW_BYTE     0
 #define AQ_PAUSE_WATERMARK_HIGH_BYTE    1
@@ -1152,9 +1156,13 @@ hwOnLinkUp(AQC111NIC_IVars *ivars, uint8_t speedCode)
     r = aqWrite16(iface, AQ_REG_MEDIUM_MODE, medium);
     LogI("hwOnLinkUp: MEDIUM_STATUS_MODE|=RECEIVE_EN => 0x%04x -> 0x%x", medium, r);
 
-    b = 0x10;  // SFR_VLAN_CONTROL_VSO
-    r = aqWrite(iface, 0x002B, &b, 1);
-    LogI("hwOnLinkUp: VLAN_ID_CONTROL=0x10 -> 0x%x", r);
+    // Keep 802.1Q tags inline for the OS vlan(4) software path. Enabling
+    // hardware strip here removes the tag before Skywalk can demux to vlan0
+    // unless we also forward RX descriptor VLAN metadata, which this layer-1
+    // VLAN support pass intentionally does not do.
+    b = AQ_VLAN_CONTROL_NONE;
+    r = aqWrite(iface, AQ_REG_VLAN_CONTROL, &b, 1);
+    LogI("hwOnLinkUp: VLAN_CONTROL=0x%02x (strip off) -> 0x%x", b, r);
 
     // The x86 path also touches speed-dependent secondary controls here
     // (0x0046, 0x009e). Keep this patch minimal and focus first on the

@@ -9,7 +9,7 @@ it proved. Organized by feature, newest entries at the top of each section.
 
 ## VLAN Support
 
-### Step 1 — Layer 1 fix (2026-06-20): TX tagging confirmed working; full round-trip blocked by test harness, not the driver
+### Step 1 — Layer 1 fix (2026-06-20): software VLAN path validated end-to-end
 
 Implemented the fix predicted but not yet built when Step 0 found the bug:
 called `SetSoftwareVlanSupport(true)` in `Start()` (a concrete `IOUserNetworkEthernet`
@@ -17,10 +17,16 @@ base-class method the driver calls, not one it overrides — the original plan
 had this backwards), added `kIOUserNetworkHWAssistSoftwareVlan` to the
 declared/self-enabled hwAssist mask, and added a 4-byte allowance
 (`AQC111_VLAN_TAG_LEN`) to the TX/RX frame-size checks and buffer sizing.
-Uncommitted on `vlan-support` pending a clean full round-trip — see below for
-why that's still outstanding.
 
-**TX tagging: confirmed working, multiple independent ways:**
+A second bug then appeared on the RX/software-demux side: `hwOnLinkUp()` had
+inherited the original x86 kext's `SFR_VLAN_ID_CONTROL` write of `0x10`
+(`SFR_VLAN_CONTROL_VSO`, VLAN strip on). That is wrong for this layer-1
+software VLAN pass. It removes the inline 802.1Q header before macOS `vlan(4)`
+can classify the packet, while this driver does not yet forward hardware RX
+descriptor VLAN metadata to Skywalk. The fix is to write `0x00` to
+`SFR_VLAN_ID_CONTROL` on link-up, preserving inline tags for software demux.
+
+**Initial TX tagging confirmation, multiple independent ways:**
 - `vlan0`'s MTU corrected from `1496` (BSD's "parent doesn't support
   VLAN_MTU" clamp) to `1500`, matching the Apple CDC/ECM reference exactly.
 - The byte-level 802.1Q tag (`81 00 04 d2`) now genuinely appears inline in
@@ -37,48 +43,55 @@ why that's still outstanding.
   demuxed/decapsulated. This is the first real confirmation that an inbound
   tagged frame is handled correctly end-to-end at the remote.
 
-**Full round-trip (ping replies) not yet achieved — but every failure traced
-to test-harness state, not driver behavior:**
-- Two interfaces on the Mac (`en9` parent, `vlan0` child) both carry `/16`
-  netmasks on the same `169.254.0.0/16` range, so the kernel has two
-  competing routes for any single target IP. `route -n add -host X
-  -interface vlan0` itself appears to seed a placeholder link-layer
-  resolution pointing at the interface's own MAC (not from any `arp`
-  command) until an explicit `arp -s ... temp ifscope vlan0` overwrites it.
-  That `temp` entry expires after a few minutes, after which traffic
-  silently falls back to the ambiguous subnet match and often resolves via
-  `en9` (untagged) instead of `vlan0` (tagged) — explaining several
-  apparent regressions mid-session that were actually just an aged-out
-  override.
-- A `permanent`-flagged stale ARP entry (self-referential, mapping the
-  remote's IP to this Mac's own MAC) survived `arp -d`, `arp -d -a` (full
-  flush), and full `vlan0` interface destroy/recreate cycles. Root cause
-  not fully resolved; worked around by switching test target IPs entirely
-  rather than fighting it further.
-- macOS appears to collapse `ifscope vlan0` ARP entries down to the
-  physical parent's scope (`ifscope en9`) regardless of what's requested —
-  plausibly because `vlan0` and `en9` share the same physical link/MAC.
-  Not confirmed as the actual cause of any specific failure, but consistent
-  with the general pattern of ARP/route state being harder to pin to the
-  VLAN sub-interface specifically than expected.
-- Remote-side `rx-vlan-offload` (fixed, see above) and possibly
-  `tx-vlan-offload` (suspected, not yet fixed) on the Realtek/`r8152`
-  adapter caused asymmetric tag handling — frames sent *from* the remote
-  toward the Mac (reverse-direction RX test, attempted to independently
-  verify this driver's RX path) arrived at the Mac's `en9` untagged despite
-  the remote's own `vlan1234` apparently sending with intent to tag.
+**Final clean test rig:** moved away from link-local `/16` addressing and gave
+the parent no IPv4 address, leaving only `vlan0` with `172.16.123.20/24` on
+VLAN tag `1234`; the remote peer was `172.16.123.10/24`. This removes the
+earlier route/ARP ambiguity between `en9` and `vlan0`. The reproducible local
+setup is `tools/setup-vlan1234.sh`.
 
-**Conclusion:** the driver-side fix for M6e Layer 1 is demonstrated correct —
-TX tagging happens, and at least one full inbound demux was confirmed on the
-remote. What's blocking a clean automated positive+negative test is this
-specific test rig's `/16`-overlap routing ambiguity and the remote's NIC
-offload quirks, not anything in `AQC111NIC.cpp`. Paused here; next session
-should either fix the test harness properly (e.g. give `vlan0` a netmask
-that doesn't overlap `en9`'s, to remove the routing ambiguity at the root)
-or accept the asymmetric evidence gathered so far as sufficient and move on.
-This driver's RX-side handling (the `OnRxComplete` size-check `+4` fix) has
-not yet been exercised by any test — the reverse-direction test that would
-have proven it didn't complete due to the remote's own offload quirk.
+**Positive control, parent view (`en9`):** after disabling hardware VLAN
+stripping, `tcpdump -n -XX -e -i en9` showed both directions with inline
+802.1Q headers on the parent:
+
+```text
+3c:8c:f8:f9:d7:a3 > 58:ef:68:e2:8e:95, ethertype 802.1Q (0x8100), length 102: vlan 1234, p 0, ethertype IPv4 (0x0800), 172.16.123.20 > 172.16.123.10: ICMP echo request
+58:ef:68:e2:8e:95 > 3c:8c:f8:f9:d7:a3, ethertype 802.1Q (0x8100), length 102: vlan 1234, p 0, ethertype IPv4 (0x0800), 172.16.123.10 > 172.16.123.20: ICMP echo reply
+```
+
+The outbound request's IPv4 header checksum is still visible as `0000` in the
+local capture. That is expected with TX checksum offload at this vantage point;
+the inbound reply carries a completed checksum.
+
+**Positive control, VLAN view (`vlan0`):** `tcpdump -n -XX -e -i vlan0` showed
+both directions decapsulated as normal IPv4 Ethernet frames:
+
+```text
+3c:8c:f8:f9:d7:a3 > 58:ef:68:e2:8e:95, ethertype IPv4 (0x0800), length 98: 172.16.123.20 > 172.16.123.10: ICMP echo request
+58:ef:68:e2:8e:95 > 3c:8c:f8:f9:d7:a3, ethertype IPv4 (0x0800), length 98: 172.16.123.10 > 172.16.123.20: ICMP echo reply
+```
+
+This proves the parent receives tagged frames intact and macOS `vlan(4)`
+delivers only the matching VLAN traffic to `vlan0`.
+
+**Negative control, mismatched VLAN ID:** the remote then sent the same traffic
+on VLAN tag `1235` while the local `vlan0` remained configured for tag `1234`.
+The parent saw the frame:
+
+```text
+58:ef:68:e2:8e:95 > 3c:8c:f8:f9:d7:a3, ethertype 802.1Q (0x8100), length 102: vlan 1235, p 0, ethertype IPv4 (0x0800), 172.16.123.10 > 172.16.123.20: ICMP echo request
+```
+
+`vlan0` did not receive those `1235` frames; the only traffic visible there was
+local ARP from `172.16.123.20` looking for `172.16.123.10` on VLAN `1234`.
+That is the expected negative result and proves the fix did not flatten all
+tagged parent traffic into `vlan0`.
+
+**Conclusion:** M6e Layer 1 software VLAN support is validated. Required pieces
+are `SetSoftwareVlanSupport(true)`, declaring `kIOUserNetworkHWAssistSoftwareVlan`,
+allowing `+4` bytes in TX/RX frame-size checks and buffers, and disabling
+hardware VLAN stripping (`SFR_VLAN_ID_CONTROL=0x00`) until a future hardware
+VLAN metadata path exists. Hardware tag insert/strip remains out of scope for
+this pass.
 
 ### Step 0 — baseline test (2026-06-20): confirmed broken before any code changes
 
