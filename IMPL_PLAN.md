@@ -129,10 +129,25 @@ Unlike RX, confirmed against both Linux `aqc111_tx_fixup()` and the RE'd x86 TX 
 
 **Status: validated 2026-06-18.** Full methodology and results in `TESTING.md` "TX Checksum Offload". Headline finding: confirmed `getTxChecksumInfo` reports `flags=0x4` (`IPHdr` only, correct for ICMP traffic since ICMP isn't declared), and that the OS genuinely stops computing the IP header checksum itself once the capability is declared (direct proof of "stack consumption" — the thing M6a couldn't get without `dtrace`). Negative-control testing surfaced an important hardware quirk: `SFR_TXCOE_CTL`/`SFR_RXCOE_CTL` are **sticky across dext Stop/Start cycles** (the chip never loses power on a driver restart, and `hwDisable()` doesn't reset these registers) — a first attempt at disabling TX offload by skipping the write got a false negative because the register was still enabled from an earlier test run. A genuine negative control required a physical USB unplug/replug to force a real hardware reset. See `TESTING.md` "Reusable Methodology Notes" for the general lesson.
 
+#### M6c — Jumbo frame / MTU control design
+
+MTU was previously hardcoded to 1500: `SetMTU()` was a no-op stub, `GetMaxTransferUnit()` hardcoded `*mtu = 1500`, and `txDrainOne()` hard-rejected anything over 1514 bytes. The AQC111U supports jumbo frames up to ~16KB.
+
+**Hardware** — cross-checked against two independent sources that agree exactly on the watermark tiers: Linux's `aqc111_change_mtu()`/`aqc111_configure_rx()` (`notes/aqc111.c`) and the x86 kext RE (`RE_LOG.md`, now updated with the confirmed `SFR_PAUSE_WATERLVL_LOW`/`_HIGH` register address `0x0054`/`0x0055`). Three registers are MTU-aware: `SFR_MEDIUM_STATUS_MODE` bit 6 (jumbo enable, set when `mtu > 1500`), `SFR_PAUSE_WATERLVL_LOW` (new, tiered `0x0810/0x1020/0x1420/0x1A20` by MTU bucket), and the existing `SFR_RX_BULKIN_QCTRL` coalescing register (gets a dedicated jumbo profile `07 00 01 18 ff` when `mtu > 12500`, overriding the speed-based profile).
+
+**DriverKit API**: both the deprecated dispatched pair (`SetMTU`/`GetMaxTransferUnit`) and the modern `LOCALONLY` pair (`setMaxTransferUnit`/`getMaxTransferUnit`, `NDK_21`) are implemented, sharing a `setCurrentMtu()`/`applyMtuToHardware()` helper pair. `getMaxTransferUnit()`/`GetMaxTransferUnit()` report the hardware ceiling (`16334`) unconditionally rather than the currently-configured MTU — confirmed correct via `networksetup -listvalidMTURange`, which uses this as a capability/range query (the OS tracks the actually-configured MTU itself; the driver's job is to enforce and apply it in hardware, not to be the source of truth for "what's set now").
+
+**Implementation also fixed a gap not in the original plan**: the `IOUserNetworkPacketBufferPool`'s `bufferSize` was hardcoded to `2048` — far too small for a jumbo frame copy in `OnRxComplete`. Resized to `AQC111_MAX_FRAME_LEN` alongside the TX staging buffer (`AQC111_TX_BUF_SIZE`). RX/TX frame lengths are now gated against `ivars->currentMtu + 14` instead of the old hardcoded `1514`.
+
+**Status: validated 2026-06-19** for MTU `1500`/`9000`/`16334` hardware programming and the OS-visible `1280-16334` valid-MTU-range, plus jumbo ICMP traffic up to the test peer's ~9KB-class limit and 4K-streaming stability soak at both MTU `1500` and `16334`. Full methodology in `TESTING.md` "Jumbo Frames / MTU Control". **Full 16KB-class jumbo traffic is deferred, not blocking** — the bench peer tops out around 9KB; the 16KB ceiling will be exercised when this driver gets a proper throughput/perf benching pass later, not treated as an open risk in the meantime.
+
+### M6d — Endianness cleanup
+
+Replaced raw pointer-cast reads/writes of multi-byte device payloads (e.g. `*(const uint64_t *)(buf + ...)`) — host-endian-fragile and technically unaligned-access UB even though harmless on Apple Silicon today — with explicit `readLe16/32/64`/`writeLe16/32/64` helpers and typed `aqRead16`/`aqWrite16`/`aqVendorOut32` wrappers. Applied to RX aggregate-header parsing, RX packet descriptor parsing, TX descriptor construction, and all 16-bit SFR/32-bit PHY-firmware register access. Wire bytes unchanged on Apple Silicon (verification: signing-disabled build passes); the value is portability and removing UB, not a behavior change.
+
 ### M7 — Advanced hardware features (planned, post-stability)
 
 - TSO (TX descriptor MSS field, bits 46:32)
-- Jumbo frames (MTU > 1500; hardware supports ~16 KB)
 - VLAN offload (RX descriptor bit 10; `SFR_VLAN_ID_CONTROL`)
 - Wake-on-LAN
 
