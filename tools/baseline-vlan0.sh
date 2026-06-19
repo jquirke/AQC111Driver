@@ -9,8 +9,8 @@ VLAN_IF="${VLAN_IF:-vlan0}"
 VLAN_TAG="${VLAN_TAG:-1234}"
 VLAN_ADDR="${VLAN_ADDR:-169.254.113.129}"
 VLAN_NETMASK="${VLAN_NETMASK:-255.255.0.0}"
-TARGET_ADDR="${TARGET_ADDR:-169.254.50.51}"
-TARGET_MAC="${TARGET_MAC:-1c:86:0b:3b:e7:f6}"
+TARGET_ADDR="${TARGET_ADDR:-169.254.50.52}"
+TARGET_MAC="${TARGET_MAC:-58:ef:68:e2:8e:95}"
 WAIT_SECONDS="${WAIT_SECONDS:-20}"
 PING_COUNT="${PING_COUNT:-4}"
 
@@ -52,10 +52,7 @@ wait_for_parent() {
   while [ "$elapsed" -le "$WAIT_SECONDS" ]; do
     if ifconfig "$PARENT_IF" >/dev/null 2>&1; then
       status=$(ifconfig "$PARENT_IF" | awk '/status:/{print $2; exit}')
-      if [ "$status" = "active" ]; then
-        log "$PARENT_IF exists and is active"
-        return 0
-      fi
+      return 0
       log "$PARENT_IF exists but status is '${status:-unknown}'; waiting"
     else
       log "$PARENT_IF does not exist yet; waiting"

@@ -96,8 +96,9 @@ applyLogLevelFromDictionary(OSDictionary *dict)
 #define AQC111_MIN_MTU          1500
 #define AQC111_MAX_MTU          16334
 #define AQC111_ETH_HEADER_LEN   14
+#define AQC111_VLAN_TAG_LEN     4   // 802.1Q tag (see IMPL_PLAN.md M6e)
 #define AQC111_TX_DESC_LEN      8
-#define AQC111_MAX_FRAME_LEN    (AQC111_MAX_MTU + AQC111_ETH_HEADER_LEN)
+#define AQC111_MAX_FRAME_LEN    (AQC111_MAX_MTU + AQC111_ETH_HEADER_LEN + AQC111_VLAN_TAG_LEN)
 #define AQC111_TX_BUF_SIZE      (AQC111_TX_DESC_LEN + AQC111_MAX_FRAME_LEN)
 
 // SFR_RXCOE_CTL: per-protocol RX checksum offload enable (see IMPL_PLAN.md M6a).
@@ -156,6 +157,7 @@ applyLogLevelFromDictionary(OSDictionary *dict)
     kIOUserNetworkHWAssistRxChecksum | \
     kIOUserNetworkHWAssistTxChecksumIPHdr | \
     kIOUserNetworkHWAssistTxChecksumTCP | \
+    kIOUserNetworkHWAssistSoftwareVlan | \
     kIOUserNetworkHWAssistTxChecksumUDP)
 
 // RX Packet Descriptor checksum sub-fields (lower 16 bits of pd; see
@@ -583,6 +585,15 @@ IMPL(AQC111NIC, Start)
         goto fail;
     }
     LogI("Start: RegisterEthernetInterface OK");
+
+    // Declare VLAN_MTU accommodation (IMPL_PLAN.md M6e) — without this call,
+    // the OS's vlan(4) software-tagging layer can't assume this interface
+    // tolerates a 4-byte-larger frame. Best-effort capability nudge, not
+    // fatal to Start() if it fails.
+    {
+        kern_return_t vlanRet = SetSoftwareVlanSupport(true);
+        LogI("Start: SetSoftwareVlanSupport(true) -> 0x%x", vlanRet);
+    }
 
     // --- TX path ---
     // Wire up TxPacketAvailable: stack notifies via IODataQueueDispatchSource
@@ -1386,7 +1397,7 @@ txDrainOne(AQC111NIC_IVars *ivars)
         for (uint32_t i = 0; i < dumpLen && hexoff < (int)sizeof(hexbuf) - 3; i++) {
             hexoff += snprintf(hexbuf + hexoff, sizeof(hexbuf) - (size_t)hexoff, "%02x ", frame[i]);
         }
-        LogD("txDrainOne: getVlanTag has=%d tag=%u dataLen=%u first%u: %s",
+        LogD("txDrainOne: getVlanTag has=%d tag=%u dataLen=%u first%u: %{public}s",
             hasVlanTag, vlanTag, dataLen, dumpLen, hexbuf);
     }
 
@@ -1404,7 +1415,7 @@ txDrainOne(AQC111NIC_IVars *ivars)
             txCsumFlags, txCsumStart, txCsumStuff);
     }
 
-    uint32_t maxFrameLen = ivars->currentMtu + AQC111_ETH_HEADER_LEN;
+    uint32_t maxFrameLen = ivars->currentMtu + AQC111_ETH_HEADER_LEN + AQC111_VLAN_TAG_LEN;
     if (dataLen == 0 || dataLen > maxFrameLen) {
         LogE("txDrainOne: bad len=%u max=%u mtu=%u, dropping",
             dataLen, maxFrameLen, ivars->currentMtu);
@@ -1571,10 +1582,10 @@ IMPL(AQC111NIC, OnRxComplete)
                 pkt_offset += pkt_len;
                 continue;
             }
-            if (frame_len > ivars->currentMtu + AQC111_ETH_HEADER_LEN) {
+            if (frame_len > ivars->currentMtu + AQC111_ETH_HEADER_LEN + AQC111_VLAN_TAG_LEN) {
                 LogE("RX[%u] frame[%u] too large: pkt_len=%u frame_len=%u max=%u mtu=%u",
                     slot, i, pkt_len, frame_len,
-                    ivars->currentMtu + AQC111_ETH_HEADER_LEN, ivars->currentMtu);
+                    ivars->currentMtu + AQC111_ETH_HEADER_LEN + AQC111_VLAN_TAG_LEN, ivars->currentMtu);
                 pkt_offset += pkt_len;
                 continue;
             }

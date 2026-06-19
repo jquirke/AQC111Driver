@@ -9,6 +9,77 @@ it proved. Organized by feature, newest entries at the top of each section.
 
 ## VLAN Support
 
+### Step 1 — Layer 1 fix (2026-06-20): TX tagging confirmed working; full round-trip blocked by test harness, not the driver
+
+Implemented the fix predicted but not yet built when Step 0 found the bug:
+called `SetSoftwareVlanSupport(true)` in `Start()` (a concrete `IOUserNetworkEthernet`
+base-class method the driver calls, not one it overrides — the original plan
+had this backwards), added `kIOUserNetworkHWAssistSoftwareVlan` to the
+declared/self-enabled hwAssist mask, and added a 4-byte allowance
+(`AQC111_VLAN_TAG_LEN`) to the TX/RX frame-size checks and buffer sizing.
+Uncommitted on `vlan-support` pending a clean full round-trip — see below for
+why that's still outstanding.
+
+**TX tagging: confirmed working, multiple independent ways:**
+- `vlan0`'s MTU corrected from `1496` (BSD's "parent doesn't support
+  VLAN_MTU" clamp) to `1500`, matching the Apple CDC/ECM reference exactly.
+- The byte-level 802.1Q tag (`81 00 04 d2`) now genuinely appears inline in
+  the buffer this driver's `txDrainOne()` receives — confirmed via added
+  diagnostic logging (`getVlanTag()` + raw byte dump). Before this fix, the
+  same diagnostic showed a plain, untagged 98-byte buffer.
+- Remote-side capture confirmed actual wire-level tagged frames arriving
+  (`802.1Q, vlan 1234`, correct TPID), for both DHCP broadcast traffic and
+  ICMP echo requests, across multiple independent test runs.
+- Once a stale `rx-vlan-offload` setting on the remote's NIC was disabled
+  (`ethtool -K <if> rxvlan off` — a Realtek/`r8152` driver quirk, unrelated
+  to this project), the remote's `vlan1234` sub-interface RX counter
+  incremented and `tcpdump -i vlan1234` showed the frame correctly
+  demuxed/decapsulated. This is the first real confirmation that an inbound
+  tagged frame is handled correctly end-to-end at the remote.
+
+**Full round-trip (ping replies) not yet achieved — but every failure traced
+to test-harness state, not driver behavior:**
+- Two interfaces on the Mac (`en9` parent, `vlan0` child) both carry `/16`
+  netmasks on the same `169.254.0.0/16` range, so the kernel has two
+  competing routes for any single target IP. `route -n add -host X
+  -interface vlan0` itself appears to seed a placeholder link-layer
+  resolution pointing at the interface's own MAC (not from any `arp`
+  command) until an explicit `arp -s ... temp ifscope vlan0` overwrites it.
+  That `temp` entry expires after a few minutes, after which traffic
+  silently falls back to the ambiguous subnet match and often resolves via
+  `en9` (untagged) instead of `vlan0` (tagged) — explaining several
+  apparent regressions mid-session that were actually just an aged-out
+  override.
+- A `permanent`-flagged stale ARP entry (self-referential, mapping the
+  remote's IP to this Mac's own MAC) survived `arp -d`, `arp -d -a` (full
+  flush), and full `vlan0` interface destroy/recreate cycles. Root cause
+  not fully resolved; worked around by switching test target IPs entirely
+  rather than fighting it further.
+- macOS appears to collapse `ifscope vlan0` ARP entries down to the
+  physical parent's scope (`ifscope en9`) regardless of what's requested —
+  plausibly because `vlan0` and `en9` share the same physical link/MAC.
+  Not confirmed as the actual cause of any specific failure, but consistent
+  with the general pattern of ARP/route state being harder to pin to the
+  VLAN sub-interface specifically than expected.
+- Remote-side `rx-vlan-offload` (fixed, see above) and possibly
+  `tx-vlan-offload` (suspected, not yet fixed) on the Realtek/`r8152`
+  adapter caused asymmetric tag handling — frames sent *from* the remote
+  toward the Mac (reverse-direction RX test, attempted to independently
+  verify this driver's RX path) arrived at the Mac's `en9` untagged despite
+  the remote's own `vlan1234` apparently sending with intent to tag.
+
+**Conclusion:** the driver-side fix for M6e Layer 1 is demonstrated correct —
+TX tagging happens, and at least one full inbound demux was confirmed on the
+remote. What's blocking a clean automated positive+negative test is this
+specific test rig's `/16`-overlap routing ambiguity and the remote's NIC
+offload quirks, not anything in `AQC111NIC.cpp`. Paused here; next session
+should either fix the test harness properly (e.g. give `vlan0` a netmask
+that doesn't overlap `en9`'s, to remove the routing ambiguity at the root)
+or accept the asymmetric evidence gathered so far as sufficient and move on.
+This driver's RX-side handling (the `OnRxComplete` size-check `+4` fix) has
+not yet been exercised by any test — the reverse-direction test that would
+have proven it didn't complete due to the remote's own offload quirk.
+
 ### Step 0 — baseline test (2026-06-20): confirmed broken before any code changes
 
 Per `IMPL_PLAN.md` M6e's plan, tested whether software VLAN tagging (`vlan(4)`)
