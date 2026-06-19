@@ -1748,3 +1748,21 @@ setChecksumResult(mbuf, kChecksumFamilyInet, checked, valid, 0, 0);
 `checked` is the set of checksums the hardware examined; `valid` is the subset that passed. The IOKit stack uses this to skip software re-verification of valid checksums.
 
 IPv6 IP-header checksum (`kChecksumIP`) is never added to `checked` for IPv6 frames — correct, since IPv6 has no header checksum.
+
+---
+
+## Open Items (low priority)
+
+### `mbuf_set_vlan_tag` call-site masking behavior — unresolved (2026-06-20)
+
+Confirmed `_mbuf_set_vlan_tag`/`_mbuf_get_vlan_tag` are genuine imported kernel symbols in the kext binary (`~/trendiokit/Contents/MacOS/TUC-ET5G`), found via `izz~vlan` and as `SET_2` relocations (`ir~vlan`) targeting `0x1f00b0`/`0x1f0178`. Not resolved: the exact call site(s) invoking them, which would confirm whether the kext masks the 16-bit VLAN tag to 12 bits (matching Linux's explicit `& VLAN_VID_MASK` in `aqc111_rx_fixup`) before calling `mbuf_set_vlan_tag`, or passes the raw field through.
+
+Tried and exhausted without success in a single r2 session:
+- `axt @ 0x1f00b0` / `axt @ 0x1f0178` — no xrefs found (standard PLT/GOT xref resolution doesn't model kext-style `kxld` relocation slots)
+- `/r 0x1f00b0` and `/re 0x1f00b0` (reference search, emulation-based reference search) — no hits
+- `/a call qword [rip]` (RIP-relative call pattern search) — no hits
+- Direct byte search for the address in both 4-byte and 8-byte little-endian encodings — no hits, meaning the literal address never appears in the instruction stream, consistent with either a RIP-relative displacement (which a literal-address search can't find) or an indirect call through a register-based table set up elsewhere (e.g. a `lea`-computed base + fixed small offset, which wouldn't show up in either search)
+
+**Next steps if revisited**: try a kext/`kxld`-relocation-aware disassembler (Ghidra or Hopper tend to handle this better than r2's current setup here) rather than more r2 commands, or do a manual linear disassembly walk of `Rx::clean()` and its callees looking for `call`/`mov` instructions with RIP-relative memory operands and computing each target by hand.
+
+**Why this is low priority**: doesn't block VLAN implementation. Linux's explicit `VLAN_VID_MASK` masking is a safe, well-justified default to adopt in this driver regardless of what the closed-source kext precisely did — worst case if the kext skipped masking, that would be a latent kext bug, not a reason for us to skip it too.
