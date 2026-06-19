@@ -66,13 +66,11 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
 - RX checksum offload — validated end-to-end against deterministic good/bad-checksum test traffic, including the IP/TCP error-interaction edge case; see `TESTING.md` and `IMPL_PLAN.md` M6a
 - TX checksum offload — validated end-to-end including a genuine hardware-reset negative control; see `TESTING.md` and `IMPL_PLAN.md` M6b
 - Jumbo MTU control — reports and applies MTU up to 16334; jumbo ICMP traffic
-  validated to the available peer's 9 KB-class limit, with 4K streaming stable
-  at both MTU 1500 and configured MTU 16334; see `TESTING.md`
+  validated up to 16 KB-class frames with matching peer hardware, with 4K
+  streaming stable at both MTU 1500 and configured MTU 16334; see `TESTING.md`
 
 **What is not done yet:**
 - TSO — firmware-based TCP segmentation via TX descriptor MSS field
-- Full 16 KB-class jumbo traffic validation — requires a matching peer and L2
-  path that support MTU 16334 end-to-end
 - VLAN support — hardware supports 802.1Q insertion/stripping and the RX
   descriptor carries a tag, but the current commit has no working VLAN path:
   hardware tag support is not implemented, and software `vlan(4)` tagging is

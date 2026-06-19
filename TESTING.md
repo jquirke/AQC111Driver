@@ -11,8 +11,8 @@ it proved. Organized by feature, newest entries at the top of each section.
 
 Validated 2026-06-19 on the TRENDnet TUC-ET5G as `en9` for MTU control,
 standard-MTU stability, max-configured-MTU stability, and jumbo ICMP traffic
-up to the peer's supported limit. Full 16 KB-class jumbo traffic is not yet
-tested because the available peer tops out below that.
+first to a 9 KB-class peer limit, then to the full 16 KB-class hardware limit
+with a peer that supports it.
 
 ### Methodology
 
@@ -160,23 +160,36 @@ driver's maximum configured MTU. It does not by itself prove full-size 16 KB
 jumbo frames on the wire because the streaming workload does not necessarily
 emit maximum-sized packets.
 
-### Pending — full 16 KB-class jumbo traffic
+### Test 7 — full 16 KB-class jumbo traffic
 
-Still to run with a peer and full L2 path configured for MTU `16334`:
+After adding peer hardware and a full L2 path that support 16 KB-class frames,
+`tcpdump` on `en9` captured repeated near-ceiling ICMP request/reply pairs:
 
-- `ping`/`ping6` with don't-fragment semantics and payload sized near the
-  driver's maximum MTU.
-- `iperf3` or equivalent sustained traffic.
-- `tcpdump`/Wireshark confirmation from the peer or a third-party capture
-  point that full-size frames move intact.
-- Interface error-counter check before/after.
+```text
+tcpdump -ni en9 icmp
+02:11:35.023015 IP 169.254.50.51 > 169.254.113.128: ICMP echo request, id 6277, seq 1, length 16314
+02:11:35.023287 IP 169.254.113.128 > 169.254.50.51: ICMP echo reply, id 6277, seq 1, length 16314
+02:11:36.024149 IP 169.254.50.51 > 169.254.113.128: ICMP echo request, id 6277, seq 2, length 16314
+02:11:36.024385 IP 169.254.113.128 > 169.254.50.51: ICMP echo reply, id 6277, seq 2, length 16314
+02:11:37.025391 IP 169.254.50.51 > 169.254.113.128: ICMP echo request, id 6277, seq 3, length 16314
+02:11:37.025655 IP 169.254.113.128 > 169.254.50.51: ICMP echo reply, id 6277, seq 3, length 16314
+02:11:38.026426 IP 169.254.50.51 > 169.254.113.128: ICMP echo request, id 6277, seq 4, length 16314
+02:11:38.026692 IP 169.254.113.128 > 169.254.50.51: ICMP echo reply, id 6277, seq 4, length 16314
+02:11:39.027234 IP 169.254.50.51 > 169.254.113.128: ICMP echo request, id 6277, seq 5, length 16314
+02:11:39.027437 IP 169.254.113.128 > 169.254.50.51: ICMP echo reply, id 6277, seq 5, length 16314
+```
+
+`tcpdump`'s displayed IPv4 length of `16314`, plus the 14-byte Ethernet
+header, gives roughly `16328` bytes without FCS. That is within the driver's
+configured MTU ceiling (`16334`) and proves full 16 KB-class jumbo RX and TX
+with matching peer hardware.
 
 ### Conclusion
 
 MTU reporting and hardware programming are validated for `1500`, `9000`, and
-`16334`. Jumbo traffic is validated up to the peer-supported 9 KB class.
-Ordinary 4K streaming is stable at both MTU `1500` and configured MTU `16334`.
-Full 16 KB-class jumbo traffic remains untested.
+`16334`. Jumbo traffic is validated both at the earlier 9 KB-class peer limit
+and at the full 16 KB-class hardware limit with a capable peer. Ordinary 4K
+streaming is stable at both MTU `1500` and configured MTU `16334`.
 
 ---
 

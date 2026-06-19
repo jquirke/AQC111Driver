@@ -139,7 +139,7 @@ MTU was previously hardcoded to 1500: `SetMTU()` was a no-op stub, `GetMaxTransf
 
 **Implementation also fixed a gap not in the original plan**: the `IOUserNetworkPacketBufferPool`'s `bufferSize` was hardcoded to `2048` — far too small for a jumbo frame copy in `OnRxComplete`. Resized to `AQC111_MAX_FRAME_LEN` alongside the TX staging buffer (`AQC111_TX_BUF_SIZE`). RX/TX frame lengths are now gated against `ivars->currentMtu + 14` instead of the old hardcoded `1514`.
 
-**Status: validated 2026-06-19** for MTU `1500`/`9000`/`16334` hardware programming and the OS-visible `1280-16334` valid-MTU-range, plus jumbo ICMP traffic up to the test peer's ~9KB-class limit and 4K-streaming stability soak at both MTU `1500` and `16334`. Full methodology in `TESTING.md` "Jumbo Frames / MTU Control". **Full 16KB-class jumbo traffic is deferred, not blocking** — the bench peer tops out around 9KB; the 16KB ceiling will be exercised when this driver gets a proper throughput/perf benching pass later, not treated as an open risk in the meantime.
+**Status: validated 2026-06-19/20** for MTU `1500`/`9000`/`16334` hardware programming and the OS-visible `1280-16334` valid-MTU-range, plus jumbo ICMP traffic first up to the original test peer's ~9KB-class limit and then to the full 16KB-class hardware limit with matching peer hardware (`tcpdump` IPv4 length `16314`, about `16328` bytes at Ethernet without FCS). 4K-streaming stability soaks also passed at both MTU `1500` and configured MTU `16334`. Full methodology in `TESTING.md` "Jumbo Frames / MTU Control".
 
 ### M6d — Endianness cleanup
 
