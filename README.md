@@ -40,16 +40,6 @@ Two DriverKit personalities in a single dext bundle:
 - Registers an `en` Ethernet interface via Skywalk (`RegisterEthernetInterface`)
 - Posts async IO on bulk RX/TX pipes and an interrupt pipe for link status
 
-### Key design lessons (hard won)
-
-Anyone who has done kernel debugging on other platforms will recognise the value of a two-machine setup early — one machine running the driver, another attached for kernel-level inspection. Some of these lessons were learned without that luxury, which is the most thorough way to learn them.
-
-**OSAction callbacks require IIG factory methods.** Raw `OSAction::Create()` produces `OSTypeID(OSAction)`, but the IIG-generated `_Dispatch` switch gates every callback on a typed subclass ID (`OSTypeID(OSAction_ClassName_MethodName)`). The type mismatch causes silent, complete callback drops — no log, no error. Always use `CreateActionOnMethodName()`.
-
-**Never replace the "Default" dispatch queue.** The networking framework installs a kernel-side proxy queue at the "Default" slot in `Start_Impl`. `Stop_Impl` cancels this queue internally and its async completion block dereferences a field at `+0x10` from the proxy's backing object. Replacing "Default" with a plain `IODispatchQueue` puts a null there and crashes at `Stop_Impl+144`. The dext-owned queue should be registered as `"RxDispatchQueue"` / `"TxDispatchQueue"` (the IIG-named Skywalk slots), not as "Default".
-
-**`IOProviderClass` must be `IOUSBHostInterface` for the NIC personality.** Matching on `IOUSBHostDevice` allows `Start()` to succeed and direct method calls to work, but `IOUSBHostPipe` async IO completions are routed through the interface node — a driver matched on the device node is outside that delivery path and never receives callbacks.
-
 ---
 
 ## Current Status
@@ -147,6 +137,18 @@ DriverKit dext `os_log` output is attributed to the `kernel` process.
 **Log verbosity is runtime-controllable** (see `IMPL_PLAN.md` "Log Level Strategy"): defaults to Info via the `AQC111LogLevel` key in `Info.plist`, and can be raised/lowered live without reinstalling via `tools/set-log-level.swift <0-3>` (0=Error, 1=Info, 2=Debug, 3=Verbose — Debug/Verbose include per-packet and hex-dump logging, off by default).
 
 Test methodology and results for features that need more than "it compiled" as evidence — e.g. the RX checksum offload validation — are tracked in `TESTING.md`.
+
+---
+
+## Design Lessons
+
+Anyone who has done kernel debugging on other platforms will recognise the value of a two-machine setup early — one machine running the driver, another attached for kernel-level inspection. Some of these lessons were learned without that luxury, which is the most thorough way to learn them.
+
+**OSAction callbacks require IIG factory methods.** Raw `OSAction::Create()` produces `OSTypeID(OSAction)`, but the IIG-generated `_Dispatch` switch gates every callback on a typed subclass ID (`OSTypeID(OSAction_ClassName_MethodName)`). The type mismatch causes silent, complete callback drops — no log, no error. Always use `CreateActionOnMethodName()`.
+
+**Never replace the "Default" dispatch queue.** The networking framework installs a kernel-side proxy queue at the "Default" slot in `Start_Impl`. `Stop_Impl` cancels this queue internally and its async completion block dereferences a field at `+0x10` from the proxy's backing object. Replacing "Default" with a plain `IODispatchQueue` puts a null there and crashes at `Stop_Impl+144`. The dext-owned queue should be registered as `"RxDispatchQueue"` / `"TxDispatchQueue"` (the IIG-named Skywalk slots), not as "Default".
+
+**`IOProviderClass` must be `IOUSBHostInterface` for the NIC personality.** Matching on `IOUSBHostDevice` allows `Start()` to succeed and direct method calls to work, but `IOUSBHostPipe` async IO completions are routed through the interface node — a driver matched on the device node is outside that delivery path and never receives callbacks.
 
 ---
 
