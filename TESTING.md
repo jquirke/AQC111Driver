@@ -7,6 +7,68 @@ it proved. Organized by feature, newest entries at the top of each section.
 
 ---
 
+## VLAN Support
+
+### Step 0 — baseline test (2026-06-20): confirmed broken before any code changes
+
+Per `IMPL_PLAN.md` M6e's plan, tested whether software VLAN tagging (`vlan(4)`)
+already works against the *unmodified* driver before writing any code.
+
+**Methodology**: built `tools/baseline-vlan0.sh`, a deterministic, idempotent
+test harness (parameterized via env vars, logs every command + exit status)
+that sets up a `vlan0` pseudo-interface on tag `1234` over `en9`, with
+distinct addresses for the parent (`169.254.245.127/16`) and VLAN
+(`169.254.113.129/16`) interfaces, a scoped host route + ARP entry for the
+remote peer pinned to `vlan0` specifically (necessary — without this, macOS
+can cache the peer's MAC on `en0` instead and `ping -b vlan0` fails with "no
+route to host", which would look like a driver bug but isn't one).
+
+**Reference baseline (Apple CDC/ECM, not DriverKit)**: ran the harness
+against the same adapter bound via macOS's built-in CDC fallback driver
+instead of this project's DriverKit driver. Result: `vlan0` produced
+remote-visible `802.1Q` tag `1234` traffic, 0% packet loss over 4 pings.
+This establishes that the adapter, peer, VLAN ID, route, and ARP setup are
+all valid — any failure against the DriverKit driver can't be blamed on the
+test method itself.
+
+**DriverKit result**: re-ran the identical harness against this project's
+(unmodified) driver. Local `tcpdump -eni en9` decodes the outbound ICMP as
+correctly VLAN-tagged:
+
+```text
+3c:8c:f8:f9:d7:a3 > 1c:86:0b:3b:e7:f6, ethertype 802.1Q (0x8100), length 102: vlan 1234, p 0, ethertype IPv4 (0x0800), 169.254.113.129 > 169.254.50.51: ICMP echo request
+```
+
+But **the remote end received no frames at all** for this traffic. Reverting
+to the CDC driver with the identical setup immediately restored working,
+remote-visible VLAN traffic. This is the same "local capture isn't
+authoritative" lesson from TX checksum offload testing, now confirming an
+actual bug rather than just a methodology gap: something in the DriverKit
+TX path silently drops or mangles VLAN-tagged (4-byte-oversized) frames
+before they leave the device, despite the local buffer/capture looking
+superficially correct.
+
+**Ruled out as a separate issue**: the local packet hex shows IP header
+checksum `0000` at this capture point — this is the expected TX-checksum-
+offload placeholder behavior already validated in M6b (driver hands a
+zero checksum to hardware, which is supposed to fill it in before
+transmission), not evidence of a second, unrelated bug. Worth stating
+explicitly since it would be easy to misread as "two things are broken"
+when only VLAN handling actually is.
+
+**Conclusion**: VLAN support is not "not implemented yet," it's actively
+broken in the DriverKit TX path for any VLAN-tagged frame, even via the
+software-only `vlan(4)` accommodation path that's supposed to need zero
+driver code changes. Next step is `IMPL_PLAN.md` M6e's Layer 1
+implementation, instrumented to find out exactly what happens to the extra
+4 bytes between submission and the wire, rather than assuming the
+predicted size-check rejection is the root cause without checking.
+
+Raw logs: `notes/setup-vlan0.log`, `notes/baseline-vlan0.log`,
+`notes/diag-vlan0.log`. Full narrative: `notes/cdc-vlan-baseline-2026-06-20.md`.
+
+---
+
 ## Jumbo Frames / MTU Control
 
 Validated 2026-06-19 on the TRENDnet TUC-ET5G as `en9` for MTU control,
