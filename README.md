@@ -68,8 +68,14 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
 - TSO — firmware-based TCP segmentation via TX descriptor MSS field
 - Hardware VLAN tag insert/strip — the AQC111U supports this in silicon and
   the RX/TX descriptors carry VLAN metadata, but the current supported path is
-  software `vlan(4)` with inline 802.1Q tags. Hardware offload remains a
-  separate future optimization; see `IMPL_PLAN.md` M6e.
+  software `vlan(4)` with inline 802.1Q tags, which works fully. Hardware
+  offload is a performance optimization, not a functional gap, and is
+  **blocked**: `IOUserNetworkPacket::getVlanTag()`/`setVlanTag()` require a
+  `kFeatureHardwareVlan` capability per their doc comments, but that constant
+  doesn't exist anywhere in the public SDK headers — confirmed exhaustively
+  (every combination of the related public mechanisms tested, none gate it).
+  Posted to Apple Developer Forums:
+  https://developer.apple.com/forums/thread/835355. See `IMPL_PLAN.md` M6e.
 - Wake-on-LAN — magic packet path exists in hardware; not wired up
 - PHY access polymorphism — the AQC111U has two PHY control interfaces selected by firmware major version (`>= 0x80` → `FWPhyAccess` via bRequest=0x61; `< 0x80` → `DirectPhyAccess` via bRequest=0x31/0x32). The driver reads and logs the firmware version at start but unconditionally uses the `FWPhyAccess` path. This is correct for the DUT (firmware `major=0x82`). Support for older `DirectPhyAccess` devices is not implemented.
 - TX ring depth — the TX path submits one frame at a time and waits for USB completion before submitting the next (`txBusy`/`txInFlight` single-slot gate). RX uses 10 outstanding buffers in flight; TX has no equivalent pipelining, which caps achievable throughput well short of the link's 5 Gbps ceiling under sustained load.

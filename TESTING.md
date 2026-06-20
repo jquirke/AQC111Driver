@@ -163,6 +163,33 @@ mental model going forward should be: **the hardware register write is
 what actually makes VLAN traffic work; the DriverKit-level declarations
 only affect MTU accounting.**
 
+### Step 1d — the last combination (2026-06-20): exhaustive, still no change
+
+One permutation remained untried: bit removed **and** `SetSoftwareVlanSupport(false)`
+called together, in case `getVlanTag()`/`setVlanTag()` metadata delivery
+only activates when both signals agree the driver has no software
+fallback. Real attach/reinstall (temporary, reverted after testing —
+not a design change). Result: identical to every prior combination —
+inline tag still present (`81 00 04 d2`) in both directions, `getVlanTag()`
+still `false`.
+
+All four combinations of {bit on/off} × {call true/false/absent} have now
+been tested:
+
+| Bit | Call | Tag delivery | `vlan0` MTU |
+|-----|------|---------------|-------------|
+| on  | true (shipped originally) | inline, works | 1500 |
+| on  | false | inline, works | 1500 |
+| off | absent | inline, works | 1496 |
+| off | false | inline, works | 1496 |
+
+**Conclusion:** no combination of these two mechanisms changes tag-delivery
+behavior — only the bit's effect on MTU varies. Whatever actually gates
+real hardware-VLAN metadata delivery (`kFeatureHardwareVlan` per the SDK
+doc comment) is not reachable through either mechanism, in any
+combination, on this SDK. Reverted to the validated shipped state (bit
+declared, no call) after this test.
+
 ### Step 0 — baseline test (2026-06-20): confirmed broken before any code changes
 
 Per `IMPL_PLAN.md` M6e's plan, tested whether software VLAN tagging (`vlan(4)`)
