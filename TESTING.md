@@ -87,11 +87,81 @@ That is the expected negative result and proves the fix did not flatten all
 tagged parent traffic into `vlan0`.
 
 **Conclusion:** M6e Layer 1 software VLAN support is validated. Required pieces
-are `SetSoftwareVlanSupport(true)`, declaring `kIOUserNetworkHWAssistSoftwareVlan`,
-allowing `+4` bytes in TX/RX frame-size checks and buffers, and disabling
-hardware VLAN stripping (`SFR_VLAN_ID_CONTROL=0x00`) until a future hardware
-VLAN metadata path exists. Hardware tag insert/strip remains out of scope for
-this pass.
+are declaring `kIOUserNetworkHWAssistSoftwareVlan`, allowing `+4` bytes in
+TX/RX frame-size checks and buffers, and disabling hardware VLAN stripping
+(`SFR_VLAN_ID_CONTROL=0x00`) until a future hardware VLAN metadata path
+exists. Hardware tag insert/strip remains out of scope for this pass.
+
+### Step 1b — is `SetSoftwareVlanSupport()` actually load-bearing? (2026-06-20)
+
+Tested whether the dedicated `SetSoftwareVlanSupport()` call matters on its
+own, separately from the `kIOUserNetworkHWAssistSoftwareVlan` HWAssist bit,
+since both were added together in Step 1 and never tested independently.
+
+**First attempt (inconclusive): live toggle.** Added temporary scaffolding —
+a process-global pointer to the live `AQC111NIC` instance, a new
+`IOUserClient` selector, and a small CLI tool — to call
+`SetSoftwareVlanSupport()` from userspace mid-flow, without a dext reinstall.
+Toggling it live (both directions) produced zero observable change: inline
+tag still present, `getVlanTag()` still `false`, wire behavior identical.
+Inconclusive on its own — the value is almost certainly consulted once at
+attach/`RegisterEthernetInterface` time, so a live toggle after attach can't
+distinguish "this call doesn't matter" from "this call matters, but only
+at attach time." The scaffolding was reverted (not kept) once this became
+clear.
+
+**Second attempt (decisive): attach-time disagreement.** Changed `Start()`
+to call `SetSoftwareVlanSupport(false)` while deliberately leaving
+`kIOUserNetworkHWAssistSoftwareVlan` declared in `AQC111_HWASSIST_MASK` —
+an explicit disagreement between the two mechanisms. Rebuilt, reinstalled
+(a real attach, not a live toggle), and retested against `tools/setup-
+vlan1234.sh`. Result: VLAN tagging kept working identically — `vlan0`
+correctly configured, inline tag still arrived intact (`81 00 04 d2`
+visible in both `txDrainOne`'s diagnostic and a raw `tcpdump` capture),
+full bidirectional ICMP still passed.
+
+**Conclusion:** `SetSoftwareVlanSupport()`'s value has no observable effect
+on this DriverKit version. The call has been removed entirely from
+`Start()`. (See Step 1c below for what the HWAssist bit itself actually
+turned out to control — it is not the tag-delivery mechanism either.)
+
+### Step 1c — what does the HWAssist bit itself actually do? (2026-06-20)
+
+Step 1b showed `SetSoftwareVlanSupport()` doesn't matter. Natural follow-up:
+does `kIOUserNetworkHWAssistSoftwareVlan` itself matter, or is something
+else (the `SFR_VLAN_ID_CONTROL` hardware fix from Step 1) doing all the
+real work?
+
+**Test:** removed `kIOUserNetworkHWAssistSoftwareVlan` from
+`AQC111_HWASSIST_MASK` entirely (not just the method call), real
+attach/reinstall, retested against `tools/setup-vlan1234.sh`.
+
+**Result:** VLAN tag delivery/demux kept working identically in both
+directions — `txDrainOne`'s diagnostic and `OnRxComplete`'s frame log both
+still showed the inline tag (`81 00 04 d2`, `type=0x8100`) exactly as
+before. The one thing that *did* change: `ifconfig vlan0` reported `mtu
+1496` instead of `1500` (BSD's standard clamp for an interface it believes
+doesn't support `IFNET_VLAN_MTU`).
+
+```text
+# bit removed:
+vlan0: ... mtu 1496 ...
+
+# bit declared (normal/restored state):
+vlan0: ... mtu 1500 ...
+```
+
+**Conclusion:** `kIOUserNetworkHWAssistSoftwareVlan` controls *only*
+`vlan(4)`'s MTU bookkeeping — whether the VLAN sub-interface gets the
+parent's full MTU or is clamped down by 4 bytes. It does not gate whether
+tagging/demuxing actually happens; that's governed entirely by
+`SFR_VLAN_ID_CONTROL` (RX hardware strip, see Step 1) and the OS's
+unconditional software tag insertion on TX. The bit has been restored
+(losing 4 bytes of MTU for no reason is a real downside, and the `+4`
+size-check headroom already exists regardless of this bit), but the
+mental model going forward should be: **the hardware register write is
+what actually makes VLAN traffic work; the DriverKit-level declarations
+only affect MTU accounting.**
 
 ### Step 0 — baseline test (2026-06-20): confirmed broken before any code changes
 

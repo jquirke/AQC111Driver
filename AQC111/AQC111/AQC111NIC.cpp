@@ -157,11 +157,19 @@ applyLogLevelFromDictionary(OSDictionary *dict)
 
 // Full hwAssist capability mask this driver declares via getFeatureFlags()
 // and self-initializes hwAssistMask to. Shared by both so they can't drift.
+//
+// kIOUserNetworkHWAssistSoftwareVlan: confirmed (IMPL_PLAN.md M6e Step 1c)
+// to control only vlan(4)'s MTU bookkeeping (vlan0 gets the parent's full
+// MTU instead of being clamped down by 4) — it does not gate whether VLAN
+// tag delivery/demux actually happens, which is governed entirely by
+// SFR_VLAN_ID_CONTROL (see hwOnLinkUp) and the OS's own software tagging.
+// Still kept declared: losing 4 bytes of MTU for no reason is a real,
+// avoidable downside once the +4 size-check headroom already exists.
 #define AQC111_HWASSIST_MASK ( \
     kIOUserNetworkHWAssistRxChecksum | \
+    kIOUserNetworkHWAssistSoftwareVlan | \
     kIOUserNetworkHWAssistTxChecksumIPHdr | \
     kIOUserNetworkHWAssistTxChecksumTCP | \
-    kIOUserNetworkHWAssistSoftwareVlan | \
     kIOUserNetworkHWAssistTxChecksumUDP)
 
 // RX Packet Descriptor checksum sub-fields (lower 16 bits of pd; see
@@ -589,15 +597,6 @@ IMPL(AQC111NIC, Start)
         goto fail;
     }
     LogI("Start: RegisterEthernetInterface OK");
-
-    // Declare VLAN_MTU accommodation (IMPL_PLAN.md M6e) — without this call,
-    // the OS's vlan(4) software-tagging layer can't assume this interface
-    // tolerates a 4-byte-larger frame. Best-effort capability nudge, not
-    // fatal to Start() if it fails.
-    {
-        kern_return_t vlanRet = SetSoftwareVlanSupport(true);
-        LogI("Start: SetSoftwareVlanSupport(true) -> 0x%x", vlanRet);
-    }
 
     // --- TX path ---
     // Wire up TxPacketAvailable: stack notifies via IODataQueueDispatchSource
