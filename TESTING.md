@@ -93,6 +93,50 @@ Forced media selection works end-to-end across the full rate range this hardware
 
 ---
 
+## Promiscuous Mode
+
+### Methodology: testing without switch mirroring
+
+Test rig is a direct point-to-point link (no switch in the path), so a frame addressed to a foreign (non-matching, non-broadcast/multicast) destination MAC already reaches this NIC's physical layer regardless of destination — no port mirroring needed. The only open question is whether *this driver's own* hardware filter (`SFR_RX_CTL`, lacking the `PRO` bit by default) drops it before it reaches `OnRxComplete`. Crafted the foreign-MAC frame from the remote Linux peer with `scapy` (`nmap`/`nping`'s `-e <iface>` hit a known long-interface-name limitation with `enx<mac>`-style USB Ethernet names, so used `scapy.sendp()` instead, which has no such limit):
+
+```python
+from scapy.all import sendp, Ether, IP, ICMP
+sendp(Ether(dst='02:00:00:00:00:99')/IP(dst='1.2.3.4')/ICMP(), iface='enx1c860b3be7f6', count=3)
+```
+
+### Negative control (2026-06-23): confirmed broken before implementation
+
+Before adding any real logic, `SetPromiscuousModeEnable` logged and returned success with no hardware effect. Sent the foreign-MAC frame above; confirmed **nothing** appeared in `tcpdump -i en9 icmp` *and* nothing appeared in the dext log (no `OnRxComplete`/`RX[...]` entries) — the hardware filter silently dropped it before the frame ever reached the driver. Note: `SetPromiscuousModeEnable` being *called* (e.g. by running `tcpdump`/Wireshark locally, which requests promiscuous capture mode via BPF regardless of this test) doesn't contaminate this result — the stub didn't touch hardware either way at this point.
+
+### Implementation
+
+Added `ivars->rxFilterBits` and a shared `doSetPromiscuousMode()` helper toggling `SFR_RX_CTL_PRO` (`0x0001`); `hwOnLinkUp` now ORs in the stored bits instead of hardcoding `0x0288`. Implemented both the deprecated capital `SetPromiscuousModeEnable` and the modern lowercase `setPromiscuousModeEnable`, both routing to the same helper. See `IMPL_PLAN.md` M6g.
+
+### Positive validation (2026-06-23)
+
+Enabled promiscuous mode (confirmed empirically this fires through the deprecated capital form, not the lowercase one, on this NDK — see "Known Risk Points" in `IMPL_PLAN.md`):
+
+```text
+doSetPromiscuousMode: rxFilterBits=0x0001 (interfaceEnabled=1)
+doSetPromiscuousMode: RX_CTL=0x0289 -> 0x0
+```
+
+Re-sent the identical foreign-MAC frame — now visible in `tcpdump -i en9 icmp`:
+
+```text
+06:13:48.158335 a8:e2:91:12:c6:2b > 02:00:00:00:00:99, ethertype IPv4 (0x0800), length 60: 192.168.0.88 > 1.2.3.4: ICMP echo request, id 0, seq 0, length 8
+```
+
+### Negative control, repeated with promiscuous mode off (2026-06-23)
+
+Disabled promiscuous mode (`RX_CTL` back to `0x0288`, `SFR_RX_CTL_PRO` cleared), then re-checked with `tcpdump -n -e --no-promiscuous-mode -i en9 icmp` — the `--no-promiscuous-mode` flag specifically to rule out `tcpdump` itself re-requesting promiscuous capture and contaminating this half of the test. Result: nothing captured, confirming the toggle genuinely controls the behavior in both directions, not just a one-shot positive result.
+
+### Conclusion
+
+Promiscuous mode works end-to-end: OS → `SetPromiscuousModeEnable`/`setPromiscuousModeEnable` → `SFR_RX_CTL_PRO` write → confirmed change in actual frame admission on the wire (not just a register write with assumed effect), in both the enable and disable direction, with the disable direction specifically verified against `tcpdump` self-contamination.
+
+---
+
 ## VLAN Support
 
 ### Step 1 — Layer 1 fix (2026-06-20): software VLAN path validated end-to-end

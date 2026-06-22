@@ -80,6 +80,13 @@ public:
     virtual kern_return_t
     SetPromiscuousModeEnable(bool enable) override;
 
+    // Modern replacement for SetPromiscuousModeEnable above — confirmed
+    // empirically (2026-06-23) that the deprecated capital form is what
+    // Skywalk actually calls on this NDK, but both route to the same shared
+    // logic in case a future release switches. See IMPL_PLAN.md M6g.
+    virtual kern_return_t
+    setPromiscuousModeEnable(bool enable) override LOCALONLY;
+
     virtual kern_return_t
     SetAllMulticastModeEnable(bool enable) override;
 

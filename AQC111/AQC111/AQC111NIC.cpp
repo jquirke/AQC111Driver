@@ -319,6 +319,11 @@ struct AQC111NIC_IVars {
     // ifconfig down/up cycle instead of silently reverting to full
     // autoneg. See IMPL_PLAN.md M6f.
     uint32_t                            phyAdvertiseMask;
+    // RX_CTL filter bits beyond the fixed IPE|START|AB base (e.g.
+    // SFR_RX_CTL_PRO for promiscuous mode) — stored here, not a hwOnLinkUp-
+    // local literal, so the setting survives a later ifconfig down/up cycle
+    // instead of silently reverting on the next link-up. See IMPL_PLAN.md M6g.
+    uint16_t                            rxFilterBits;
     // Dext-owned queue for OSAction callbacks (USB async IO).
     // CopyDispatchQueue("Default") returns the kernel-side networking proxy queue
     // which doesn't deliver OSAction callbacks into our process.
@@ -1145,7 +1150,7 @@ hwOnLinkUp(AQC111NIC_IVars *ivars, uint8_t speedCode)
     // The x86 path also touches speed-dependent secondary controls here
     // (0x0046, 0x009e). Keep this patch minimal and focus first on the
     // must-have RX producer enables.
-    rxCtl = 0x0288;  // default hwSetFilters: IPE | START | AB
+    rxCtl = 0x0288 | ivars->rxFilterBits;  // base: IPE | START | AB, plus any OS-requested filter bits
     r = aqWrite16(iface, 0x000B, rxCtl);
     LogI("hwOnLinkUp: RX_CTL=0x%04x -> 0x%x", rxCtl, r);
 }
@@ -1736,8 +1741,43 @@ AQC111NIC::getFeatureFlags()
     return AQC111_HWASSIST_MASK;
 }
 
+// Shared by both the deprecated SetPromiscuousModeEnable and its modern
+// lowercase replacement setPromiscuousModeEnable, since it's not yet known
+// (without testing each macOS/NDK release) which one Skywalk actually calls
+// — see IMPL_PLAN.md "Known Risk Points" for the M6f/M6g/M6h policy this
+// follows. Toggles SFR_RX_CTL_PRO (0x0001) in the stored filter-bits ivar
+// and, if the interface is already up, applies it live; otherwise it takes
+// effect on the next hwOnLinkUp.
+static kern_return_t
+doSetPromiscuousMode(AQC111NIC_IVars *ivars, bool enable)
+{
+    if (enable) {
+        ivars->rxFilterBits |= 0x0001u;  // SFR_RX_CTL_PRO
+    } else {
+        ivars->rxFilterBits &= ~0x0001u;
+    }
+    LogI("doSetPromiscuousMode: rxFilterBits=0x%04x (interfaceEnabled=%d)",
+        ivars->rxFilterBits, ivars->interfaceEnabled);
+
+    if (ivars->interfaceEnabled && ivars->interface != nullptr) {
+        uint16_t rxCtl = 0x0288 | ivars->rxFilterBits;
+        kern_return_t r = aqWrite16(ivars->interface, 0x000B, rxCtl);
+        LogI("doSetPromiscuousMode: RX_CTL=0x%04x -> 0x%x", rxCtl, r);
+        return r;
+    }
+    return kIOReturnSuccess;
+}
+
 // --- Dispatched overrides ---
 
+// TODO: SetInterfaceEnable is the deprecated capital form (IOUserNetworkEthernet.iig:
+// "@deprecated, use setInterfaceEnable instead"); the lowercase setInterfaceEnable
+// (LOCALONLY NDK_21) is the documented modern replacement. Confirmed empirically this
+// whole project that the OS calls the deprecated form on this NDK (every ifconfig
+// up/down logs here), so this is not currently broken — but for consistency with the
+// "implement both, one shared helper" policy adopted for promiscuous/multicast (see
+// IMPL_PLAN.md M6g/M6h), setInterfaceEnable should eventually forward to the same
+// logic too, in case a future macOS/NDK release switches which one Skywalk calls.
 kern_return_t
 IMPL(AQC111NIC, SetInterfaceEnable)
 {
@@ -1804,7 +1844,14 @@ kern_return_t
 IMPL(AQC111NIC, SetPromiscuousModeEnable)
 {
     LogI("SetPromiscuousModeEnable: %d", enable);
-    return kIOReturnSuccess;
+    return doSetPromiscuousMode(ivars, enable);
+}
+
+kern_return_t
+AQC111NIC::setPromiscuousModeEnable(bool enable)
+{
+    LogI("setPromiscuousModeEnable (lowercase): %d", enable);
+    return doSetPromiscuousMode(ivars, enable);
 }
 
 kern_return_t
@@ -1821,6 +1868,13 @@ IMPL(AQC111NIC, SetMulticastAddresses)
     return kIOReturnSuccess;
 }
 
+// TODO: SelectMediaType is the deprecated capital form ("@deprecated, use
+// handleChosenMedia instead"). Confirmed empirically (2026-06-23, IMPL_PLAN.md M6f)
+// that the OS actually calls handleChosenMedia for ifconfig media changes, not this
+// one — left as a no-op stub deliberately. For consistency with the "implement both,
+// one shared helper" policy adopted for promiscuous/multicast (IMPL_PLAN.md M6g/M6h),
+// this should eventually forward to the same logic handleChosenMedia uses, in case
+// some caller still invokes this legacy path.
 kern_return_t
 IMPL(AQC111NIC, SelectMediaType)
 {
