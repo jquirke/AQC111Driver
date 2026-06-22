@@ -137,6 +137,42 @@ Promiscuous mode works end-to-end: OS → `SetPromiscuousModeEnable`/`setPromisc
 
 ---
 
+## Multicast Filtering
+
+### Methodology
+
+Same direct point-to-point rig as Promiscuous Mode above (no switch needed). Crafted multicast test addresses by picking an administratively-scoped multicast IP and deriving its Ethernet MAC by hand (`01:00:5e` + low 23 bits of the IP), choosing the last octet specifically to land on a hash bucket *not* already occupied by whatever real multicast groups macOS has standing at the time — confirmed by computing the driver's exact CRC32/`bitrev32` hash algorithm in a standalone Python script *before* touching the driver code, so the implementation could be checked against an independent reference rather than just "does it look plausible."
+
+### Negative control (2026-06-23): confirmed broken before implementation
+
+Before adding real logic, `SetAllMulticastModeEnable`/`SetMulticastAddresses` logged and returned success with no hardware effect. Sent a frame to a derived multicast MAC (`01:00:5e:7f:01:63`, IP `239.255.1.99`) via `scapy`; confirmed nothing in `tcpdump` or the dext log.
+
+### Implementation
+
+`doSetAllMulticastMode()` toggles `SFR_RX_CTL_AMALL`. `doSetMulticastAddresses()` computes the CRC32/`bitrev32` hash bucket for each address (logging the byte/bit breakdown per address for runtime visibility), writes the 8-byte table to `SFR_MULTI_FILTER_ARRY`, toggles `SFR_RX_CTL_AM`, and falls back to `AMALL` instead of a partial table when the OS hands over more groups than `AQ_MAX_MCAST_ADDRESSES` (64, matching Linux) can represent — mirroring Linux's mutual exclusion exactly, not an additive/always-write-the-table approach. See `IMPL_PLAN.md` M6h.
+
+### Positive validation — per-address hash filtering (2026-06-23)
+
+The macOS box already has ~6-8 standing multicast group memberships (IPv6 solicited-node ×2, all-nodes, mDNS v4/v6, STP/bridge management) that get handed to the driver automatically. Confirmed the hash computation against all of them matched a from-scratch Python port computed independently, including byte-for-byte agreement on the resulting filter table dump (e.g. `filter=00 c0 00 02 00 40 01 40` decoding exactly to the logged per-address bits).
+
+Joined a real IP multicast group (`239.255.1.1` → `01:00:5e:7f:01:01`, chosen to land on bucket 18, confirmed clear of the existing occupied buckets `{14,15,25,46,48,62}`) via a Python `IP_ADD_MEMBERSHIP` socket on `en9`. Log confirmed `doSetMulticastAddresses[0]: mac=01:00:5e:7f:01:01 hashBit=18 (byte=2 bit=2)` and the filter dump gained exactly that bit. Sent a real UDP packet to that group from the Linux peer — note the first attempt sent nothing, because the sender's outgoing interface for a multicast destination is chosen by the routing table (`ip route get 239.255.1.1` showed it picked the wrong NIC, `wlp2s0`), not by which interface you "meant"; fixed by setting `IP_MULTICAST_IF` explicitly to the correct interface's address. After that fix: the Mac-side listening socket printed `Received 15 bytes from (...)` — real application-level delivery, not just visible in `tcpdump`.
+
+### Negative control, repeated against the real table (2026-06-23)
+
+Computed a second address (`239.255.1.2` → `01:00:5e:7f:01:02`, bucket 5) deliberately chosen to avoid every bucket occupied by the real, currently-joined group list. Sent a frame to it *without* joining that group — confirmed dropped, including against `tcpdump --no-promiscuous-mode` to rule out self-contamination. Proves the filter is discriminating by hash bit, not admitting multicast wholesale.
+
+### AMALL fallback validation (2026-06-23)
+
+Temporarily lowered `AQ_MAX_MCAST_ADDRESSES` to `5` in a real build (the macOS box's own standing multicast joins already exceed that, so no manual group creation needed to trigger it). Confirmed in the log: `doSetMulticastAddresses: count=7 exceeds max 5, falling back to AMALL`, and `RX_CTL` gained the `AMALL` bit (decoded `0x029a` = `IPE|START|AB|AM|AMALL`). Re-sent the *same* non-colliding negative-control address from above (`01:00:5e:7f:01:02`, hash bit 5, confirmed absent from the live filter table at the time) — now **admitted**, flipping the earlier confirmed-dropped result. This proves `AMALL` genuinely bypasses per-address filtering rather than the admission being a coincidental table match. Restored `AQ_MAX_MCAST_ADDRESSES` to `64` afterward.
+
+### Conclusion
+
+Multicast filtering works end-to-end across both mechanisms: per-address CRC32-hash filtering (verified against an independent reference implementation and real socket delivery, not just register writes) and the `AMALL` accept-all fallback for when the address count exceeds the hash table's capacity (verified to actually bypass per-address filtering, not just set a bit with assumed effect).
+
+**Not validated:** only the overflow→`AMALL` direction was tested here — the count dropping back under the threshold afterward was not, and reasoning through that direction surfaced a real bug (the fallback can never retract once triggered, since nothing clears it). See `IMPL_PLAN.md` "Bug fix plan — AMALL fallback can never be retracted once triggered by address-count overflow".
+
+---
+
 ## VLAN Support
 
 ### Step 1 — Layer 1 fix (2026-06-20): software VLAN path validated end-to-end

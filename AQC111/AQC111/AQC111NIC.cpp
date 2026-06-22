@@ -139,6 +139,13 @@ applyLogLevelFromDictionary(OSDictionary *dict)
 #define AQ_VLAN_CONTROL_NONE            0x00
 #define AQ_VLAN_CONTROL_STRIP_ENABLE    0x10
 
+// Max multicast groups the 64-bucket hash table can represent precisely
+// before falling back to accept-all-multicast (matches Linux's AQ_MAX_MCAST
+// in aqc111_set_rx_mode). Validated 2026-06-23 with this temporarily lowered
+// to 5 against the handful of multicast groups macOS already joins by
+// default — see IMPL_PLAN.md M6h / TESTING.md "Multicast Filtering".
+#define AQ_MAX_MCAST_ADDRESSES          64
+
 #define AQ_PAUSE_WATERMARK_LOW_BYTE     0
 #define AQ_PAUSE_WATERMARK_HIGH_BYTE    1
 #define AQ_PAUSE_WATERMARK_LEN          2
@@ -1741,13 +1748,28 @@ AQC111NIC::getFeatureFlags()
     return AQC111_HWASSIST_MASK;
 }
 
+// Applies the current ivars->rxFilterBits to live hardware if the interface
+// is enabled; shared by every setter that changes rxFilterBits (promiscuous,
+// all-multicast, multicast hash) so they all write through one path. If the
+// interface isn't up yet, the bits still take effect on the next hwOnLinkUp
+// since hwOnLinkUp itself ORs in ivars->rxFilterBits (see IMPL_PLAN.md M6g).
+static kern_return_t
+applyRxFilterBits(AQC111NIC_IVars *ivars)
+{
+    if (!ivars->interfaceEnabled || ivars->interface == nullptr) {
+        return kIOReturnSuccess;
+    }
+    uint16_t rxCtl = 0x0288 | ivars->rxFilterBits;
+    kern_return_t r = aqWrite16(ivars->interface, 0x000B, rxCtl);
+    LogI("applyRxFilterBits: RX_CTL=0x%04x -> 0x%x", rxCtl, r);
+    return r;
+}
+
 // Shared by both the deprecated SetPromiscuousModeEnable and its modern
 // lowercase replacement setPromiscuousModeEnable, since it's not yet known
 // (without testing each macOS/NDK release) which one Skywalk actually calls
 // — see IMPL_PLAN.md "Known Risk Points" for the M6f/M6g/M6h policy this
-// follows. Toggles SFR_RX_CTL_PRO (0x0001) in the stored filter-bits ivar
-// and, if the interface is already up, applies it live; otherwise it takes
-// effect on the next hwOnLinkUp.
+// follows. Toggles SFR_RX_CTL_PRO (0x0001) in the stored filter-bits ivar.
 static kern_return_t
 doSetPromiscuousMode(AQC111NIC_IVars *ivars, bool enable)
 {
@@ -1758,14 +1780,114 @@ doSetPromiscuousMode(AQC111NIC_IVars *ivars, bool enable)
     }
     LogI("doSetPromiscuousMode: rxFilterBits=0x%04x (interfaceEnabled=%d)",
         ivars->rxFilterBits, ivars->interfaceEnabled);
+    return applyRxFilterBits(ivars);
+}
 
-    if (ivars->interfaceEnabled && ivars->interface != nullptr) {
-        uint16_t rxCtl = 0x0288 | ivars->rxFilterBits;
-        kern_return_t r = aqWrite16(ivars->interface, 0x000B, rxCtl);
-        LogI("doSetPromiscuousMode: RX_CTL=0x%04x -> 0x%x", rxCtl, r);
-        return r;
+// Same consistency policy as doSetPromiscuousMode. Toggles SFR_RX_CTL_AMALL
+// (0x0002). See IMPL_PLAN.md M6h.
+static kern_return_t
+doSetAllMulticastMode(AQC111NIC_IVars *ivars, bool enable)
+{
+    if (enable) {
+        ivars->rxFilterBits |= 0x0002u;  // SFR_RX_CTL_AMALL
+    } else {
+        ivars->rxFilterBits &= ~0x0002u;
     }
-    return kIOReturnSuccess;
+    LogI("doSetAllMulticastMode: rxFilterBits=0x%04x (interfaceEnabled=%d)",
+        ivars->rxFilterBits, ivars->interfaceEnabled);
+    return applyRxFilterBits(ivars);
+}
+
+// Standard reflected CRC32 (poly 0xEDB88320) — same algorithm as zlib's
+// crc32/Linux's crc32_le. Used only by aqMulticastHashBit below.
+static uint32_t
+crc32Le(uint32_t crc, const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320u : (crc >> 1);
+        }
+    }
+    return crc;
+}
+
+static uint32_t
+bitrev32(uint32_t x)
+{
+    x = ((x & 0x55555555u) << 1) | ((x & 0xAAAAAAAAu) >> 1);
+    x = ((x & 0x33333333u) << 2) | ((x & 0xCCCCCCCCu) >> 2);
+    x = ((x & 0x0F0F0F0Fu) << 4) | ((x & 0xF0F0F0F0u) >> 4);
+    x = ((x & 0x00FF00FFu) << 8) | ((x & 0xFF00FF00u) >> 8);
+    return (x << 16) | (x >> 16);
+}
+
+// AQC111's multicast hash filter is a 64-bucket table (8 bytes,
+// SFR_MULTI_FILTER_ARRY) indexed by the top 6 bits of
+// ether_crc(mac) == bitrev32(crc32_le(~0, mac, 6)). Matches Linux
+// aqc111_set_rx_mode (notes/aqc111.c:550-551) exactly — verified against a
+// from-scratch port of this exact algorithm before implementing here
+// (01:00:5e:7f:01:63 -> bucket 25, byte 3 bit 1).
+static uint32_t
+aqMulticastHashBit(const uint8_t mac[6])
+{
+    uint32_t crc = crc32Le(0xFFFFFFFFu, mac, 6);
+    uint32_t etherCrc = bitrev32(crc);
+    return etherCrc >> 26;
+}
+
+// Shared by both the deprecated SetMulticastAddresses and its modern
+// lowercase replacement setMulticastAddresses. addresses is a flat array of
+// count 6-byte MAC octets (IOUserNetworkMACAddress and ether_addr_t are both
+// exactly { uint8_t octet[6]; }, so callers just reinterpret_cast their
+// pointer). If count exceeds AQ_MAX_MCAST_ADDRESSES, falls back to AMALL
+// instead of the hash table (mirrors Linux aqc111_set_rx_mode's mutual
+// exclusion exactly — no point representing a partial/imprecise table when
+// AMALL already admits everything). Otherwise writes the computed hash table
+// to SFR_MULTI_FILTER_ARRY (not touched anywhere else, so it needs no
+// re-apply-on-link-up like rxFilterBits does) and toggles SFR_RX_CTL_AM
+// (0x0010) based on count > 0. See IMPL_PLAN.md M6h.
+static kern_return_t
+doSetMulticastAddresses(AQC111NIC_IVars *ivars, const uint8_t *addresses, uint32_t count)
+{
+    // Too many groups for the 64-bucket hash table to represent precisely —
+    // fall back to accept-all-multicast instead (mirrors Linux's
+    // mc_count > AQ_MAX_MCAST check). Sticky until an explicit
+    // SetAllMulticastModeEnable(false) — not cleared just because count
+    // later drops back under the threshold, to avoid clobbering an
+    // independently-requested AMALL state from that separate call.
+    if (count > AQ_MAX_MCAST_ADDRESSES) {
+        ivars->rxFilterBits |= 0x0002u;  // SFR_RX_CTL_AMALL
+        LogI("doSetMulticastAddresses: count=%u exceeds max %u, falling back to AMALL",
+            count, AQ_MAX_MCAST_ADDRESSES);
+        return applyRxFilterBits(ivars);
+    }
+
+    uint8_t filter[8] = {};
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *mac = addresses + i * 6;
+        uint32_t bit = aqMulticastHashBit(mac);
+        filter[bit >> 3] |= (uint8_t)(1u << (bit & 7));
+        LogI("doSetMulticastAddresses[%u]: mac=%02x:%02x:%02x:%02x:%02x:%02x hashBit=%u (byte=%u bit=%u)",
+            i, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            bit, bit >> 3, bit & 7);
+    }
+
+    kern_return_t r = kIOReturnSuccess;
+    if (ivars->interface != nullptr) {
+        r = aqWrite(ivars->interface, 0x0016, filter, sizeof(filter));  // SFR_MULTI_FILTER_ARRY
+        LogI("doSetMulticastAddresses: count=%u filter=%02x %02x %02x %02x %02x %02x %02x %02x -> 0x%x",
+            count, filter[0], filter[1], filter[2], filter[3],
+            filter[4], filter[5], filter[6], filter[7], r);
+    }
+
+    if (count > 0) {
+        ivars->rxFilterBits |= 0x0010u;  // SFR_RX_CTL_AM
+    } else {
+        ivars->rxFilterBits &= ~0x0010u;
+    }
+    kern_return_t r2 = applyRxFilterBits(ivars);
+    return (r != kIOReturnSuccess) ? r : r2;
 }
 
 // --- Dispatched overrides ---
@@ -1858,14 +1980,28 @@ kern_return_t
 IMPL(AQC111NIC, SetAllMulticastModeEnable)
 {
     LogI("SetAllMulticastModeEnable: %d", enable);
-    return kIOReturnSuccess;
+    return doSetAllMulticastMode(ivars, enable);
+}
+
+kern_return_t
+AQC111NIC::setAllMulticastModeEnable(bool enable)
+{
+    LogI("setAllMulticastModeEnable (lowercase): %d", enable);
+    return doSetAllMulticastMode(ivars, enable);
 }
 
 kern_return_t
 IMPL(AQC111NIC, SetMulticastAddresses)
 {
     LogI("SetMulticastAddresses: count=%u", count);
-    return kIOReturnSuccess;
+    return doSetMulticastAddresses(ivars, reinterpret_cast<const uint8_t *>(addresses), count);
+}
+
+kern_return_t
+AQC111NIC::setMulticastAddresses(const ether_addr_t *addresses, uint32_t count)
+{
+    LogI("setMulticastAddresses (lowercase): count=%u", count);
+    return doSetMulticastAddresses(ivars, reinterpret_cast<const uint8_t *>(addresses), count);
 }
 
 // TODO: SelectMediaType is the deprecated capital form ("@deprecated, use

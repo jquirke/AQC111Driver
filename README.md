@@ -78,6 +78,13 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
   becomes visible on the wire once enabled and invisible again once
   disabled), not just a register write with assumed effect; see
   `TESTING.md` and `IMPL_PLAN.md` M6g
+- Multicast filtering — per-address CRC32-hash filtering (`SetMulticastAddresses`)
+  validated end-to-end including real UDP socket delivery for an admitted
+  group and a deliberately non-colliding address confirmed still dropped;
+  the accept-all-multicast fallback for when the address count exceeds the
+  64-bucket hash table's capacity validated to genuinely bypass per-address
+  filtering, not just set a bit with assumed effect; see `TESTING.md` and
+  `IMPL_PLAN.md` M6h
 
 **What is not done yet:**
 - TSO — firmware-based TCP segmentation via TX descriptor MSS field
@@ -88,7 +95,6 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
 - Wake-on-LAN — magic packet path exists in hardware; not wired up
 - PHY access polymorphism — the AQC111U has two PHY control interfaces selected by firmware major version (`>= 0x80` → `FWPhyAccess` via bRequest=0x61; `< 0x80` → `DirectPhyAccess` via bRequest=0x31/0x32). The driver reads and logs the firmware version at start but unconditionally uses the `FWPhyAccess` path. This is correct for the DUT (firmware `major=0x82`). Support for older `DirectPhyAccess` devices is not implemented.
 - TX ring depth — the TX path submits one frame at a time and waits for USB completion before submitting the next (`txBusy`/`txInFlight` single-slot gate). RX uses 10 outstanding buffers in flight; TX has no equivalent pipelining, which caps achievable throughput well short of the link's 5 Gbps ceiling under sustained load.
-- Multicast filtering — `SetAllMulticastModeEnable` and `SetMulticastAddresses` are currently no-op stubs: the OS believes these requests succeeded when they have no hardware effect. See `IMPL_PLAN.md` M6h.
 - `hwAssistMask` is not enforced for TX checksum or VLAN tagging — RX checksum offload correctly honors `SetHardwareAssists`, but TX checksum and inline VLAN-tag preservation happen unconditionally regardless of what the OS has enabled (e.g. `ifconfig -txcsum` has no observable effect on the wire). See `IMPL_PLAN.md` M6i.
 
 **Current bugs:**
@@ -103,6 +109,18 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
    Do not enable hardware stripping without also delivering RX descriptor VLAN
    metadata to Skywalk; an earlier inherited `VSO=0x10` write broke software
    VLAN demux by removing the inline tag before macOS could classify it.
+
+4. **Multicast accept-all fallback can never be retracted once triggered.**
+   `SFR_RX_CTL_AMALL` has two independent triggers — an explicit
+   `SetAllMulticastModeEnable(true)` and `SetMulticastAddresses` falling back
+   when the group count exceeds the 64-bucket hash table's capacity — but
+   both currently OR into the same bit with no way to tell them apart later.
+   Since the OS has no reason to call `SetAllMulticastModeEnable(false)` to
+   undo a fallback it didn't ask for, a group count that briefly exceeds 64
+   leaves the NIC accepting all multicast traffic permanently, even after the
+   count drops back to something the hash table could represent precisely.
+   Fix plan in `IMPL_PLAN.md` "Bug fix plan — AMALL fallback can never be
+   retracted once triggered by address-count overflow"; not yet implemented.
 
 ---
 

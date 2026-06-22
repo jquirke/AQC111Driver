@@ -90,9 +90,21 @@ public:
     virtual kern_return_t
     SetAllMulticastModeEnable(bool enable) override;
 
+    // Modern replacement for SetAllMulticastModeEnable above — same
+    // consistency policy as setPromiscuousModeEnable. See IMPL_PLAN.md M6h.
+    virtual kern_return_t
+    setAllMulticastModeEnable(bool enable) override LOCALONLY;
+
     virtual kern_return_t
     SetMulticastAddresses(const IOUserNetworkMACAddress * addresses,
                           uint32_t count) override;
+
+    // Modern replacement for SetMulticastAddresses above (note: ether_addr_t,
+    // not IOUserNetworkMACAddress — binary-identical 6-byte octet array, but
+    // the type differs). See IMPL_PLAN.md M6h.
+    virtual kern_return_t
+    setMulticastAddresses(const ether_addr_t * addresses,
+                          uint32_t count) override LOCALONLY;
 
     virtual kern_return_t
     SelectMediaType(IOUserNetworkMediaType mediaType) override;
