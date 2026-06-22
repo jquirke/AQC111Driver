@@ -168,6 +168,32 @@ Two genuinely separate DriverKit mechanisms, researched before planning (includi
 
 **Verification**: same rigor as RX/TX checksum offload — parent/remote capture vantage points, not just the transmitting Mac. Positive test complete: real `802.1Q vlan 1234` tags visible on parent, `vlan0` decapsulates both request and reply, ICMP succeeds. Negative test complete: remote sends `vlan 1235`, parent sees the tagged frame, local `vlan0` for tag `1234` does not. Results in `TESTING.md` "VLAN Support".
 
+### M6f — `SelectMediaType` not implemented (not implemented)
+
+`SelectMediaType` in `AQC111NIC.cpp` logs and returns `kIOReturnSuccess` with no hardware effect — the OS believes a forced media selection succeeded when it's silently dropped. PHY init (`AQC111NIC.cpp` ~line 992) hardcodes autoneg-enabled/all-speeds-advertised regardless of what's requested, so e.g. `ifconfig en9 media 100baseTX` is accepted but has no effect on the wire.
+
+**Fix shape:** map the requested `IOUserNetworkMediaType` to a forced speed/duplex in the PHY init sequence, mirroring how the x86 kext/Linux force individual rates rather than always advertising the full set.
+
+### M6g — Promiscuous mode not implemented (not implemented)
+
+`SetPromiscuousModeEnable` in `AQC111NIC.cpp` logs and returns `kIOReturnSuccess` with no hardware effect. `hwOnLinkUp`/`hwOnLinkDown`/`hwDisable` hardcode `SFR_RX_CTL` (`0x000B`) to a fixed `0x0288` (`IPE|START|AB`) on every link transition, with no ivar tracking current filter mode for this call to update.
+
+Linux's `aqc111_set_rx_mode` (`notes/aqc111.c:529`) is the reference implementation: `SFR_RX_CTL_PRO` (`0x0001`) is the promiscuous bit.
+
+**Fix shape:** add an ivar holding the current RX_CTL filter bits (distinct from the fixed `IPE|START|AB` base), have `SetPromiscuousModeEnable` OR/AND in `SFR_RX_CTL_PRO` and rewrite `SFR_RX_CTL`, and have `hwOnLinkUp` apply the stored filter bits instead of the hardcoded `0x0288` so a link bounce doesn't silently revert to default filtering.
+
+### M6h — Multicast filtering not implemented (not implemented)
+
+`SetAllMulticastModeEnable` and `SetMulticastAddresses` in `AQC111NIC.cpp` both log and return `kIOReturnSuccess` with no hardware effect. Same underlying gap as M6g: no ivar tracks current filter state for `SFR_RX_CTL`.
+
+Linux's `aqc111_set_rx_mode` (`notes/aqc111.c:529`) is the reference implementation: `SFR_RX_CTL_AMALL` (`0x0002`) is accept-all-multicast; `SFR_RX_CTL_AM` (`0x0010`) plus a hash written to `SFR_MULTI_FILTER_ARRY` (`0x16`) is per-address multicast filtering.
+
+**Fix shape:** extends the same RX_CTL filter ivar from M6g — `SetAllMulticastModeEnable` toggles `SFR_RX_CTL_AMALL`; `SetMulticastAddresses` computes and writes the hash table to `SFR_MULTI_FILTER_ARRY` and toggles `SFR_RX_CTL_AM`.
+
+### M6i — `hwAssistMask` not enforced for TX checksum / VLAN (flagged, not yet scoped)
+
+`SetHardwareAssists`/`GetHardwareAssists` (`AQC111NIC.cpp:1804-1812`) store/report `ivars->hwAssistMask`, and RX checksum correctly gates delivery on it (`OnRxComplete`, ~line 1628). TX checksum and inline-VLAN-tag preservation do not consult the mask at all — they happen unconditionally regardless of what the OS has enabled. For TX this is partly deliberate (the hardware auto-computes the checksum once `SFR_TXCOE_CTL` is enabled at link-up; there's no existing per-packet toggle), but the practical effect is that `ifconfig -txcsum` has no observable effect on the wire — the OS's request to disable the capability is silently ignored rather than honored. Not yet decided whether this needs a fix (toggle `SFR_TXCOE_CTL` based on the mask) or is acceptable as-is — flagged for a decision, not yet scoped as work.
+
 ### M7 — Advanced hardware features (planned, post-stability)
 
 - TSO (TX descriptor MSS field, bits 46:32)
@@ -208,6 +234,21 @@ A `kIOReturnNotResponding` (`0xe00002ed`, `IOReturn.h:182`, "device not respondi
 3. General principle to apply everywhere a pipe's `AsyncIO()` is called for (re)submission: a `kUSBHostReturnPipeStalled` return value from the submission call is just as actionable as one arriving via a completion callback — both need `ClearStall()`. Today only the completion-callback path has this wired up, and only for RX/ITR, not TX.
 
 **Why wait:** Only occurrence 3 has produced a concrete, decoded error trail; occurrences 1 and 2 showed no error status at all before the freeze, so it's not yet certain the same fix covers all observed patterns. Collecting more occurrences (saved the same way, `notes/rx_stall_occurrence_N.log`) before implementing, to confirm the fix addresses the actual recurring pattern rather than just the one well-captured instance.
+
+### Bug fix plan — RX aggregation header layout guessing (found 2026-06-22, not yet fixed)
+
+**Symptom:** none observed yet — found by code review, not a reported failure.
+
+`parseRxLayout` (`AQC111NIC.cpp:1297-1310`) tries three candidate header layouts in sequence and accepts whichever validates against the descriptor count/length sanity checks:
+1. 4-byte header at offset 0, packet data starting at offset 4
+2. 8-byte header at the last 8 bytes, packet data starting at offset 0
+3. 4-byte header at the last 4 bytes, packet data starting at offset 0
+
+The Linux driver (`notes/aqc111.c:1088-1100`, `notes/aqc111.h:214-216`) settles this unambiguously: the descriptor header is **always** an 8-byte field (`u64 desc_hdr`) at the very end of the transfer (`skb_trim(skb, skb_len - sizeof(desc_hdr))`), and packet data always starts at offset 0. `AQ_RX_DH_PKT_CNT_MASK` (`0x1FFF`) / `AQ_RX_DH_DESC_OFFSET_MASK` (`0xFFFFE000`, shift 13) match this driver's existing bit math exactly — candidate 2 above is the only layout with any evidentiary support. Candidates 1 and 3 are unsupported guesses; trying them first risks spuriously validating against the wrong bytes (the sanity check is necessary but not sufficient — a corrupted offset-0 read could coincidentally pass it).
+
+**Second, related bug:** Linux pads each packet to an 8-byte boundary when walking the buffer (`pkt_len_with_padd = (pkt_len + 7) & 0x7FFF8`, `notes/aqc111.c:1128`). This driver's packet-walk loops — both the validation loop in `parseRxLayoutCandidate` (`AQC111NIC.cpp:1276-1288`) and the consumer loop in `OnRxComplete` (~lines 1574-1589) — advance by raw, unpadded `pkt_len`. Any aggregated buffer carrying more than one packet will misparse from the second packet onward.
+
+**Proposed fix:** delete candidates 1 and 3 from `parseRxLayout`, keeping only the tail-8-byte/data-at-0 layout. Add the `(pkt_len + 7) & ~7` padding step everywhere the code advances an offset by a packet length during RX parsing.
 
 ---
 

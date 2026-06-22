@@ -73,6 +73,8 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
 - Wake-on-LAN — magic packet path exists in hardware; not wired up
 - PHY access polymorphism — the AQC111U has two PHY control interfaces selected by firmware major version (`>= 0x80` → `FWPhyAccess` via bRequest=0x61; `< 0x80` → `DirectPhyAccess` via bRequest=0x31/0x32). The driver reads and logs the firmware version at start but unconditionally uses the `FWPhyAccess` path. This is correct for the DUT (firmware `major=0x82`). Support for older `DirectPhyAccess` devices is not implemented.
 - TX ring depth — the TX path submits one frame at a time and waits for USB completion before submitting the next (`txBusy`/`txInFlight` single-slot gate). RX uses 10 outstanding buffers in flight; TX has no equivalent pipelining, which caps achievable throughput well short of the link's 5 Gbps ceiling under sustained load.
+- Media selection, promiscuous mode, and multicast filtering — `SelectMediaType`, `SetPromiscuousModeEnable`, `SetAllMulticastModeEnable`, and `SetMulticastAddresses` are all currently no-op stubs: the OS believes these requests succeeded when they have no hardware effect. See `IMPL_PLAN.md` M6f–M6h.
+- `hwAssistMask` is not enforced for TX checksum or VLAN tagging — RX checksum offload correctly honors `SetHardwareAssists`, but TX checksum and inline VLAN-tag preservation happen unconditionally regardless of what the OS has enabled (e.g. `ifconfig -txcsum` has no observable effect on the wire). See `IMPL_PLAN.md` M6i.
 
 **Current bugs:**
 
@@ -86,6 +88,17 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
    Do not enable hardware stripping without also delivering RX descriptor VLAN
    metadata to Skywalk; an earlier inherited `VSO=0x10` write broke software
    VLAN demux by removing the inline tag before macOS could classify it.
+
+4. **RX aggregation header layout is guessed, not determined.** `parseRxLayout`
+   tries three candidate header layouts per completed transfer and accepts
+   whichever validates — but the Linux reference driver shows only one layout
+   (8-byte header in the final 8 bytes, packet data at offset 0) is actually
+   correct; the other two candidates are unsupported guesses that could
+   spuriously validate against the wrong bytes. A related bug: packet offsets
+   aren't padded to the 8-byte boundary the hardware actually uses, which will
+   misparse any aggregated buffer carrying more than one packet. Found by code
+   review, not yet reproduced as a live failure. See `IMPL_PLAN.md` "Bug fix
+   plan — RX aggregation header layout guessing".
 
 ---
 
