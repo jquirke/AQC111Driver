@@ -194,6 +194,14 @@ Linux's `aqc111_set_rx_mode` (`notes/aqc111.c:529`) is the reference implementat
 
 `SetHardwareAssists`/`GetHardwareAssists` (`AQC111NIC.cpp:1804-1812`) store/report `ivars->hwAssistMask`, and RX checksum correctly gates delivery on it (`OnRxComplete`, ~line 1628). TX checksum and inline-VLAN-tag preservation do not consult the mask at all — they happen unconditionally regardless of what the OS has enabled. For TX this is partly deliberate (the hardware auto-computes the checksum once `SFR_TXCOE_CTL` is enabled at link-up; there's no existing per-packet toggle), but the practical effect is that `ifconfig -txcsum` has no observable effect on the wire — the OS's request to disable the capability is silently ignored rather than honored. Not yet decided whether this needs a fix (toggle `SFR_TXCOE_CTL` based on the mask) or is acceptable as-is — flagged for a decision, not yet scoped as work.
 
+### M6j — Runtime MAC address override not implemented (not implemented)
+
+`IOUserNetworkEthernet` declares a dedicated override pair for this — `getHardwareAddress(ether_addr_t *addr)` / `setHardwareAddress(ether_addr_t *addr)` (both `LOCALONLY NDK_21`, `NetworkingDriverKit.framework/Headers/IOUserNetworkEthernet.iig`) — with `setHardwareAddress`'s doc comment explicit that "the driver can override this function if there's a need to re-program the Hardware address... if that feature is needed the driver is expected to override this method." Neither is overridden in `AQC111NIC.iig`/`AQC111NIC.cpp` today. The MAC is written to `SFR_NODE_ID` exactly once, in `Start()`, from the value read at boot (or the hardcoded fallback); there's no path for the OS to change it afterward, so `ifconfig en9 lladdr ...` / `networksetup -setether` has no effect.
+
+Both reference drivers support this. Linux: `ndo_set_mac_address = aqc111_set_mac_addr` (`notes/aqc111.c:647`), which validates via `eth_mac_addr()` and writes `SFR_NODE_ID` via `AQ_ACCESS_MAC`. The x86 kext: confirmed by disassembly (2026-06-22) — `AqPacificDriver::setHardwareAddress(IOEthernetAddress const*)` is a real override of `IOEthernetController::setHardwareAddress`, forwarding to `AqUsbHal::setMacAddress(unsigned char const*)`, which issues the exact `StandardUSB::DeviceRequest` already documented in `RE_LOG.md` "Set MAC Address" (raw `0x0006000600100140` — OUT, `AQ_ACCESS_MAC`, `wValue=0x0010`/`SFR_NODE_ID`, 6 bytes) — confirming that trace is this runtime override's call site, not just the boot-time write `RE_LOG.md`'s `start()` trace also shows.
+
+**Fix shape:** override `setHardwareAddress` to validate the new address and write it to `SFR_NODE_ID` (reusing the existing `aqWrite` path already in `hwEnable`), updating `ivars->macAddress`. Override `getHardwareAddress` to return the cached `ivars->macAddress` — no device round-trip needed since it's already held.
+
 ### M7 — Advanced hardware features (planned, post-stability)
 
 - TSO (TX descriptor MSS field, bits 46:32)
