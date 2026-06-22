@@ -243,20 +243,24 @@ A `kIOReturnNotResponding` (`0xe00002ed`, `IOReturn.h:182`, "device not respondi
 
 **Why wait:** Only occurrence 3 has produced a concrete, decoded error trail; occurrences 1 and 2 showed no error status at all before the freeze, so it's not yet certain the same fix covers all observed patterns. Collecting more occurrences (saved the same way, `notes/rx_stall_occurrence_N.log`) before implementing, to confirm the fix addresses the actual recurring pattern rather than just the one well-captured instance.
 
-### Bug fix plan — RX aggregation header layout guessing (found 2026-06-22, not yet fixed)
+### Bug fix plan — RX aggregation header layout guessing (found 2026-06-22, fixed 2026-06-23)
 
-**Symptom:** none observed yet — found by code review, not a reported failure.
+**Symptom:** none observed as a live failure — found by code review, confirmed by live-traffic instrumentation before fixing.
 
-`parseRxLayout` (`AQC111NIC.cpp:1297-1310`) tries three candidate header layouts in sequence and accepts whichever validates against the descriptor count/length sanity checks:
+`parseRxLayout` previously tried three candidate header layouts in sequence and accepted whichever validated against the descriptor count/length sanity checks:
 1. 4-byte header at offset 0, packet data starting at offset 4
 2. 8-byte header at the last 8 bytes, packet data starting at offset 0
 3. 4-byte header at the last 4 bytes, packet data starting at offset 0
 
-The Linux driver (`notes/aqc111.c:1088-1100`, `notes/aqc111.h:214-216`) settles this unambiguously: the descriptor header is **always** an 8-byte field (`u64 desc_hdr`) at the very end of the transfer (`skb_trim(skb, skb_len - sizeof(desc_hdr))`), and packet data always starts at offset 0. `AQ_RX_DH_PKT_CNT_MASK` (`0x1FFF`) / `AQ_RX_DH_DESC_OFFSET_MASK` (`0xFFFFE000`, shift 13) match this driver's existing bit math exactly — candidate 2 above is the only layout with any evidentiary support. Candidates 1 and 3 are unsupported guesses; trying them first risks spuriously validating against the wrong bytes (the sanity check is necessary but not sufficient — a corrupted offset-0 read could coincidentally pass it).
+The Linux driver (`notes/aqc111.c:1088-1100`, `notes/aqc111.h:214-216`) settles this unambiguously: the descriptor header is **always** an 8-byte field (`u64 desc_hdr`) at the very end of the transfer (`skb_trim(skb, skb_len - sizeof(desc_hdr))`), and packet data always starts at offset 0. `AQ_RX_DH_PKT_CNT_MASK` (`0x1FFF`) / `AQ_RX_DH_DESC_OFFSET_MASK` (`0xFFFFE000`, shift 13) matched this driver's existing bit math exactly — candidate 2 was the only layout with any evidentiary support.
 
-**Second, related bug:** Linux pads each packet to an 8-byte boundary when walking the buffer (`pkt_len_with_padd = (pkt_len + 7) & 0x7FFF8`, `notes/aqc111.c:1128`). This driver's packet-walk loops — both the validation loop in `parseRxLayoutCandidate` (`AQC111NIC.cpp:1276-1288`) and the consumer loop in `OnRxComplete` (~lines 1574-1589) — advance by raw, unpadded `pkt_len`. Any aggregated buffer carrying more than one packet will misparse from the second packet onward.
+**Confirmed before fixing:** added one-shot-free logging of which candidate matched on every `OnRxComplete`, ran real traffic. Candidate 2 matched on every single completion; candidates 1 and 3 never matched once. Fixed with that evidence in hand rather than on the Linux reference alone.
 
-**Proposed fix:** delete candidates 1 and 3 from `parseRxLayout`, keeping only the tail-8-byte/data-at-0 layout. Add the `(pkt_len + 7) & ~7` padding step everywhere the code advances an offset by a packet length during RX parsing.
+**Where the original "disagreement" actually came from:** the multi-candidate hedge existed because the x86 kext's RE notes (`RE_LOG.md`, since corrected) claimed the header was at offset 0 — seemingly contradicting Linux. Re-disassembling `Rx::clean()` directly (`otool -tV` on `~/trendiokit/Contents/MacOS/TUC-ET5G`) showed that claim was simply wrong: the kext reads the header via `mbuf_copydata(mbuf, total_length - 8, 8, &local)` — the same tail-8-byte offset Linux uses, not offset 0. The earlier RE pass had paraphrased a `copydata`-style call without tracing the register dataflow that computed its offset argument, and that error propagated into this driver's "hardware revisions disagree" comment and the defensive multi-candidate parsing it justified. There was never an actual conflict between the two reference drivers — `RE_LOG.md`'s RX buffer layout section is now corrected to match.
+
+**Second, related bug, fixed in the same pass:** Linux pads each packet to an 8-byte boundary when walking the buffer (`pkt_len_with_padd = (pkt_len + 7) & 0x7FFF8`, `notes/aqc111.c:1128`). This driver's packet-walk loops — both the validation loop inside `parseRxLayout` and the consumer loop in `OnRxComplete` — previously advanced by raw, unpadded `pkt_len`, which would have misparsed any aggregated buffer carrying more than one packet.
+
+**Fix applied:** `parseRxLayout` now only implements the confirmed tail-8-byte-header/data-at-0 layout (the multi-candidate trial and the `candidate` diagnostic field are gone). All three packet-offset advances (`parseRxLayout`'s validation loop, plus both `continue` paths and the success path in `OnRxComplete`) now use `(pkt_len + 7u) & ~7u` instead of raw `pkt_len`.
 
 ---
 

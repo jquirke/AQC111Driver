@@ -983,23 +983,34 @@ Called on URB completion (interrupt context). Calls `Rx::clean()` then tail-call
 
 ### RX Bulk IN Buffer Layout
 
+**Corrected 2026-06-23** — an earlier pass through this disassembly (now fixed
+below) misread the header offset as 0; see "RX header offset: how the
+earlier error happened" below for the full story. Re-verified directly
+against `Rx::clean()` (`otool -tV`, `__ZN2Rx5cleanEv` at `0x200e` in
+`~/trendiokit/Contents/MacOS/TUC-ET5G`).
+
 Each 64KB bulk IN URB receives a variable-length buffer structured as:
 
 ```
-[4-byte RX Descriptor Header]
 [packet 0: 2-byte HW pad + payload]
 [packet 1: 2-byte HW pad + payload]
 ...
 [packet N-1: 2-byte HW pad + payload]
 [N × 8-byte RX Packet Descriptors]   ← at byte offset desc_offset from buffer start
+[8-byte RX Descriptor Header]        ← at the last 8 bytes of the buffer (offset = total_length - 8)
 ```
 
-**RX Descriptor Header** (first 4 bytes of buffer):
+**RX Descriptor Header** (8-byte field at `total_length - 8`; only the low 32 bits are meaningful):
 
 | Bits | Mask | Description |
 |------|------|-------------|
 | 12:0 | `0x1FFF` | Packet count — number of packets in this transfer |
 | 31:13 | `0xFFFFE000` >> 13 | Descriptor offset — byte offset to the packet descriptor array |
+
+This matches the empirically-confirmed behavior of this project's own
+hardware — see `IMPL_PLAN.md` "Bug fix plan — RX aggregation header layout
+guessing" for the cross-reference against other sources and the live-traffic
+confirmation.
 
 **RX Packet Descriptor** (8 bytes per packet, at desc_offset):
 
@@ -1024,24 +1035,34 @@ Drains all completed ring entries and delivers packets to the network stack.
 ```
 while ring[head*0xb5 + 0xbc] != 0:   // completion flag set
     entry = ring[head]
-    memdesc = entry[0x08]
+    memdesc = entry[0x10]               // corrected 2026-06-23, was entry[0x08]
     memdesc->vtable[0x1f8]()           // complete / unmap descriptor
+    mbuf = *(mbuf_t*)(entry + 0x08)    // corrected 2026-06-23, was entry[0x00]
+    total_length = entry[0xb8]          // bytes actually received for this URB
 
-    // Parse RX Descriptor Header from start of buffer
-    uint32_t header = *(uint32_t*)buffer;
+    // Header is NOT a raw pointer dereference at offset 0 — mbuf is a BSD
+    // mbuf chain, so every read goes through mbuf_copydata(). The header is
+    // the LAST 8 bytes of the buffer (offset = total_length - 8):
+    uint8_t header_bytes[8];
+    mbuf_copydata(mbuf, total_length - 8, 8, &header_bytes);
+    uint32_t header = *(uint32_t*)&header_bytes;  // only low 32 bits used
     pkt_count   = header & 0x1FFF;          // number of packets
-    desc_offset = (header & 0xFFFFE000) >> 13;  // offset to descriptor array
+    desc_offset = header >> 13;             // offset to descriptor array (equivalent to (header & 0xFFFFE000) >> 13)
 
     if pkt_count == 0: skip (drop)
 
-    // Walk each packet using its RX Packet Descriptor
+    // Walk each packet's RX Packet Descriptor — also via mbuf_copydata, not
+    // a raw pointer dereference, advancing the offset by 8 bytes/iteration:
+    offset = desc_offset
     for i in range(pkt_count):
-        uint64_t pd = *(uint64_t*)(buffer + desc_offset + i*8);
+        uint8_t pd_bytes[8];
+        mbuf_copydata(mbuf, offset, 8, &pd_bytes);
+        uint64_t pd = *(uint64_t*)&pd_bytes;
+        offset += 8;
         if pd & AQ_RX_PD_DROP: continue
         if !(pd & AQ_RX_PD_RX_OK): continue
         pkt_len = (pd & 0x7FFF0000) >> 16;
 
-        mbuf = entry[0x00]
         if mbuf != null:
             Rx::setChecksum(mbuf, pd)           // apply HW checksum offload info
             if pd & AQ_RX_PD_VLAN: set VLAN tag on mbuf from pd[63:32]
@@ -1054,6 +1075,19 @@ while ring[head*0xb5 + 0xbc] != 0:   // completion flag set
 
 AqPacificDriver::flushInputQueue()      // flush batch to network stack
 ```
+
+### RX header offset: how the earlier error happened
+
+The original pass through this function read the early `mbuf_copydata` call as
+"copy from the start of the buffer" without tracing what offset was actually
+passed in `%esi`. That offset isn't a literal — it's computed two
+instructions earlier (`movl (%r15), %esi` then `addq $-0x8, %rsi`, i.e.
+`total_length - 8`), so getting it right requires following that dataflow
+rather than reading the call site on its own. It's an easy mistake to make
+when skimming a `copydata`-style call: the call itself looks identical
+whether the offset argument is `0` or `total_length - 8`; only tracing the
+register that feeds it tells you which. Re-disassembling directly (rather
+than trusting the earlier summary) caught it.
 
 ## Tx Class
 

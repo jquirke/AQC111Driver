@@ -90,17 +90,6 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
    metadata to Skywalk; an earlier inherited `VSO=0x10` write broke software
    VLAN demux by removing the inline tag before macOS could classify it.
 
-4. **RX aggregation header layout is guessed, not determined.** `parseRxLayout`
-   tries three candidate header layouts per completed transfer and accepts
-   whichever validates — but the Linux reference driver shows only one layout
-   (8-byte header in the final 8 bytes, packet data at offset 0) is actually
-   correct; the other two candidates are unsupported guesses that could
-   spuriously validate against the wrong bytes. A related bug: packet offsets
-   aren't padded to the 8-byte boundary the hardware actually uses, which will
-   misparse any aggregated buffer carrying more than one packet. Found by code
-   review, not yet reproduced as a live failure. See `IMPL_PLAN.md` "Bug fix
-   plan — RX aggregation header layout guessing".
-
 ---
 
 ## Provisioning Requirements

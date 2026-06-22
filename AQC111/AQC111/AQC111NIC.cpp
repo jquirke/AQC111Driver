@@ -190,10 +190,7 @@ static void hwOnLinkDown(IOUSBHostInterface *iface);
 static kern_return_t applyMtuToHardware(struct AQC111NIC_IVars *ivars);
 static void ensureRxStarted(struct AQC111NIC_IVars *ivars, uint8_t speedCode);
 static void ensureRxStopped(struct AQC111NIC_IVars *ivars);
-static void dumpRxBytes(const uint8_t *buf, uint32_t actualByteCount, uint32_t slot, IOReturn status);
 struct RxParseInfo {
-    uint32_t headerOffset;
-    uint32_t packetBaseOffset;
     uint32_t descriptorOffset;
     uint32_t packetCount;
 };
@@ -320,9 +317,6 @@ struct AQC111NIC_IVars {
     // CopyDispatchQueue("Default") returns the kernel-side networking proxy queue
     // which doesn't deliver OSAction callbacks into our process.
     IODispatchQueue                    *asyncQueue;
-    bool                                dumpedRx80;
-    bool                                dumpedRx432;
-    bool                                dumpedRxOther;
     // TX path — one frame in flight at a time
     IOBufferMemoryDescriptor           *txBuf;           // staging buffer: 8-byte descriptor + frame
     OSAction                           *txPacketAction;  // TxPacketAvailable OSAction
@@ -1188,58 +1182,34 @@ ensureRxStopped(AQC111NIC_IVars *ivars)
     LogI("ensureRxStopped: stopped");
 }
 
-static void
-dumpRxBytes(const uint8_t *buf, uint32_t actualByteCount, uint32_t slot, IOReturn status)
-{
-    if (buf == nullptr || actualByteCount == 0) {
-        return;
-    }
-
-    auto dumpRange = [buf, slot](uint32_t start, uint32_t end) {
-        for (uint32_t i = start; i < end; i += 16) {
-            char line[96];
-            int n = snprintf(line, sizeof(line), "RXDUMP[%u] %04x:", slot, (unsigned)i);
-            for (uint32_t j = 0; j < 16 && i + j < end && n > 0 && n < (int)sizeof(line); j++) {
-                n += snprintf(line + n, sizeof(line) - (size_t)n, " %02x", buf[i + j]);
-            }
-            LogV("%s", line);
-        }
-    };
-
-    LogV("RXDUMP slot=%u status=0x%x bytes=%u", slot, status, actualByteCount);
-
-    if (actualByteCount <= 512) {
-        dumpRange(0, actualByteCount);
-        return;
-    }
-
-    dumpRange(0, 64);
-    LogV("RXDUMP[%u] ...", slot);
-    dumpRange(actualByteCount - 64, actualByteCount);
-}
-
+// Parse the RX aggregation header: an 8-byte header in the final 8 bytes of
+// the USB transfer, packet data starting at offset 0. Confirmed three ways:
+// the Linux driver's source (notes/aqc111.c aqc111_rx_fixup, notes/aqc111.h
+// AQ_RX_DH_PKT_CNT_MASK/AQ_RX_DH_DESC_OFFSET_MASK), corrected x86 kext
+// disassembly (RE_LOG.md "RX Bulk IN Buffer Layout"), and live-traffic
+// logging of every candidate layout previously considered (see
+// IMPL_PLAN.md "Bug fix plan — RX aggregation header layout guessing").
 static bool
-parseRxLayoutCandidate(const uint8_t *buf, uint32_t actualByteCount, uint32_t headerOffset,
-                       uint32_t packetBaseOffset, RxParseInfo *info)
+parseRxLayout(const uint8_t *buf, uint32_t actualByteCount, RxParseInfo *info)
 {
-    if (buf == nullptr || info == nullptr || actualByteCount < headerOffset + sizeof(uint32_t)) {
+    if (buf == nullptr || info == nullptr || actualByteCount < 8) {
         return false;
     }
 
+    uint32_t headerOffset = actualByteCount - 8;
     uint32_t header    = readLe32(buf + headerOffset);
     uint32_t pktCount  = header & 0x1FFF;
     uint32_t descOff   = (header & 0xFFFFE000) >> 13;
     uint32_t descBytes = pktCount * 8;
 
-    if (pktCount == 0 || descOff < packetBaseOffset || descOff + descBytes > actualByteCount) {
+    if (pktCount == 0 || descOff + descBytes > headerOffset) {
         return false;
     }
 
-    if (headerOffset != 0 && descOff + descBytes > headerOffset) {
-        return false;
-    }
-
-    uint32_t pktOffset = packetBaseOffset;
+    // Packets are padded to an 8-byte boundary (notes/aqc111.c
+    // pkt_len_with_padd = (pkt_len + 7) & 0x7FFF8) — walk with that padding
+    // applied or multi-packet buffers misparse from the second packet on.
+    uint32_t pktOffset = 0;
     for (uint32_t i = 0; i < pktCount; i++) {
         uint64_t pd      = readLe64(buf + descOff + i * 8);
         uint32_t pktLen  = (uint32_t)((pd & 0x7FFF0000) >> 16);
@@ -1247,32 +1217,16 @@ parseRxLayoutCandidate(const uint8_t *buf, uint32_t actualByteCount, uint32_t he
         if (pktLen == 0) {
             return false;
         }
-        if (pktOffset + pktLen > descOff) {
+        uint32_t pktLenPadded = (pktLen + 7u) & ~7u;
+        if (pktOffset + pktLenPadded > descOff) {
             return false;
         }
-        pktOffset += pktLen;
+        pktOffset += pktLenPadded;
     }
 
-    info->headerOffset     = headerOffset;
-    info->packetBaseOffset = packetBaseOffset;
     info->descriptorOffset = descOff;
     info->packetCount      = pktCount;
     return true;
-}
-
-static bool
-parseRxLayout(const uint8_t *buf, uint32_t actualByteCount, RxParseInfo *info)
-{
-    if (parseRxLayoutCandidate(buf, actualByteCount, 0, 4, info)) {
-        return true;
-    }
-    if (actualByteCount >= 8 && parseRxLayoutCandidate(buf, actualByteCount, actualByteCount - 8, 0, info)) {
-        return true;
-    }
-    if (actualByteCount >= 4 && parseRxLayoutCandidate(buf, actualByteCount, actualByteCount - 4, 0, info)) {
-        return true;
-    }
-    return false;
 }
 
 static void
@@ -1497,28 +1451,12 @@ IMPL(AQC111NIC, OnRxComplete)
         return;
     }
 
-    // Parse aggregated RX buffer. Hardware revisions / reverse-engineering notes disagree on
-    // whether the 4-byte aggregation header is at offset 0 or in the final 8 bytes, so accept
-    // whichever layout validates cleanly against the completed transfer length.
+    // Parse aggregated RX buffer (see parseRxLayout for the confirmed
+    // header layout).
     IOAddressSegment range;
     ivars->rxBufs[slot]->GetAddressRange(&range);
     const uint8_t *buf = (const uint8_t *)range.address;
     RxParseInfo layout = {};
-
-    bool shouldDump = false;
-    if (actualByteCount == 80 && !ivars->dumpedRx80) {
-        ivars->dumpedRx80 = true;
-        shouldDump = true;
-    } else if (actualByteCount == 432 && !ivars->dumpedRx432) {
-        ivars->dumpedRx432 = true;
-        shouldDump = true;
-    } else if (!ivars->dumpedRxOther) {
-        ivars->dumpedRxOther = true;
-        shouldDump = true;
-    }
-    if (shouldDump) {
-        dumpRxBytes(buf, actualByteCount, slot, status);
-    }
 
     if (!parseRxLayout(buf, actualByteCount, &layout)) {
         kern_return_t r = ivars->pipeRx->AsyncIO(ivars->rxBufs[slot], RX_BUF_SIZE, ivars->rxActions[slot], 0);
@@ -1526,10 +1464,10 @@ IMPL(AQC111NIC, OnRxComplete)
         return;
     }
 
-    LogD("RX[%u] parsed layout: hdr=%u pkt_base=%u desc=%u count=%u",
-        slot, layout.headerOffset, layout.packetBaseOffset, layout.descriptorOffset, layout.packetCount);
+    LogD("RX[%u] parsed layout: desc=%u count=%u",
+        slot, layout.descriptorOffset, layout.packetCount);
 
-    uint32_t pkt_offset = layout.packetBaseOffset;
+    uint32_t pkt_offset = 0;
     uint32_t delivered  = 0;
 
     for (uint32_t i = 0; i < layout.packetCount; i++) {
@@ -1537,6 +1475,7 @@ IMPL(AQC111NIC, OnRxComplete)
         bool     drop    = (pd >> 31) & 1;
         bool     ok      = (pd >> 11) & 1;
         uint32_t pkt_len = (uint32_t)((pd & 0x7FFF0000) >> 16);
+        uint32_t pkt_len_padded = (pkt_len + 7u) & ~7u;
 
         if (!drop && ok && pkt_len > 2) {
             uint32_t frame_len = pkt_len - 2;
@@ -1544,14 +1483,14 @@ IMPL(AQC111NIC, OnRxComplete)
             if (frame_len < 14) {
                 LogD("RX[%u] frame[%u] too short for Ethernet: pkt_len=%u frame_len=%u",
                     slot, i, pkt_len, frame_len);
-                pkt_offset += pkt_len;
+                pkt_offset += pkt_len_padded;
                 continue;
             }
             if (frame_len > ivars->currentMtu + AQC111_ETH_HEADER_LEN + AQC111_VLAN_TAG_LEN) {
                 LogE("RX[%u] frame[%u] too large: pkt_len=%u frame_len=%u max=%u mtu=%u",
                     slot, i, pkt_len, frame_len,
                     ivars->currentMtu + AQC111_ETH_HEADER_LEN + AQC111_VLAN_TAG_LEN, ivars->currentMtu);
-                pkt_offset += pkt_len;
+                pkt_offset += pkt_len_padded;
                 continue;
             }
 
@@ -1636,7 +1575,7 @@ IMPL(AQC111NIC, OnRxComplete)
             }
         }
 
-        pkt_offset += pkt_len;
+        pkt_offset += pkt_len_padded;
     }
 
     if (delivered > 0) {
