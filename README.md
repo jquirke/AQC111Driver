@@ -68,6 +68,11 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
   on the wire, a fresh DHCP lease, and confirmation the override is
   volatile/safe across a genuine power cycle (not a durable EEPROM rewrite);
   see `TESTING.md` and `IMPL_PLAN.md` M6j
+- Forced media selection (`ifconfig en9 media 100baseTX`/`2500base-T`/...) —
+  validated end-to-end across 100M/2.5G (cross-confirmed by the link
+  partner's own `ethtool` for the 2.5G case), survives an interface
+  disable/enable cycle, and reverting to `autoselect` correctly climbs back
+  to the link's actual max; see `TESTING.md` and `IMPL_PLAN.md` M6f
 
 **What is not done yet:**
 - TSO — firmware-based TCP segmentation via TX descriptor MSS field
@@ -78,7 +83,7 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
 - Wake-on-LAN — magic packet path exists in hardware; not wired up
 - PHY access polymorphism — the AQC111U has two PHY control interfaces selected by firmware major version (`>= 0x80` → `FWPhyAccess` via bRequest=0x61; `< 0x80` → `DirectPhyAccess` via bRequest=0x31/0x32). The driver reads and logs the firmware version at start but unconditionally uses the `FWPhyAccess` path. This is correct for the DUT (firmware `major=0x82`). Support for older `DirectPhyAccess` devices is not implemented.
 - TX ring depth — the TX path submits one frame at a time and waits for USB completion before submitting the next (`txBusy`/`txInFlight` single-slot gate). RX uses 10 outstanding buffers in flight; TX has no equivalent pipelining, which caps achievable throughput well short of the link's 5 Gbps ceiling under sustained load.
-- Media selection, promiscuous mode, and multicast filtering — `SelectMediaType`, `SetPromiscuousModeEnable`, `SetAllMulticastModeEnable`, and `SetMulticastAddresses` are all currently no-op stubs: the OS believes these requests succeeded when they have no hardware effect. See `IMPL_PLAN.md` M6f–M6h.
+- Promiscuous mode and multicast filtering — `SetPromiscuousModeEnable`, `SetAllMulticastModeEnable`, and `SetMulticastAddresses` are all currently no-op stubs: the OS believes these requests succeeded when they have no hardware effect. See `IMPL_PLAN.md` M6g–M6h.
 - `hwAssistMask` is not enforced for TX checksum or VLAN tagging — RX checksum offload correctly honors `SetHardwareAssists`, but TX checksum and inline VLAN-tag preservation happen unconditionally regardless of what the OS has enabled (e.g. `ifconfig -txcsum` has no observable effect on the wire). See `IMPL_PLAN.md` M6i.
 
 **Current bugs:**

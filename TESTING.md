@@ -57,6 +57,42 @@ Runtime MAC override works end-to-end: OS → `setHardwareAddress` → `SFR_NODE
 
 ---
 
+## Media Selection
+
+### Implementation
+
+The real OS-facing media-selection entry point is `handleChosenMedia(MediaWord)`, not the deprecated `SelectMediaType`. Previously a no-op stub; PHY init always advertised all four rates regardless of what was requested. See `IMPL_PLAN.md` M6f for the full design (single-bit `AQ_ADV_*` mask per forced rate, stored in a new `ivars->phyAdvertiseMask` ivar so it survives a later interface disable/enable, applied via a helper shared with `hwEnable`).
+
+### Baseline regression (2026-06-23): autoneg unaffected by the refactor
+
+Confirmed across three real peers before testing the new forcing behavior, to make sure storing the advertise mask in an ivar and sharing the PHY-write helper between `hwEnable`/`handleChosenMedia` didn't regress plain autonegotiation:
+
+- **1G-only peer:** negotiated `1000 Mbps` (`code=0x11`), full duplex — matches remote `ethtool` (`Speed: 1000Mb/s`, `Duplex: Full`, `Auto-negotiation: on`).
+- **5G-capable peer:** negotiated `5000 Mbps` (`code=0x0f`).
+- **Live mid-session renegotiation:** restricting the remote's advertisement on the fly (100M → 1000M, no action on this driver's side) flowed cleanly through the existing `hwOnLinkUp` path and correctly re-reported the new speed — confirms the existing link-event handling wasn't disturbed either.
+- **2.5G case, restricting the remote side instead of forcing it off:** `sudo ethtool -s <iface> speed 2500 duplex full autoneg on` (multi-gig copper rates have no genuine forced/non-autoneg signaling mode in the IEEE spec at all, so `autoneg on` is required even when restricting to one rate) cleanly negotiated `2500 Mb/s` on the remote, and this driver correctly followed it down to `2500 Mbps` (`code=0x10`).
+
+**Negative finding worth keeping in mind for future interop testing:** first attempted the 2.5G-restriction test by genuinely disabling the remote's autoneg (`ethtool -s <iface> speed 100 duplex full autoneg off`) instead. Result: no link at all (`code=0x19`, an unrecognized speed code, `status: inactive`) — a real-world instance of the classic IEEE 802.3 parallel-detection limitation (an autonegotiating PHY paired with a hard-forced peer can sense speed but not duplex, and many implementations simply fail to establish a stable link rather than degrade gracefully). Recovered cleanly the moment the remote went back to plain `autoneg on`. Not a driver bug — this is exactly mirrored by the fact that this driver's own "forced" mode is the same restricted-advertisement model, not a true forced/non-autoneg mode either (see `IMPL_PLAN.md` M6f).
+
+### Forcing media on this driver's side (2026-06-23)
+
+With the remote left on full autoneg (advertising up to 5G/10G), forced this driver's own side down via `ifconfig` and confirmed it overrides what autoneg alone would pick:
+
+- **`sudo ifconfig en9 media 100baseTX mediaopt full-duplex`** → log: `handleChosenMedia: advertiseMask=0x1` → `applyPhyAdvertise: AQ_PHY_OPS flags=0x032b0001` → link renegotiated to `100 Mbps` (`code=0x13`) despite the remote advertising up to 1000baseT; `ifconfig en9` showed `media: 100baseTX <full-duplex,flow-control>`, `status: active`; traffic flowing normally; remote `ethtool` independently confirmed `Speed: 100Mb/s`.
+- **`sudo ifconfig en9 media autoselect`** → `advertiseMask=0xf` → link climbed back to `1000 Mbps` (`code=0x11`), matching the remote's actual max.
+- **`sudo ifconfig en9 media 2500base-T mediaopt full-duplex`** (note: macOS `ifconfig`'s media-name table wants the hyphenated `2500base-T`, not `2500baseT`, which errors `unknown media subtype`) → `advertiseMask=0x4` → renegotiated to `2500 Mbps` (`code=0x10`) despite the remote advertising up to 10G. Cross-confirmed independently via the remote's own `ethtool`: `Link partner advertised link modes: 2500baseT/Full` (only 2.5G), `Speed: 2500Mb/s` — direct third-party evidence this driver is genuinely restricting its own advertisement, not just self-reporting a speed it isn't actually negotiating.
+- Reverting to `autoselect` again climbed back to `5000 Mbps`, matching this peer's actual max.
+
+### Persistence across interface disable/enable (2026-06-23)
+
+The specific case `ivars->phyAdvertiseMask` was added to handle, rather than leaving the mask as a `hwEnable`-local literal: forced `100baseTX`, then `sudo ifconfig en9 down` followed by `sudo ifconfig en9 up`. Log confirmed `hwDisable` withdrew the advertisement entirely (`AQ_PHY_OPS withdraw advertise flags=0x00000000`) as it always does, but the subsequent `hwEnable` on `up` re-applied the *stored* mask — `applyPhyAdvertise: AQ_PHY_OPS flags=0x032b0001` (mask `0x1`, not `0xf`) — and the link re-negotiated to 100 Mbps again, confirmed by the remote's `ethtool` (`Speed: 100Mb/s`, `Duplex: Full`). Without the ivar, this would have silently reverted to full autoneg on every `ifconfig down`/`up`, the same bug class flagged for M6g/M6h's filter bits.
+
+### Conclusion
+
+Forced media selection works end-to-end across the full rate range this hardware and test peers support (100M/2.5G, plus the pre-existing autoneg path confirmed at 1G/5G), survives an interface disable/enable cycle, and reverting to `autoselect` always climbs back to the link's actual max. Not yet exercised: the half-duplex rejection path (`kIOUserNetworkMediaOptionHalfDuplex` → `kIOReturnUnsupported`) — implemented but not tested against real hardware.
+
+---
+
 ## VLAN Support
 
 ### Step 1 — Layer 1 fix (2026-06-20): software VLAN path validated end-to-end

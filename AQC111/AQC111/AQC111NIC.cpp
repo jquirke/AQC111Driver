@@ -313,6 +313,12 @@ struct AQC111NIC_IVars {
     bool                                rxStarted;
     bool                                ioArmed;
     IOUserNetworkMACAddress             macAddress;
+    // PHY advertise mask (AQ_ADV_* bits) applied by hwEnable on every
+    // interface-enable. Stored here (not a hwEnable-local literal) so a
+    // forced media selection via handleChosenMedia() survives a later
+    // ifconfig down/up cycle instead of silently reverting to full
+    // autoneg. See IMPL_PLAN.md M6f.
+    uint32_t                            phyAdvertiseMask;
     // Dext-owned queue for OSAction callbacks (USB async IO).
     // CopyDispatchQueue("Default") returns the kernel-side networking proxy queue
     // which doesn't deliver OSAction callbacks into our process.
@@ -359,6 +365,7 @@ AQC111NIC::init()
     // GetHardwareAssists. See IMPL_PLAN.md M6a.
     ivars->hwAssistMask = AQC111_HWASSIST_MASK;
     ivars->currentMtu = AQC111_MIN_MTU;
+    ivars->phyAdvertiseMask = 0x0000000Fu;  // AQ_ADV_MASK: advertise 100M, 1G, 2.5G, 5G (autoneg all rates)
     return true;
 }
 
@@ -879,11 +886,32 @@ disarmAsyncIO(AQC111NIC_IVars *ivars)
     }
 }
 
+// Writes the AQ_PHY_OPS advertise word: advertiseMask is AQ_ADV_MASK bits
+// (100M=0x1, 1G=0x2, 2.5G=0x4, 5G=0x8) — full autoneg (0xF) normally, or a
+// single bit when handleChosenMedia() has forced a specific rate. Shared by
+// hwEnable (bring-up) and handleChosenMedia (live runtime change) so the two
+// paths can't drift. Matches Linux aqc111_set_phy_speed()'s pause/downshift
+// defaults; Retries=3 per Linux default.
+static kern_return_t
+applyPhyAdvertise(IOUSBHostInterface *iface, uint32_t advertiseMask)
+{
+    uint32_t phyFlags = 0;
+    phyFlags |= (advertiseMask & 0x0000000Fu);  // AQ_ADV_MASK
+    phyFlags |= 1u << 16;     // AQ_PAUSE
+    phyFlags |= 1u << 17;     // AQ_ASYM_PAUSE
+    phyFlags |= 1u << 19;     // AQ_PHY_POWER_EN
+    phyFlags |= 1u << 21;     // AQ_DOWNSHIFT
+    phyFlags |= 3u << 24;     // AQ_DSH_RETRIES=3
+    kern_return_t ret = aqVendorOut32(iface, 0x61, phyFlags);
+    LogI("applyPhyAdvertise: AQ_PHY_OPS flags=0x%08x -> 0x%x", phyFlags, ret);
+    return ret;
+}
+
 // Minimal PHY-only bring-up sequence derived from Linux aqc111.c and the x86
 // IOKit RE notes. This intentionally does not enable RX or program the final
 // medium state; that belongs on the link-up path once the PHY is alive.
 static void
-hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
+hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac, uint32_t advertiseMask)
 {
     kern_return_t ret;
     uint8_t  b;
@@ -948,17 +976,8 @@ hwEnable(IOUSBHostInterface *iface, const IOUserNetworkMACAddress &mac)
     }
     LogI("hwEnable: reg[0x00B0] clear bit0 -> 0x%x", ret);
 
-    // Step 2: full advertisement. Matches Linux aqc111_set_phy_speed() with
-    // autoneg=ENABLE, speed=SPEED_5000 (all rates). Retries=3 per Linux default.
-    phyFlags = 0;
-    phyFlags |= 0x0000000Fu;  // AQ_ADV_MASK: 100M, 1G, 2.5G, 5G
-    phyFlags |= 1u << 16;     // AQ_PAUSE
-    phyFlags |= 1u << 17;     // AQ_ASYM_PAUSE
-    phyFlags |= 1u << 19;     // AQ_PHY_POWER_EN
-    phyFlags |= 1u << 21;     // AQ_DOWNSHIFT
-    phyFlags |= 3u << 24;     // AQ_DSH_RETRIES=3 (matches Linux aqc111_set_phy_speed default)
-    ret = aqVendorOut32(iface, 0x61, phyFlags);
-    LogI("hwEnable: AQ_PHY_OPS step2 flags=0x%08x -> 0x%x", phyFlags, ret);
+    // Step 2: advertisement.
+    ret = applyPhyAdvertise(iface, advertiseMask);
 
     // NOTE: ETH_MAC_PATH, BULK_OUT_CTRL, and coalescing are intentionally
     // NOT programmed here. x86 hwStart and Linux aqc111_reset both stop at
@@ -1759,7 +1778,7 @@ IMPL(AQC111NIC, SetInterfaceEnable)
         // a stale autoneg-in-progress state; the device may not re-signal once
         // autoneg actually completes, leaving the interface stuck "inactive"
         // until a physical cable transition.
-        hwEnable(ivars->interface, ivars->macAddress);
+        hwEnable(ivars->interface, ivars->macAddress, ivars->phyAdvertiseMask);
 
         kern_return_t armRet = armAsyncIO(ivars);
         LogI("SetInterfaceEnable: armAsyncIO -> 0x%x", armRet);
@@ -1876,6 +1895,50 @@ kern_return_t
 AQC111NIC::handleChosenMedia(MediaWord chosenMedia)
 {
     LogI("handleChosenMedia: 0x%x", chosenMedia);
+
+    // Hardware only supports full duplex at every rate it advertises (matches
+    // Linux aqc111_set_link_ksettings's explicit DUPLEX_FULL-only check) — no
+    // forced-half-duplex mode exists to map this onto.
+    if (chosenMedia & kIOUserNetworkMediaOptionHalfDuplex) {
+        LogE("handleChosenMedia: half-duplex requested, unsupported");
+        return kIOReturnUnsupported;
+    }
+
+    MediaWord baseType = chosenMedia & kIOUserNetworkMediaEthernetMask;
+    uint32_t advertiseMask;
+    switch (baseType) {
+    case kIOUserNetworkMediaEthernetAuto:
+    case kIOUserNetworkMediaEthernetNone:
+    case kIOUserNetworkMediaEthernetManual:
+        advertiseMask = 0x0000000Fu;  // AQ_ADV_MASK: autoneg all rates
+        break;
+    case kIOUserNetworkMediaEthernet100BaseTX:
+        advertiseMask = 0x1u;  // AQ_ADV_100M only — force this rate
+        break;
+    case kIOUserNetworkMediaEthernet1000BaseT:
+        advertiseMask = 0x2u;  // AQ_ADV_1G only
+        break;
+    case kIOUserNetworkMediaEthernet2500BaseT:
+        advertiseMask = 0x4u;  // AQ_ADV_2G5 only
+        break;
+    case kIOUserNetworkMediaEthernet5000BaseT:
+        advertiseMask = 0x8u;  // AQ_ADV_5G only
+        break;
+    default:
+        LogE("handleChosenMedia: unsupported media type 0x%x", baseType);
+        return kIOReturnUnsupported;
+    }
+
+    ivars->phyAdvertiseMask = advertiseMask;
+    LogI("handleChosenMedia: advertiseMask=0x%x (interfaceEnabled=%d)",
+        advertiseMask, ivars->interfaceEnabled);
+
+    // Apply live if the interface is already up; otherwise the stored mask
+    // takes effect on the next hwEnable (ifconfig up).
+    if (ivars->interfaceEnabled && ivars->interface != nullptr) {
+        kern_return_t ret = applyPhyAdvertise(ivars->interface, advertiseMask);
+        return ret;
+    }
     return kIOReturnSuccess;
 }
 
