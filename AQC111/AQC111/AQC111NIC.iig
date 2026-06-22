@@ -11,6 +11,7 @@
 #define AQC111NIC_h
 
 #include <Availability.h>
+#include <net/ethernet.h>
 #include <DriverKit/IOService.iig>
 #include <DriverKit/IODataQueueDispatchSource.iig>
 #include <NetworkingDriverKit/IOUserNetworkEthernet.iig>
@@ -91,6 +92,13 @@ public:
 
     virtual kern_return_t
     SetWakeOnMagicPacketEnable(bool enable) override;
+
+    // Runtime MAC address override — see IMPL_PLAN.md M6j
+    virtual kern_return_t
+    getHardwareAddress(ether_addr_t * addr) override LOCALONLY;
+
+    virtual kern_return_t
+    setHardwareAddress(ether_addr_t * addr) override LOCALONLY;
 
     // Deprecated LOCAL pure virtuals
     virtual kern_return_t

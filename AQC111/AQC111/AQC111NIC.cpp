@@ -1816,6 +1816,39 @@ IMPL(AQC111NIC, SetWakeOnMagicPacketEnable)
     return kIOReturnSuccess;
 }
 
+kern_return_t
+AQC111NIC::getHardwareAddress(ether_addr_t *addr)
+{
+    LogI("getHardwareAddress: called, cached=%02x:%02x:%02x:%02x:%02x:%02x",
+        ivars->macAddress.octet[0], ivars->macAddress.octet[1], ivars->macAddress.octet[2],
+        ivars->macAddress.octet[3], ivars->macAddress.octet[4], ivars->macAddress.octet[5]);
+    if (addr == nullptr) {
+        return kIOReturnBadArgument;
+    }
+    memcpy(addr->octet, ivars->macAddress.octet, 6);
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+AQC111NIC::setHardwareAddress(ether_addr_t *addr)
+{
+    LogI("setHardwareAddress: called");
+    if (addr == nullptr) {
+        return kIOReturnBadArgument;
+    }
+    LogI("setHardwareAddress: requested %02x:%02x:%02x:%02x:%02x:%02x",
+        addr->octet[0], addr->octet[1], addr->octet[2],
+        addr->octet[3], addr->octet[4], addr->octet[5]);
+
+    kern_return_t ret = aqWrite(ivars->interface, 0x0010, addr->octet, 6);
+    LogI("setHardwareAddress: write SFR_NODE_ID -> 0x%x", ret);
+    if (ret != kIOReturnSuccess) {
+        return ret;
+    }
+    memcpy(ivars->macAddress.octet, addr->octet, 6);
+    return kIOReturnSuccess;
+}
+
 // --- Media support ---
 
 kern_return_t

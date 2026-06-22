@@ -7,6 +7,56 @@ it proved. Organized by feature, newest entries at the top of each section.
 
 ---
 
+## Runtime MAC Address Override
+
+### Negative control (2026-06-23): confirmed broken before implementation
+
+Before adding any override, `setHardwareAddress`/`getHardwareAddress` did not exist anywhere in `AQC111NIC.iig`/`.cpp` — the MAC was only ever written to `SFR_NODE_ID` once, at `Start()`, from the value read at boot.
+
+```text
+$ ifconfig en9 | grep ether
+    ether 3c:8c:f8:f9:d7:a3
+$ sudo ifconfig en9 lladdr 02:11:22:33:44:55
+ifconfig: ioctl (SIOCAIFADDR): Can't assign requested address
+```
+
+Ruled out link state as the cause before concluding it was the missing override: taking the interface down first made it fail *earlier* (`ENETDOWN`) rather than succeed, and bringing it back up reproduced the identical `EADDRNOTAVAIL`. Also checked whether this was a macOS-wide block rather than a missing override: attempting the identical address change against a completely different interface (`en6`, different hardware/driver) failed with the same `SIOCAIFADDR`/`EADDRNOTAVAIL` error. That result alone was ambiguous on its own (could mean either "OS-wide block" or "that other driver also doesn't implement the override") and got resolved by the positive result below.
+
+### Implementation
+
+Added `getHardwareAddress(ether_addr_t *addr)` / `setHardwareAddress(ether_addr_t *addr)` overrides (`LOCALONLY`, matching the declared pair in `IOUserNetworkEthernet.iig`). `setHardwareAddress` validates, writes the new address to `SFR_NODE_ID` via the existing `aqWrite` path, and updates the cached `ivars->macAddress`; `getHardwareAddress` returns that cache. See `IMPL_PLAN.md` M6j.
+
+### Positive validation (2026-06-23): full end-to-end success
+
+```text
+log: setHardwareAddress: write SFR_NODE_ID -> 0x0
+$ ifconfig en9
+en9: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+    ether 3c:8c:f8:f9:d7:a4
+```
+
+- DHCP issued a fresh lease for the new address — the server treated it as a distinct client, independent corroboration that this is a real MAC change, not a stale `ifconfig` cache (see "Reusable Methodology Notes" below on `ifconfig`/aggregate counters not being trustworthy on their own).
+- Local `tcpdump -i en9` showed the new address (`3c:8c:f8:f9:d7:a4`) as the actual source MAC on live ARP and TCP traffic.
+- **Remote-side capture** (the rigor standard used for RX/TX checksum and VLAN — a local capture on the transmitting host isn't sufficient on its own) confirmed the same address on the wire from an independent vantage point, on real IPv6 MLDv2 multicast traffic:
+
+```text
+03:49:58.902594 3c:8c:f8:f9:d7:a4 > 33:33:00:00:00:16, ethertype IPv6 (0x86dd), length 110: :: > ff02::16: HBH ICMP6, multicast listener report v2, 2 group record(s), length 48
+```
+
+### Persistence investigation (2026-06-23): volatile across a genuine power cycle, not an EEPROM rewrite
+
+After the positive result above, a re-enumeration showed `Start()`'s flash-MAC read (`AQ_FLASH_PARAMETERS`, bRequest=0x20, logged as `"Start: readMAC -> ..."`) reporting back the *override* (`...a4`), not the original factory value (`...a3`) — initially read as evidence that `SFR_NODE_ID` writes durably rewrite whatever EEPROM-backed storage `AQ_FLASH_PARAMETERS` reads from. **Exactly what kind of re-enumeration produced that reading (whether the device genuinely lost power or not) was not conclusively established** — flagged here rather than asserted, since the next test is what actually settled the question.
+
+Restored the original address (`sudo ifconfig en9 lladdr 3c:8c:f8:f9:d7:a3`) and tested again with a **deliberate re-enumeration that included a real power disconnect**. Result: `Start: readMAC` reverted to the genuine factory value (`...a3`), not whatever was set immediately beforehand.
+
+**Conclusion:** a true power cycle reverts the override, so the factory EEPROM itself is not durably rewritten by this feature. The most likely explanation for the earlier `...a4` reading is that `AQ_FLASH_PARAMETERS` doesn't necessarily re-read raw EEPROM cells on every call — it may return a firmware-side cache that's only reloaded from real EEPROM at power-on, with `SFR_NODE_ID` writes updating that same cache operationally; a re-enumeration that doesn't fully power-cycle the chip would leave that cache (and the override) intact. This is a plausible explanation for the discrepancy, not a confirmed mechanism — what's actually confirmed is the end result (power-cycle reverts it, soft reset apparently doesn't), which is the practically important property regardless of the exact internal reason. This makes the override safe and power-cycle-scoped, not a risk of permanently overwriting the device's factory-assigned address — but confirming that required an actual power-disconnect test; a same-host logical re-enum alone was not sufficient to settle it, consistent with the general "SFR registers stay sticky absent a real power-cycle" caution in "Reusable Methodology Notes" below.
+
+### Conclusion
+
+Runtime MAC override works end-to-end: OS → `setHardwareAddress` → `SFR_NODE_ID` write → confirmed live on the wire from a third-party vantage point, with independent DHCP-server corroboration, and confirmed volatile/safe across an actual power cycle.
+
+---
+
 ## VLAN Support
 
 ### Step 1 — Layer 1 fix (2026-06-20): software VLAN path validated end-to-end

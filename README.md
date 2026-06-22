@@ -63,6 +63,11 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
   capture showing inline `802.1Q` tags on the wire, `vlan0` capture showing
   decapsulated IPv4, and a mismatched-VLAN negative control (`1235`) proving
   VLAN ID demux/filtering works; see `TESTING.md` and `IMPL_PLAN.md` M6e
+- Runtime MAC address override (`ifconfig en9 lladdr ...`) — validated
+  end-to-end including a remote-side capture confirming the new address live
+  on the wire, a fresh DHCP lease, and confirmation the override is
+  volatile/safe across a genuine power cycle (not a durable EEPROM rewrite);
+  see `TESTING.md` and `IMPL_PLAN.md` M6j
 
 **What is not done yet:**
 - TSO — firmware-based TCP segmentation via TX descriptor MSS field
@@ -75,7 +80,6 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
 - TX ring depth — the TX path submits one frame at a time and waits for USB completion before submitting the next (`txBusy`/`txInFlight` single-slot gate). RX uses 10 outstanding buffers in flight; TX has no equivalent pipelining, which caps achievable throughput well short of the link's 5 Gbps ceiling under sustained load.
 - Media selection, promiscuous mode, and multicast filtering — `SelectMediaType`, `SetPromiscuousModeEnable`, `SetAllMulticastModeEnable`, and `SetMulticastAddresses` are all currently no-op stubs: the OS believes these requests succeeded when they have no hardware effect. See `IMPL_PLAN.md` M6f–M6h.
 - `hwAssistMask` is not enforced for TX checksum or VLAN tagging — RX checksum offload correctly honors `SetHardwareAssists`, but TX checksum and inline VLAN-tag preservation happen unconditionally regardless of what the OS has enabled (e.g. `ifconfig -txcsum` has no observable effect on the wire). See `IMPL_PLAN.md` M6i.
-- Runtime MAC address override — `IOUserNetworkEthernet` exposes `getHardwareAddress`/`setHardwareAddress` specifically for this, and both reference drivers (Linux, the x86 kext) implement it, but neither is overridden here. The MAC is fixed at boot; `ifconfig en9 lladdr ...` / `networksetup -setether` has no effect. See `IMPL_PLAN.md` M6j.
 
 **Current bugs:**
 
