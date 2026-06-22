@@ -316,13 +316,10 @@ struct AQC111NIC_IVars {
     bool                                rxStarted;
     bool                                ioArmed;
     IOUserNetworkMACAddress             macAddress;
-    // Dext-owned queue for OSAction callbacks (timer, USB async IO).
+    // Dext-owned queue for OSAction callbacks (USB async IO).
     // CopyDispatchQueue("Default") returns the kernel-side networking proxy queue
     // which doesn't deliver OSAction callbacks into our process.
     IODispatchQueue                    *asyncQueue;
-    // OSAction dispatch diagnostic
-    IOTimerDispatchSource              *timerTest;
-    OSAction                           *timerAction;
     bool                                dumpedRx80;
     bool                                dumpedRx432;
     bool                                dumpedRxOther;
@@ -661,29 +658,6 @@ IMPL(AQC111NIC, Start)
     ret = RegisterService();
     LogI("Start: RegisterService -> 0x%x", ret);
 
-    // --- OSAction dispatch diagnostic ---
-    // If OnTimerFired fires ~3s after start, OSAction dispatch works on this
-    // provider shape. Expected to fire now that provider is IOUSBHostInterface.
-    {
-        kern_return_t tr = IOTimerDispatchSource::Create(ivars->queue, &ivars->timerTest);
-        if (tr == kIOReturnSuccess) {
-            tr = CreateActionOnTimerFired(0, &ivars->timerAction);
-        }
-        if (tr == kIOReturnSuccess) {
-            tr = ivars->timerTest->SetHandler(ivars->timerAction);
-            LogI("Start: timer SetHandler -> 0x%x", tr);
-            if (tr == kIOReturnSuccess) tr = ivars->timerTest->SetEnable(true);
-            LogI("Start: timer SetEnable -> 0x%x", tr);
-        }
-        if (tr == kIOReturnSuccess) {
-            uint64_t fireAt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 3ULL * 1000000000ULL;
-            kern_return_t wr = ivars->timerTest->WakeAtTime(kIOTimerClockUptimeRaw, fireAt, 0);
-            LogI("Start: timer WakeAtTime -> 0x%x (fires in ~3s)", wr);
-        } else {
-            LogE("Start: timer setup failed: 0x%x", tr);
-        }
-    }
-
     return ret;
 
 fail:
@@ -700,15 +674,8 @@ IMPL(AQC111NIC, Stop)
 
     // DispatchSync removed: during force-close/uninstall asyncQueue may not
     // be serviceable, causing DispatchSync to block indefinitely and
-    // preventing SUPERDISPATCH from ever being called. Instead: cancel timer
-    // and abort pipes directly, then close interface.
-
-    // Cancel timer directly (no queue serialisation needed — timer is
-    // one-shot and either already fired or idle by this point).
-    if (ivars->timerTest != nullptr) {
-        kern_return_t r = ivars->timerTest->Cancel(nullptr);
-        LogI("Stop: Cancel timer -> 0x%x", r);
-    }
+    // preventing SUPERDISPATCH from ever being called. Instead: abort pipes
+    // directly, then close interface.
 
     // Abort pipes synchronously before closing the interface.
     // kIOUSBAbortSynchronous ensures completions have fired before returning.
@@ -731,8 +698,6 @@ IMPL(AQC111NIC, Stop)
     }
 
     LogI("Stop: releasing objects");
-    OSSafeReleaseNULL(ivars->timerAction);
-    OSSafeReleaseNULL(ivars->timerTest);
     OSSafeReleaseNULL(ivars->itrAction);
     OSSafeReleaseNULL(ivars->itrBuf);
     for (int i = 0; i < RX_SLOTS; i++) {
@@ -1358,14 +1323,6 @@ hwDisable(IOUSBHostInterface *iface)
     phyFlags = (1u << 18) | (1u << 19);
     r = aqVendorOut32(iface, 0x61, phyFlags);
     LogI("hwDisable: AQ_PHY_OPS lowPower flags=0x%08x -> 0x%x", phyFlags, r);
-}
-
-// --- OSAction dispatch diagnostic ---
-
-void
-IMPL(AQC111NIC, OnTimerFired)
-{
-    LogI("OnTimerFired: OSAction dispatch CONFIRMED WORKING (time=%llu)", time);
 }
 
 // --- TX path ---

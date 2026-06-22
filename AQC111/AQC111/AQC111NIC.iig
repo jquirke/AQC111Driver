@@ -12,7 +12,6 @@
 
 #include <Availability.h>
 #include <DriverKit/IOService.iig>
-#include <DriverKit/IOTimerDispatchSource.iig>
 #include <DriverKit/IODataQueueDispatchSource.iig>
 #include <NetworkingDriverKit/IOUserNetworkEthernet.iig>
 #include <USBDriverKit/IOUSBHostPipe.iig>
@@ -50,12 +49,6 @@ public:
                   IOReturn status,
                   uint32_t actualByteCount,
                   uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
-
-    // OSAction dispatch diagnostic — fires 3s after Start() via IOTimerDispatchSource.
-    // If this fires, OSAction dispatch works for this class; if not, it's broken globally.
-    virtual void
-    OnTimerFired(OSAction * action,
-                 uint64_t time) TYPE(IOTimerDispatchSource::TimerOccurred);
 
     // TX path — fired by IODataQueueDispatchSource when stack enqueues a packet
     virtual void
