@@ -142,8 +142,7 @@ applyLogLevelFromDictionary(OSDictionary *dict)
 // Max multicast groups the 64-bucket hash table can represent precisely
 // before falling back to accept-all-multicast (matches Linux's AQ_MAX_MCAST
 // in aqc111_set_rx_mode). Validated 2026-06-23 with this temporarily lowered
-// to 5 against the handful of multicast groups macOS already joins by
-// default — see IMPL_PLAN.md M6h / TESTING.md "Multicast Filtering".
+// to 10 — see IMPL_PLAN.md M6h / "Bug fix plan — AMALL fallback...".
 #define AQ_MAX_MCAST_ADDRESSES          64
 
 #define AQ_PAUSE_WATERMARK_LOW_BYTE     0
@@ -331,6 +330,17 @@ struct AQC111NIC_IVars {
     // local literal, so the setting survives a later ifconfig down/up cycle
     // instead of silently reverting on the next link-up. See IMPL_PLAN.md M6g.
     uint16_t                            rxFilterBits;
+    // SFR_RX_CTL_AMALL has two independent triggers — an explicit
+    // SetAllMulticastModeEnable(true) request, and doSetMulticastAddresses()
+    // falling back when count exceeds AQ_MAX_MCAST_ADDRESSES. Tracked
+    // separately (rather than OR-ing once straight into rxFilterBits) so
+    // that when the address count later drops back under the threshold, the
+    // overflow contribution can retract on its own without also clearing an
+    // independently-active explicit request. recomputeAmallBit() combines
+    // both into rxFilterBits. Confirmed reproduced as a real bug before this
+    // existed — see IMPL_PLAN.md "Bug fix plan — AMALL fallback...".
+    bool                                allMulticastRequested;
+    bool                                mcastCountExceeded;
     // Dext-owned queue for OSAction callbacks (USB async IO).
     // CopyDispatchQueue("Default") returns the kernel-side networking proxy queue
     // which doesn't deliver OSAction callbacks into our process.
@@ -1783,18 +1793,29 @@ doSetPromiscuousMode(AQC111NIC_IVars *ivars, bool enable)
     return applyRxFilterBits(ivars);
 }
 
-// Same consistency policy as doSetPromiscuousMode. Toggles SFR_RX_CTL_AMALL
-// (0x0002). See IMPL_PLAN.md M6h.
-static kern_return_t
-doSetAllMulticastMode(AQC111NIC_IVars *ivars, bool enable)
+// SFR_RX_CTL_AMALL (0x0002) has two independent sources — see the
+// allMulticastRequested/mcastCountExceeded ivar comment. Recomputes the bit
+// as their OR every time either source changes, so the overflow trigger can
+// retract on its own without disturbing an independently-active explicit
+// request, and vice versa.
+static void
+recomputeAmallBit(AQC111NIC_IVars *ivars)
 {
-    if (enable) {
+    if (ivars->allMulticastRequested || ivars->mcastCountExceeded) {
         ivars->rxFilterBits |= 0x0002u;  // SFR_RX_CTL_AMALL
     } else {
         ivars->rxFilterBits &= ~0x0002u;
     }
-    LogI("doSetAllMulticastMode: rxFilterBits=0x%04x (interfaceEnabled=%d)",
-        ivars->rxFilterBits, ivars->interfaceEnabled);
+}
+
+// Same consistency policy as doSetPromiscuousMode. See IMPL_PLAN.md M6h.
+static kern_return_t
+doSetAllMulticastMode(AQC111NIC_IVars *ivars, bool enable)
+{
+    ivars->allMulticastRequested = enable;
+    recomputeAmallBit(ivars);
+    LogI("doSetAllMulticastMode: requested=%d rxFilterBits=0x%04x (interfaceEnabled=%d)",
+        ivars->allMulticastRequested, ivars->rxFilterBits, ivars->interfaceEnabled);
     return applyRxFilterBits(ivars);
 }
 
@@ -1852,12 +1873,16 @@ doSetMulticastAddresses(AQC111NIC_IVars *ivars, const uint8_t *addresses, uint32
 {
     // Too many groups for the 64-bucket hash table to represent precisely —
     // fall back to accept-all-multicast instead (mirrors Linux's
-    // mc_count > AQ_MAX_MCAST check). Sticky until an explicit
-    // SetAllMulticastModeEnable(false) — not cleared just because count
-    // later drops back under the threshold, to avoid clobbering an
-    // independently-requested AMALL state from that separate call.
-    if (count > AQ_MAX_MCAST_ADDRESSES) {
-        ivars->rxFilterBits |= 0x0002u;  // SFR_RX_CTL_AMALL
+    // mc_count > AQ_MAX_MCAST check), via the count-exceeded contribution to
+    // SFR_RX_CTL_AMALL recomputed alongside any independent explicit request
+    // (see allMulticastRequested/mcastCountExceeded ivar comment) — so this
+    // retracts cleanly once count drops back under the threshold instead of
+    // staying stuck on (confirmed reproduced as a real bug before this
+    // existed — see IMPL_PLAN.md "Bug fix plan — AMALL fallback...").
+    ivars->mcastCountExceeded = (count > AQ_MAX_MCAST_ADDRESSES);
+    recomputeAmallBit(ivars);
+
+    if (ivars->mcastCountExceeded) {
         LogI("doSetMulticastAddresses: count=%u exceeds max %u, falling back to AMALL",
             count, AQ_MAX_MCAST_ADDRESSES);
         return applyRxFilterBits(ivars);

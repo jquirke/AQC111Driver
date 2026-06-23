@@ -169,7 +169,17 @@ Temporarily lowered `AQ_MAX_MCAST_ADDRESSES` to `5` in a real build (the macOS b
 
 Multicast filtering works end-to-end across both mechanisms: per-address CRC32-hash filtering (verified against an independent reference implementation and real socket delivery, not just register writes) and the `AMALL` accept-all fallback for when the address count exceeds the hash table's capacity (verified to actually bypass per-address filtering, not just set a bit with assumed effect).
 
-**Not validated:** only the overflow→`AMALL` direction was tested here — the count dropping back under the threshold afterward was not, and reasoning through that direction surfaced a real bug (the fallback can never retract once triggered, since nothing clears it). See `IMPL_PLAN.md` "Bug fix plan — AMALL fallback can never be retracted once triggered by address-count overflow".
+Initially, only the overflow→`AMALL` direction was tested above — the count dropping back under the threshold afterward was not, and reasoning through that direction surfaced a real bug. Reproduced, fixed, and re-validated below.
+
+### AMALL-retraction bug: reproduced, then fixed and re-validated (2026-06-23)
+
+Throughout this test, each negative-control address was computed independently in Python (the same CRC32/`bitrev32` algorithm the driver uses) and deliberately chosen to land on a hash bucket clear of every bucket occupied by macOS's real, currently-joined multicast groups at the time — checked freshly each round rather than assumed to still hold from an earlier round. This is what makes "admitted" or "dropped" actually mean something here: without that check, a result could just be coincidental overlap with an unrelated, legitimately-joined group's hash bit, not evidence about `AMALL` specifically.
+
+**Reproduced (before the fix):** lowered `AQ_MAX_MCAST_ADDRESSES` to `10`. Joined 5 extra multicast groups (`239.255.2.1`-`.5`) on top of macOS's standing ~7-8, pushing `count` to `12` — confirmed the fallback engaged (`RX_CTL=0x029a`). Sent a frame to a freshly-computed non-colliding address (`239.255.3.1` → `01:00:5e:7f:03:01`, bucket 2, confirmed clear of every bucket occupied this session) and confirmed it admitted, as expected with `AMALL` active. Dropped all 5 extra groups. The driver correctly recomputed and wrote a fresh 7-entry hash table (`filter=00 c0 00 82 00 40 01 40`) — but `RX_CTL` stayed at `0x029a`, `AMALL` never cleared. Re-sent the identical `01:00:5e:7f:03:01` frame (still confirmed clear of this fresh table too): **still admitted**, despite being absent from the table and `count` well within hash-table capacity. Confirmed the bug exactly as predicted — `AMALL` had no path to retract once the overflow trigger set it.
+
+**Fix:** see `IMPL_PLAN.md` "Bug fix plan — AMALL fallback can never be retracted once triggered by address-count overflow" for the implementation (separate `allMulticastRequested`/`mcastCountExceeded` triggers, recomputed via a shared helper).
+
+**Re-validated (after the fix):** repeated the identical reproduction — joined the same 5 groups, `count=12`, `AMALL` engaged (`RX_CTL=0x029a`), `01:00:5e:7f:03:01` admitted as the "before" reference point. Dropped the 5 groups again: `count=7`, fresh table written, and this time `RX_CTL=0x0298` — `AMALL` correctly cleared. Re-sent the identical frame: no longer captured by `tcpdump` at all, confirming the retraction held at both the register level and actual frame-admission behavior. Restored `AQ_MAX_MCAST_ADDRESSES` to `64` afterward.
 
 ---
 

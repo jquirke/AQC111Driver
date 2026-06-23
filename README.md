@@ -110,18 +110,6 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
    metadata to Skywalk; an earlier inherited `VSO=0x10` write broke software
    VLAN demux by removing the inline tag before macOS could classify it.
 
-4. **Multicast accept-all fallback can never be retracted once triggered.**
-   `SFR_RX_CTL_AMALL` has two independent triggers — an explicit
-   `SetAllMulticastModeEnable(true)` and `SetMulticastAddresses` falling back
-   when the group count exceeds the 64-bucket hash table's capacity — but
-   both currently OR into the same bit with no way to tell them apart later.
-   Since the OS has no reason to call `SetAllMulticastModeEnable(false)` to
-   undo a fallback it didn't ask for, a group count that briefly exceeds 64
-   leaves the NIC accepting all multicast traffic permanently, even after the
-   count drops back to something the hash table could represent precisely.
-   Fix plan in `IMPL_PLAN.md` "Bug fix plan — AMALL fallback can never be
-   retracted once triggered by address-count overflow"; not yet implemented.
-
 ---
 
 ## Provisioning Requirements
