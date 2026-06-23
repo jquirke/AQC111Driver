@@ -90,8 +90,9 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
 - TSO — firmware-based TCP segmentation via TX descriptor MSS field
 - Hardware VLAN tag insert/strip — the AQC111U supports this in silicon and
   the RX/TX descriptors carry VLAN metadata, but the current supported path is
-  software `vlan(4)` with inline 802.1Q tags. Hardware offload remains a
-  separate future optimization; see `IMPL_PLAN.md` M6e.
+  software `vlan(4)` with inline 802.1Q tags. Hardware offload is confirmed
+  blocked via Apple DTS, not just unimplemented — there's no public DriverKit
+  path to it for third-party drivers; see `IMPL_PLAN.md` M6e.
 - Wake-on-LAN — magic packet path exists in hardware; not wired up
 - PHY access polymorphism — the AQC111U has two PHY control interfaces selected by firmware major version (`>= 0x80` → `FWPhyAccess` via bRequest=0x61; `< 0x80` → `DirectPhyAccess` via bRequest=0x31/0x32). The driver reads and logs the firmware version at start but unconditionally uses the `FWPhyAccess` path. This is correct for the DUT (firmware `major=0x82`). Support for older `DirectPhyAccess` devices is not implemented.
 - TX ring depth — the TX path submits one frame at a time and waits for USB completion before submitting the next (`txBusy`/`txInFlight` single-slot gate). RX uses 10 outstanding buffers in flight; TX has no equivalent pipelining, which caps achievable throughput well short of the link's 5 Gbps ceiling under sustained load.
@@ -102,13 +103,6 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
 1. **Teardown leaves corpse processes that block reinstall.** After uninstall, both personalities leave orphaned dext processes that sysextd waits on indefinitely rather than force-killing. A reboot is not required — sending `SIGTERM` to all corpse processes after uninstall is almost always sufficient to allow reinstallation. The underlying cause (why `Stop()` RPCs go undeliverable and sysextd doesn't recover) should be studied and corrected.
 
 2. **RX silently stops mid-session; TX keeps working.** Confirmed recurring (three occurrences so far). Root cause identified: a `kIOReturnNotResponding` device hiccup leaves USB pipes stalled afterward, and the driver has three separate gaps in stall recovery — one per pipe (RX, ITR, TX) — each missing a different shape of the same problem (stall-as-completion-status on RX not handled outside the `kUSBHostReturnPipeStalled` case; stall-as-resubmission-return-value on ITR and TX never checked at all). Recovery requires unplugging/re-enumerating the device. Fix plan documented in `IMPL_PLAN.md`; not yet implemented — collecting more occurrences first to confirm it covers all observed patterns before spending implementation effort.
-
-3. **Hardware VLAN offload is not implemented.** Software VLAN traffic works
-   via inline 802.1Q tags and macOS `vlan(4)`, but the driver does not yet use
-   AQC111U descriptor VLAN metadata for hardware tag insertion/stripping.
-   Do not enable hardware stripping without also delivering RX descriptor VLAN
-   metadata to Skywalk; an earlier inherited `VSO=0x10` write broke software
-   VLAN demux by removing the inline tag before macOS could classify it.
 
 ---
 
