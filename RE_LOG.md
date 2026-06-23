@@ -1153,11 +1153,11 @@ Ring of **32 slots** (0x20, wrap mod 0x20). Each entry is **0x18 bytes** (24 byt
 |--------|-------|
 | `ring[0x00]` | DWORD: head index — next slot to free in `onComplete()` |
 | `ring[0x04]` | DWORD: fill index — next slot to use in `transmit()` |
-| `ring[8 + n*0x18 + 0x00]` | pre-allocated DMA/bounce buffer ptr — allocated during `init()`, one 0x4000-byte region per slot |
+| `ring[8 + n*0x18 + 0x00]` | pre-allocated mbuf cluster ptr — allocated during `init()`, one 0x4000-byte region per slot |
 | `ring[8 + n*0x18 + 0x08]` | `IOMemoryDescriptor*` — per-frame descriptor, created by `withAddressRanges()` in `transmit()` |
 | `ring[8 + n*0x18 + 0x10]` | `__mbuf*` — mbuf being transmitted; released in `onComplete()` |
 
-`init()` pre-allocates 32 × 0x4000-byte (16 KB) DMA buffers and stores them in entry[0x00]. Confirms TX ring is separate from free-list allocation; entries are recycled in-place.
+`Tx::init()` (`0x34a4`) calls `_mbuf_alloccluster(0, 0x4000, &out_ptr)` 32 times and stores each result in entry[0x00] — these are BSD **mbuf cluster** allocations (standard kernel network-buffer memory), not an `IOBufferMemoryDescriptor`/IOKit DMA buffer of any kind. Corrected 2026-06-23: an earlier pass through this table labeled this field "DMA/bounce buffer ptr" without disassembly backing that specific claim — `mbuf_alloccluster` doesn't by itself imply anything about USB DMA bounce-buffering one way or the other; whatever DMA characteristics apply happen later, in the separate per-frame `IOMemoryDescriptor` `withAddressRanges()` wraps around a sub-range of this cluster in `transmit()`, which this disassembly doesn't resolve. `Rx::init()` (`0x1d44`) is a one-line no-op (returns `1`); RX buffers are instead allocated fresh per-slot in `Rx::refill()` via `_mbuf_allocpacket(0x10000, ...)`, not pre-allocated at `init()` time at all. Confirms TX ring is separate from free-list allocation; entries are recycled in-place.
 
 ### TX Packet Descriptor
 
