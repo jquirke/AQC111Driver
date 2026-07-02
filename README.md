@@ -100,7 +100,7 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
 - Wake-on-LAN — magic packet path exists in hardware; not wired up
 - PHY access polymorphism — the AQC111U has two PHY control interfaces selected by firmware major version (`>= 0x80` → `FWPhyAccess` via bRequest=0x61; `< 0x80` → `DirectPhyAccess` via bRequest=0x31/0x32). The driver reads and logs the firmware version at start but unconditionally uses the `FWPhyAccess` path. This is correct for the DUT (firmware `major=0x82`). Support for older `DirectPhyAccess` devices is not implemented.
 - TX ring depth — the TX path submits one frame at a time and waits for USB completion before submitting the next (`txBusy`/`txInFlight` single-slot gate). RX uses 10 outstanding buffers in flight; TX has no equivalent pipelining, which caps achievable throughput well short of the link's 5 Gbps ceiling under sustained load.
-- RX copy path — this driver does one `memcpy` per received frame (raw USB buffer → packet pool), the same as Linux, because the RX buffer is reused in-place and must be reposted immediately. The x86 kext achieves zero payload copies via a different strategy (fresh mbuf allocation every cycle + zero-copy mbuf splitting) not directly portable to this driver's model. Separately, RX/TX/ITR buffers use the generic `IOBufferMemoryDescriptor::Create()` allocator rather than `IOUSBHostInterface::CreateIOBuffer()`, which is documented to avoid USB DMA bounce-buffering — unconfirmed whether this is a measurable throughput cost in practice, since Apple's own `IODMACommand` documentation states it doesn't bounce-buffer by itself either way. See `IMPL_PLAN.md` M9.
+- RX copy path — this driver does one `memcpy` per received frame (raw USB buffer → packet pool), the same as Linux, because the RX buffer is reused in-place and must be reposted immediately. The x86 kext achieves zero payload copies via a different strategy (fresh mbuf allocation every cycle + zero-copy mbuf splitting) not directly portable to this driver's model. Separately, RX/TX/ITR pipe buffers can be allocated via `IOUSBHostInterface::CreateIOBuffer()` by setting `AQC111UseInterfacePipeBuffers=true` in the NIC personality, avoiding the generic `IOBufferMemoryDescriptor::Create()` path. This is confirmed working, but not yet benchmarked for throughput impact. See `IMPL_PLAN.md` M9.
 - `hwAssistMask` is not enforced for TX checksum or VLAN tagging — RX checksum offload correctly honors `SetHardwareAssists`, but TX checksum and inline VLAN-tag preservation happen unconditionally regardless of what the OS has enabled (e.g. `ifconfig -txcsum` has no observable effect on the wire). See `IMPL_PLAN.md` M6i.
 
 **Current bugs:**
@@ -156,6 +156,13 @@ log stream --predicate 'process == "kernel" AND eventMessage contains "AQC111"' 
 DriverKit dext `os_log` output is attributed to the `kernel` process.
 
 **Log verbosity is runtime-controllable** (see `IMPL_PLAN.md` "Log Level Strategy"): defaults to Info via the `AQC111LogLevel` key in `Info.plist`, and can be raised/lowered live without reinstalling via `tools/set-log-level.swift <0-3>` (0=Error, 1=Info, 2=Debug, 3=Verbose — Debug/Verbose include per-packet and hex-dump logging, off by default).
+
+**Pipe buffer allocator is plist-controllable** via the `AQC111UseInterfacePipeBuffers` boolean in the `AQC111-NIC` personality:
+
+- `true`: use `IOUSBHostInterface::CreateIOBuffer()` for TX/RX/ITR pipe buffers. TX must be allocated with `kIOMemoryDirectionOutIn`; a pure `kIOMemoryDirectionOut` interface-created TX buffer is CPU-read-only and faults when the dext writes the TX descriptor/frame.
+- `false`: use the generic `IOBufferMemoryDescriptor::Create()` allocator, preserving the original behavior. Generic `Out` buffers are more permissive for CPU writes, so TX works with `kIOMemoryDirectionOut`.
+
+The DriverKit lesson from testing is that direction flags are enforced more strictly for interface-created USB DMA buffers than for generic self-allocated buffers. RX and ITR with `kIOMemoryDirectionIn` work on both allocator paths; TX with interface-created buffers requires bidirectional mapping.
 
 Test methodology and results for features that need more than "it compiled" as evidence — e.g. the RX checksum offload validation — are tracked in `TESTING.md`.
 
