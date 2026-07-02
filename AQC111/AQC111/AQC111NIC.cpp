@@ -41,7 +41,6 @@
 #define kLogLevelDebug      2
 #define kLogLevelVerbose    3
 static volatile uint8_t gLogLevel = kLogLevelInfo;
-static bool gUseInterfacePipeBuffers = true;
 
 #define LogE(fmt, ...) do { if (gLogLevel >= kLogLevelError)   os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] Error(level=%u) - " fmt,   gLogLevel, ##__VA_ARGS__); } while (0)
 #define LogI(fmt, ...) do { if (gLogLevel >= kLogLevelInfo)    os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] Info(level=%u) - " fmt,    gLogLevel, ##__VA_ARGS__); } while (0)
@@ -82,19 +81,6 @@ applyLogLevelFromDictionary(OSDictionary *dict)
     if (level <= kLogLevelVerbose) {
         gLogLevel = (uint8_t)level;
     }
-}
-
-static void
-applyPipeBufferConfigFromDictionary(OSDictionary *dict)
-{
-    if (dict == nullptr) {
-        return;
-    }
-    OSBoolean *useInterface = OSDynamicCast(OSBoolean, dict->getObject("AQC111UseInterfacePipeBuffers"));
-    if (useInterface == nullptr) {
-        return;
-    }
-    gUseInterfacePipeBuffers = (useInterface == kOSBooleanTrue);
 }
 
 // Endpoint addresses for Config 1 vendor interface (class 0xFF)
@@ -183,16 +169,6 @@ applyPipeBufferConfigFromDictionary(OSDictionary *dict)
     kIOUserNetworkHWAssistTxChecksumTCP | \
     kIOUserNetworkHWAssistSoftwareVlan | \
     kIOUserNetworkHWAssistTxChecksumUDP)
-
-static kern_return_t
-allocPipeBuffer(IOUSBHostInterface *interface, uint64_t direction,
-                uint64_t capacity, IOBufferMemoryDescriptor **buf)
-{
-    if (gUseInterfacePipeBuffers)
-        return interface->CreateIOBuffer((IOOptionBits)direction, capacity, buf);
-    (void)interface;
-    return IOBufferMemoryDescriptor::Create(direction, capacity, 0, buf);
-}
 
 // RX Packet Descriptor checksum sub-fields (lower 16 bits of pd; see
 // IMPL_PLAN.md M6a — cross-checked against Linux aqc111.h and x86 kext RE).
@@ -444,11 +420,9 @@ IMPL(AQC111NIC, Start)
         OSDictionary *props = nullptr;
         if (CopyProperties(&props) == kIOReturnSuccess && props != nullptr) {
             applyLogLevelFromDictionary(props);
-            applyPipeBufferConfigFromDictionary(props);
         }
         OSSafeReleaseNULL(props);
         LogI("Start: gLogLevel=%u (0=Error 1=Info 2=Debug 3=Verbose)", gLogLevel);
-        LogI("Start: AQC111UseInterfacePipeBuffers=%d", gUseInterfacePipeBuffers);
     }
 
     // Create a dext-owned queue for Skywalk RxDispatchQueue/TxDispatchQueue slots.
@@ -658,10 +632,9 @@ IMPL(AQC111NIC, Start)
     if (ret != kIOReturnSuccess) { LogE("Start: CreateActionOnTxComplete failed: 0x%x", ret); goto fail; }
 
     // Staging buffer: 8-byte descriptor + max supported Ethernet frame.
-    // Interface-created TX buffers enforce direction-derived CPU mappings; Out
-    // is read-only to the dext, so TX needs OutIn when using CreateIOBuffer.
-    ret = allocPipeBuffer(ivars->interface,
-        gUseInterfacePipeBuffers ? kIOMemoryDirectionOutIn : kIOMemoryDirectionOut,
+    // Interface-created buffers enforce direction-derived CPU mappings; pure
+    // Out is read-only to the dext, so the CPU-written TX buffer needs OutIn.
+    ret = ivars->interface->CreateIOBuffer(kIOMemoryDirectionOutIn,
         AQC111_TX_BUF_SIZE, &ivars->txBuf);
     if (ret != kIOReturnSuccess) { LogE("Start: txBuf alloc failed: 0x%x", ret); goto fail; }
 
@@ -673,7 +646,7 @@ IMPL(AQC111NIC, Start)
     // an autoneg-in-progress state, and the device may not re-signal once
     // autoneg settles — see notes/itr_ordering_analysis.md.
     for (int i = 0; i < RX_SLOTS; i++) {
-        ret = allocPipeBuffer(ivars->interface, kIOMemoryDirectionIn, RX_BUF_SIZE, &ivars->rxBufs[i]);
+        ret = ivars->interface->CreateIOBuffer(kIOMemoryDirectionIn, RX_BUF_SIZE, &ivars->rxBufs[i]);
         if (ret != kIOReturnSuccess) {
             LogE("Start: rxBuf[%d] alloc failed: 0x%x", i, ret);
             goto fail;
@@ -687,7 +660,7 @@ IMPL(AQC111NIC, Start)
     }
     LogI("Start: %d RX buffers allocated", RX_SLOTS);
 
-    ret = allocPipeBuffer(ivars->interface, kIOMemoryDirectionIn, 16, &ivars->itrBuf);
+    ret = ivars->interface->CreateIOBuffer(kIOMemoryDirectionIn, 16, &ivars->itrBuf);
     if (ret != kIOReturnSuccess) {
         LogE("Start: itrBuf alloc failed: 0x%x", ret);
         goto fail;

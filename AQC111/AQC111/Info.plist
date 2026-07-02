@@ -66,8 +66,6 @@
 			<integer>8436</integer>
 			<key>AQC111LogLevel</key>
 			<integer>1</integer>
-			<key>AQC111UseInterfacePipeBuffers</key>
-			<true/>
 			<key>AQC111LogUserClientProperties</key>
 			<dict>
 				<key>IOClass</key>
