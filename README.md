@@ -92,8 +92,11 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
 - Hardware VLAN tag insert/strip — the AQC111U supports this in silicon and
   the RX/TX descriptors carry VLAN metadata, but the current supported path is
   software `vlan(4)` with inline 802.1Q tags. Hardware offload is confirmed
-  blocked via Apple DTS, not just unimplemented — there's no public DriverKit
-  path to it for third-party drivers; see `IMPL_PLAN.md` M6e.
+  blocked via Apple DTS and verified empirically (declaring the undocumented
+  BSD `IF_HWASSIST_VLAN_TAGGING` value `0x00010000` is ignored wholesale, and
+  the OS never calls either generation of `setHardwareAssists`); the SDK
+  doc/header inconsistency is filed as `FB23530504`. See `IMPL_PLAN.md` M6e
+  and `TESTING.md` "VLAN Support" Step 2.
 - Wake-on-LAN — magic packet path exists in hardware; not wired up
 - PHY access polymorphism — the AQC111U has two PHY control interfaces selected by firmware major version (`>= 0x80` → `FWPhyAccess` via bRequest=0x61; `< 0x80` → `DirectPhyAccess` via bRequest=0x31/0x32). The driver reads and logs the firmware version at start but unconditionally uses the `FWPhyAccess` path. This is correct for the DUT (firmware `major=0x82`). Support for older `DirectPhyAccess` devices is not implemented.
 - TX ring depth — the TX path submits one frame at a time and waits for USB completion before submitting the next (`txBusy`/`txInFlight` single-slot gate). RX uses 10 outstanding buffers in flight; TX has no equivalent pipelining, which caps achievable throughput well short of the link's 5 Gbps ceiling under sustained load.

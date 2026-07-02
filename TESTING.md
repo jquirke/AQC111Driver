@@ -185,6 +185,58 @@ Throughout this test, each negative-control address was computed independently i
 
 ## VLAN Support
 
+### Step 2 — hardware-VLAN capability experiment (2026-07-02): DTS "blocked" verdict confirmed empirically
+
+Ran the experiment Apple DTS suggested (see `IMPL_PLAN.md` M6e, `notes/vlan_re.md`):
+declare the undocumented BSD/KPI hwassist value `IF_HWASSIST_VLAN_TAGGING`
+(`0x00010000`, adjacent to the published SoftwareVlan bit `0x00020000`) and see
+whether anything changes. Branch `test-hardware-vlan-bit`, kept unmerged. All
+runs used real rebuild/reinstall/reattach cycles and the Step 1 rig
+(`tools/setup-vlan1234.sh`, continuous tagged ICMP from the remote peer).
+
+**Baseline re-verification first.** Before introducing any variable, re-confirmed
+the Step 1 result on current `main`: bidirectional `802.1Q vlan 1234` ICMP on
+the parent capture, 100% replies.
+
+**`SetSoftwareVlanSupport(true)` removed from `Start()` (`aee26cf`) and proven
+inert by A/B/A.** The 2026-06-20 session had established the call does nothing,
+but the removal never actually landed. Removed it (also eliminating a potential
+confound for the bit experiment: "software VLAN explicitly requested" preempting
+hardware capability consideration had never been ruled out), re-ran the full
+bench: identical pass. A checksum difference in the captures briefly looked like
+a counter-example — with the call removed, outgoing replies left the local `en9`
+tap with IP checksum `0000` (deferred to TX checksum offload) where the previous
+run showed a software-computed value. Re-adding the call (A/B/A) still produced
+`0000`, so the call is not causal; the offload-propagation difference is rig
+state (likely whether `vlan0` was freshly recreated relative to driver attach),
+not driver code. Two useful byproducts: capture checksum fields are not a valid
+signal for comparing driver builds, and the remote-side capture (valid checksum
+arriving, 100% replies, local pre-hardware tap showing `0000`) proves the AQC111
+TX checksum engine correctly inserts the IP header checksum through an inline
+802.1Q tag.
+
+**The experiment itself** — `0x00010000` declared via `getFeatureFlags()` +
+hwAssist self-init, plus both `setHardwareAssists` generations implemented with
+logging (deprecated NDK_21 `SetHardwareAssists` and mask-based NDK_22
+`setHardwareAssists`) so any OS-side write would be visible:
+
+| Signal | A: bit + SoftwareVlan | B: bit alone |
+|---|---|---|
+| `GetHardwareAssists` readback | `0x20030007` (bit retained) | `0x20010007` (bit retained) |
+| `getVlanTag()` on outbound `vlan(4)` traffic | `has=0`, tag inline | `has=0`, tag inline |
+| RX frames | tag inline (software demux) | tag inline (software demux) |
+| Either `setHardwareAssists` called by OS | never | never |
+| `vlan0` MTU | — | **1496 (clamped)** |
+
+**Conclusion:** the undocumented value is ignored wholesale, not partially
+honored — in permutation B it doesn't even receive the VLAN-MTU accounting the
+published SoftwareVlan bit provides (`mtu 1496` vs `1500`). And nothing is
+observably "stripped in a setter", because the OS never calls either setter
+generation at all. Hardware VLAN offload is unreachable from the public SDK,
+now on empirical rather than DTS-asserted footing. Filed as `FB23530504`
+(SDK docs reference the nonexistent `kFeatureHardwareVlan`); companion
+Suggestion drafted in `notes/fb2_hardware_vlan_er.md`.
+
 ### Step 1 — Layer 1 fix (2026-06-20): software VLAN path validated end-to-end
 
 Implemented the fix predicted but not yet built when Step 0 found the bug:
@@ -263,11 +315,12 @@ That is the expected negative result and proves the fix did not flatten all
 tagged parent traffic into `vlan0`.
 
 **Conclusion:** M6e Layer 1 software VLAN support is validated. Required pieces
-are `SetSoftwareVlanSupport(true)`, declaring `kIOUserNetworkHWAssistSoftwareVlan`,
-allowing `+4` bytes in TX/RX frame-size checks and buffers, and disabling
-hardware VLAN stripping (`SFR_VLAN_ID_CONTROL=0x00`) until a future hardware
-VLAN metadata path exists. Hardware tag insert/strip remains out of scope for
-this pass.
+are declaring `kIOUserNetworkHWAssistSoftwareVlan`, allowing `+4` bytes in
+TX/RX frame-size checks and buffers, and disabling hardware VLAN stripping
+(`SFR_VLAN_ID_CONTROL=0x00`) until a future hardware VLAN metadata path exists.
+(`SetSoftwareVlanSupport(true)` was originally listed as a required piece here,
+but later testing proved it inert and it was removed from `Start()` — see
+Step 2.) Hardware tag insert/strip remains out of scope for this pass.
 
 ### Step 0 — baseline test (2026-06-20): confirmed broken before any code changes
 
