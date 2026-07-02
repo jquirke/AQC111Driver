@@ -49,7 +49,7 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
 **What works:**
 - USB enumeration with Config 1 forced (vendor-specific high-performance path)
 - Ethernet interface registered (`en10`, MAC read from hardware)
-- PHY bring-up and link negotiation (1000baseT full-duplex confirmed)
+- PHY bring-up and link negotiation (up to 5000baseT full-duplex confirmed)
 - `ifconfig enX up` / `ifconfig enX down` — link comes up and down correctly
 - End-to-end RX: frames arrive in Wireshark and tcpdump
 - End-to-end TX: ARP resolves, `ping` succeeds
@@ -72,7 +72,8 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
   validated end-to-end across 100M/2.5G (cross-confirmed by the link
   partner's own `ethtool` for the 2.5G case), survives an interface
   disable/enable cycle, and reverting to `autoselect` correctly climbs back
-  to the link's actual max; see `TESTING.md` and `IMPL_PLAN.md` M6f
+  to the link's actual max, including 5G on a capable peer; see `TESTING.md`
+  and `IMPL_PLAN.md` M6f
 - Promiscuous mode — validated by actually changing what frames the
   hardware admits (a foreign-destination-MAC frame, invisible without it,
   becomes visible on the wire once enabled and invisible again once
