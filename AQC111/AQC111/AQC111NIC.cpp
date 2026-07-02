@@ -610,15 +610,6 @@ IMPL(AQC111NIC, Start)
     }
     LogI("Start: RegisterEthernetInterface OK");
 
-    // Declare VLAN_MTU accommodation (IMPL_PLAN.md M6e) — without this call,
-    // the OS's vlan(4) software-tagging layer can't assume this interface
-    // tolerates a 4-byte-larger frame. Best-effort capability nudge, not
-    // fatal to Start() if it fails.
-    {
-        kern_return_t vlanRet = SetSoftwareVlanSupport(true);
-        LogI("Start: SetSoftwareVlanSupport(true) -> 0x%x", vlanRet);
-    }
-
     // --- TX path ---
     // Wire up TxPacketAvailable: stack notifies via IODataQueueDispatchSource
     // when it enqueues a packet onto txsQueue.
