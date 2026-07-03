@@ -44,7 +44,7 @@ Two DriverKit personalities in a single dext bundle:
 
 ## Current Status
 
-The driver loads, forces Config 1, registers an Ethernet interface, and has grown well past basic Ethernet connectivity: RX and TX hardware checksum offload, jumbo frame/MTU control, and runtime-controllable diagnostics are all implemented and validated (see below). The complete bidirectional data path — RX and TX — is confirmed working end-to-end: ARP resolves, and `ping` succeeds.
+The driver loads, forces Config 1, registers an Ethernet interface, and has grown well past basic Ethernet connectivity: RX and TX hardware checksum offload, TSO (TCP segmentation offload), jumbo frame/MTU control, and runtime-controllable diagnostics are all implemented and validated (see below). The complete bidirectional data path — RX and TX — is confirmed working end-to-end: ARP resolves, and `ping` succeeds.
 
 **What works:**
 - USB enumeration with Config 1 forced (vendor-specific high-performance path)
@@ -55,6 +55,13 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
 - End-to-end TX: ARP resolves, `ping` succeeds
 - RX checksum offload — validated end-to-end against deterministic good/bad-checksum test traffic, including the IP/TCP error-interaction edge case; see `TESTING.md` and `IMPL_PLAN.md` M6a
 - TX checksum offload — validated end-to-end including a genuine hardware-reset negative control; see `TESTING.md` and `IMPL_PLAN.md` M6b
+- TSO (TCP segmentation offload, v4 and v6) — the device segments up-to-64KB
+  super-packets in firmware from an MSS field in the TX descriptor; validated
+  for wire shape (MTU-sized segments captured with peer GRO disabled — see the
+  GRO capture trap in `TESTING.md`), 1 GiB SHA-256 end-to-end integrity both
+  clean and under 0.5% induced loss (~3,600 retransmissions), and TSO over
+  software VLAN (inline 802.1Q tag replicated correctly into every segment);
+  see `TESTING.md` and `IMPL_PLAN.md` M10
 - Jumbo MTU control — reports and applies MTU up to 16334; jumbo ICMP traffic
   validated up to 16 KB-class frames with matching peer hardware, with 4K
   streaming stable at both MTU 1500 and configured MTU 16334; see `TESTING.md`
@@ -88,7 +95,6 @@ The driver loads, forces Config 1, registers an Ethernet interface, and has grow
   `IMPL_PLAN.md` M6h
 
 **What is not done yet:**
-- TSO — firmware-based TCP segmentation via TX descriptor MSS field
 - Hardware VLAN tag insert/strip — the AQC111U supports this in silicon and
   the RX/TX descriptors carry VLAN metadata, but the current supported path is
   software `vlan(4)` with inline 802.1Q tags. Hardware offload is confirmed

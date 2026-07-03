@@ -141,6 +141,10 @@ public:
     // RX checksum offload capability declaration — see IMPL_PLAN.md M6a
     virtual uint32_t
     getFeatureFlags() override LOCALONLY;
+
+    // TSO limits (max super-packet size per family) — see IMPL_PLAN.md M10
+    virtual kern_return_t
+    getTSOOptions(IOUserNetworkTSOOptions *options) override LOCALONLY;
 };
 
 #endif /* AQC111NIC_h */

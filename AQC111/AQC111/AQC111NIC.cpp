@@ -99,7 +99,23 @@ applyLogLevelFromDictionary(OSDictionary *dict)
 #define AQC111_VLAN_TAG_LEN     4   // 802.1Q tag (see IMPL_PLAN.md M6e)
 #define AQC111_TX_DESC_LEN      8
 #define AQC111_MAX_FRAME_LEN    (AQC111_MAX_MTU + AQC111_ETH_HEADER_LEN + AQC111_VLAN_TAG_LEN)
-#define AQC111_TX_BUF_SIZE      (AQC111_TX_DESC_LEN + AQC111_MAX_FRAME_LEN)
+
+// TSO (IMPL_PLAN.md M10): the stack may hand one oversized TCP packet — up to
+// a 65535-byte IP packet (Linux parity, netif_set_tso_max_size) — which the
+// device segments into MSS-sized wire frames. Pool buffers and the TX staging
+// buffer are sized to hold the largest such packet.
+#define AQC111_TSO_MAX_IP_LEN    65535
+#define AQC111_TSO_MAX_FRAME_LEN (AQC111_TSO_MAX_IP_LEN + AQC111_ETH_HEADER_LEN + AQC111_VLAN_TAG_LEN)
+#define AQC111_TX_BUF_SIZE      (AQC111_TX_DESC_LEN + AQC111_TSO_MAX_FRAME_LEN + 16 /* worst-case padding */)
+
+// TX descriptor TSO MSS field, bits 46:32 (Linux aqc111.h AQ_TX_DESC_MSS_*).
+#define AQ_TX_DESC_MSS_MASK     0x7FFFULL
+#define AQ_TX_DESC_MSS_SHIFT    32
+// Drop-padding flag, bit 28: transfer carries 8 trailing pad bytes the device
+// must discard (set when padding would land on a bulk-OUT maxpacket boundary).
+#define AQ_TX_DESC_DROP_PADD    (1ULL << 28)
+// Bulk OUT endpoint max packet size (SuperSpeed) — the DROP_PADD boundary.
+#define AQC111_BULK_OUT_MAXPACKET 1024
 
 // SFR_RXCOE_CTL: per-protocol RX checksum offload enable (see IMPL_PLAN.md M6a).
 // TODO: most other SFR register addresses in this file are still raw hex
@@ -168,7 +184,9 @@ applyLogLevelFromDictionary(OSDictionary *dict)
     kIOUserNetworkHWAssistTxChecksumIPHdr | \
     kIOUserNetworkHWAssistTxChecksumTCP | \
     kIOUserNetworkHWAssistSoftwareVlan | \
-    kIOUserNetworkHWAssistTxChecksumUDP)
+    kIOUserNetworkHWAssistTxChecksumUDP | \
+    kIOUserNetworkHWAssistTSO4 | \
+    kIOUserNetworkHWAssistTSO6)
 
 // RX Packet Descriptor checksum sub-fields (lower 16 bits of pd; see
 // IMPL_PLAN.md M6a — cross-checked against Linux aqc111.h and x86 kext RE).
@@ -542,7 +560,7 @@ IMPL(AQC111NIC, Start)
 
     poolOptions.packetCount = 64;
     poolOptions.bufferCount = 64;
-    poolOptions.bufferSize  = AQC111_MAX_FRAME_LEN;
+    poolOptions.bufferSize  = AQC111_TSO_MAX_FRAME_LEN;
     poolOptions.maxBuffersPerPacket = 1;
     poolOptions.memorySegmentSize = 0;
     poolOptions.poolFlags = PoolFlagMapToDext;
@@ -1108,6 +1126,20 @@ hwOnLinkUp(AQC111NIC_IVars *ivars, uint8_t speedCode)
     r = aqWrite16(iface, 0x000B, rxCtl);
     LogI("hwOnLinkUp: RX_CTL=0x0000 -> 0x%x", r);
 
+    // Linux aqc111_link_reset zeroes the buffer-manager DMA controls and ARC
+    // control on every link-up rather than trusting firmware defaults; mirror
+    // it. (Probed 2026-07-03: firmware defaults were already zero, so this is
+    // parity insurance, not a behavior change — see TESTING.md TSO section.)
+    b = 0x00;
+    r = aqWrite(iface, 0x0043, &b, 1);   // SFR_BMRX_DMA_CONTROL
+    LogI("hwOnLinkUp: BMRX_DMA_CONTROL=0x00 -> 0x%x", r);
+    b = 0x00;
+    r = aqWrite(iface, 0x0046, &b, 1);   // SFR_BMTX_DMA_CONTROL
+    LogI("hwOnLinkUp: BMTX_DMA_CONTROL=0x00 -> 0x%x", r);
+    b = 0x00;
+    r = aqWrite(iface, 0x009E, &b, 1);   // SFR_ARC_CTRL
+    LogI("hwOnLinkUp: ARC_CTRL=0x00 -> 0x%x", r);
+
     b = 0x01;
     r = aqWrite(iface, 0x00B7, &b, 1);
     LogI("hwOnLinkUp: ETH_MAC_PATH=0x01 -> 0x%x", r);
@@ -1369,7 +1401,15 @@ txDrainOne(AQC111NIC_IVars *ivars)
             txCsumFlags, txCsumStart, txCsumStuff);
     }
 
-    uint32_t maxFrameLen = ivars->currentMtu + AQC111_ETH_HEADER_LEN + AQC111_VLAN_TAG_LEN;
+    // TSO (IMPL_PLAN.md M10): segsz > 0 marks a super-packet the device must
+    // segment into MSS-sized frames; such packets legitimately exceed the MTU.
+    uint16_t tsoSegsz = 0;
+    IOUserNetworkPacketTSOFlags tsoFlags = 0;
+    pkt->getTSOInfo(&tsoSegsz, &tsoFlags);
+
+    uint32_t maxFrameLen = (tsoSegsz > 0)
+        ? AQC111_TSO_MAX_FRAME_LEN
+        : ivars->currentMtu + AQC111_ETH_HEADER_LEN + AQC111_VLAN_TAG_LEN;
     if (dataLen == 0 || dataLen > maxFrameLen) {
         LogE("txDrainOne: bad len=%u max=%u mtu=%u, dropping",
             dataLen, maxFrameLen, ivars->currentMtu);
@@ -1379,15 +1419,32 @@ txDrainOne(AQC111NIC_IVars *ivars)
     }
 
     // Build USB TX buffer: 8-byte LE descriptor + raw Ethernet frame.
-    // Descriptor bits 20:0 = frame length; all other bits 0 (no VLAN, no TSO).
+    // Descriptor bits 20:0 = frame length; bits 46:32 = TSO MSS (0 = no TSO).
     // Matches Linux aqc111_tx_fixup and x86 kext with SFR_BULK_OUT_EFF_EN=0x02.
     IOAddressSegment range;
     ivars->txBuf->GetAddressRange(&range);
     uint8_t *txp = (uint8_t *)range.address;
-    uint64_t txDesc = (uint64_t)dataLen;  // bits 20:0 = length, all others 0
+    uint64_t txDesc = (uint64_t)dataLen;  // bits 20:0 = length
+    if (tsoSegsz > 0) {
+        txDesc |= ((uint64_t)tsoSegsz & AQ_TX_DESC_MSS_MASK) << AQ_TX_DESC_MSS_SHIFT;
+        LogD("txDrainOne: TSO segsz=%u flags=0x%x len=%u", tsoSegsz, tsoFlags, dataLen);
+    }
+
+    // Pad the transfer to an 8-byte multiple; if that lands exactly on a
+    // bulk-OUT maxpacket boundary, add 8 more and flag DROP_PADD so the
+    // device discards them. Linux aqc111_tx_fixup does this for every frame.
+    uint32_t padding = (8 - ((dataLen + AQC111_TX_DESC_LEN) % 8)) % 8;
+    if (((dataLen + AQC111_TX_DESC_LEN + padding) % AQC111_BULK_OUT_MAXPACKET) == 0) {
+        padding += 8;
+        txDesc |= AQ_TX_DESC_DROP_PADD;
+    }
+
     writeLe64(txp, txDesc);
-    memcpy(txp + 8, frame, dataLen);
-    uint32_t txLen = 8 + dataLen;
+    memcpy(txp + AQC111_TX_DESC_LEN, frame, dataLen);
+    if (padding > 0) {
+        memset(txp + AQC111_TX_DESC_LEN + dataLen, 0, padding);
+    }
+    uint32_t txLen = AQC111_TX_DESC_LEN + dataLen + padding;
     ivars->txBuf->SetLength(txLen);
 
     LogV("txDrainOne: desc=%016llx frame_len=%u usb_len=%u first16: "
@@ -1750,6 +1807,18 @@ AQC111NIC::getFeatureFlags()
 {
     LogI("getFeatureFlags -> 0x%x", AQC111_HWASSIST_MASK);
     return AQC111_HWASSIST_MASK;
+}
+
+kern_return_t
+AQC111NIC::getTSOOptions(IOUserNetworkTSOOptions *options)
+{
+    if (options == nullptr) {
+        return kIOReturnBadArgument;
+    }
+    options->tso_mtu4 = AQC111_TSO_MAX_IP_LEN;
+    options->tso_mtu6 = AQC111_TSO_MAX_IP_LEN;
+    LogI("getTSOOptions -> v4=%u v6=%u", options->tso_mtu4, options->tso_mtu6);
+    return kIOReturnSuccess;
 }
 
 // Applies the current ivars->rxFilterBits to live hardware if the interface

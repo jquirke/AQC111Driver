@@ -317,6 +317,31 @@ This matters because the two triggers clear very differently in practice. The ex
 
 ---
 
+### M10 — TCP Segmentation Offload (TSO4/TSO6) (implemented on branch `tso-offload`; core validation passed 2026-07-03)
+
+**Status (2026-07-03):** engagement (`segsz=1448`, super-packets ≫ MTU in `txDrainOne`), wire segmentation (1514-byte frames / 1448-byte payloads captured with peer GRO disabled), and end-to-end integrity (1 GiB random file, SHA-256 match both ends, 414 MB/s through the TSO path; plus a second 1 GiB run under 0.5% induced ingress loss via IFB+netem — ~3,600 macOS retransmissions through RACK/SACK recovery, hash still matching, exercising the segmenter on retransmit-boundary segment sizes) all validated — see `notes/tso_validation_gro.md` and `notes/tso_sha256_validation.md`. **Beware the GRO capture trap** documented in the former: a Linux receiver re-coalesces TCP segments in software before tcpdump's tap, making correct TSO look like oversized wire frames — `ethtool -K <if> gro off` (and `rx-gro-hw off`) before interpreting packet lengths. Investigation byproducts kept: Linux-parity 8-byte TX padding + DROP_PADD (we were out of spec before, independent of TSO); BM/ARC link-up zeroing (registers read back already-zero — inert parity). TSO6/IPv6 also validated same day (fd00:111::/64 bench pair, `flags=0x200000`, MSS 1428 reflecting the 40-byte IPv6 header, 1514-byte wire frames with peer GRO off, 1 GiB SHA-256 match). TSO4 × software VLAN also validated (see `notes/tso_vlan_validation.md`): inline 802.1Q tag in the template, segmenter parses past it, 1518-byte tagged wire frames with correct checksums, 1 GiB SHA-256 match. All merge gates cleared 2026-07-03 (BM/ARC probe logging demoted to plain parity writes). Deferred TODOs, not gates: strict pcap invariant script (IP ID/seq/flags per-burst assertions — sha256 clean/lossy/VLAN/v6 runs cover correctness in aggregate); iperf3+CPU comparison (belongs to the general performance/benchmarking work item).
+
+**What the hardware does:** the device segments one oversized "super-packet" (a single TCP/IP header set + up to 64KB payload) into MSS-sized wire frames itself — replicating the header template per segment and patching IP total length/ID/checksum, TCP seq, TCP flags (FIN/PSH last-only), and TCP checksum via the same engine as `SFR_TXCOE`. Driver-side cost is one field: **MSS in TX descriptor bits 46:32** (`AQ_TX_DESC_MSS_MASK 0x7FFF`, shift 32, per Linux `aqc111.h`). Linux (`aqc111.c` `netif_set_tso_max_size(65535)`, two lines in `tx_fixup`) and the x86 kext (imports only `mbuf_get_tso_requested`) both use it; no TSO-specific SFR register exists — it rides on the TX checksum engine already enabled.
+
+**The OS contract:** the stack only hands TSO packets for capabilities advertised (`kIOUserNetworkHWAssistTSO4/6`): plain TCP over IPv4/IPv6, no IPv4 options / IPv6 extension headers, total ≤ the `tso_mtu` we report via `getTSOOptions()`, MSS in per-packet metadata (`IOUserNetworkPacket::getTSOInfo(&segsz, &flags)` — segsz==0 means not TSO). Delivered inside our own pool buffers, so size is guaranteed by construction. Darwin's gating conditions are readable in XNU `tcp_output.c` (open source — OK to cite anywhere per doc policy).
+
+**Implementation (branch `tso-offload`):**
+- `AQC111_HWASSIST_MASK` += `kIOUserNetworkHWAssistTSO4 | TSO6` (declared via `getFeatureFlags()`, self-initialized enabled mask — same negotiation pattern as M6a).
+- `getTSOOptions()` override (LOCALONLY, plain C++ — not IMPL) reports `tso_mtu4/6 = 65535` (`AQC111_TSO_MAX_IP_LEN`, Linux parity).
+- `txDrainOne`: `getTSOInfo()`; when `segsz > 0`, allow `dataLen` up to `AQC111_TSO_MAX_FRAME_LEN` (65535 + Ethernet + VLAN headers) instead of the MTU-derived cap, and OR the MSS into descriptor bits 46:32.
+- Memory plumbing (the real cost): `poolOptions.bufferSize` and `AQC111_TX_BUF_SIZE` raised from ~16KB (`AQC111_MAX_FRAME_LEN`) to `AQC111_TSO_MAX_FRAME_LEN` (~64KB). Pool = 64 buffers → ~4MB (was ~1MB). If that's ever offensive, `AQC111_TSO_MAX_IP_LEN` can shrink (even 16KB retains most of the per-transfer win) — it's a driver-declared limit, not a hardware constant.
+
+**Verification plan (TESTING.md evidence when done):**
+1. Engagement: `LogD` TSO line in `txDrainOne` showing `segsz>0` with `dataLen` ≫ MTU; `ifconfig -v` shows TSO4/TSO6 hwassist.
+2. Wire correctness: tcpdump on the bench peer during bulk TX; script asserts per-burst invariants — all segments MSS-sized except last, seq cumulative with no gap/overlap, IP ID incrementing, valid IP+TCP checksums per frame, PSH/FIN only on final segment.
+3. Integrity: multi-GB transfer + sha256 both ends; a lossy-path run for retransmission interaction.
+4. Edge cases: payload exact multiple of MSS; IPv6; **TSO × software VLAN** (inline tag becomes part of the replicated header template — should work, must verify on fw 130.5.32).
+5. Perf: iperf3 TX throughput + dext CPU vs baseline — expect a real win (per-USB-transfer and per-packet-RPC count drops ~44× for full-size bursts), unlike M9's expected-flat result.
+
+**Risk notes:** device-side segmenter is firmware-driven — bugs would appear as corrupted streams (integrity test covers). The 15-bit MSS field caps segsz at 32767 (fine — real MSS ≤ 9K). `RX_BUF_SIZE` (USB transfer staging) is unrelated and unchanged.
+
+---
+
 ## Log Level Strategy (implemented, on branch `log-level-strategy`)
 
 DriverKit's `os/log.h` only exposes `OS_LOG_TYPE_DEFAULT` (no `os_log_debug`/`info`/subsystem API), so verbosity filtering is done in our own code: four level-gated macros (`LogE`/`LogI`/`LogD`/`LogV`) backed by a single `gLogLevel`, replacing the single `Log()` macro that previously fired everything — including per-frame hex dumps — at full volume. All call sites in `AQC111NIC.cpp`/`AQC111.cpp` reclassified: hex dumps → Verbose, per-completion bookkeeping → Debug, lifecycle → Info (default), failures → Error (always on).

@@ -734,6 +734,90 @@ detection → driver flag computation → `IOUserNetworkPacket` persistence
 
 ---
 
+## TSO (TCP Segmentation Offload) — M10
+
+Full transcripts: `notes/tso_validation_gro.md` (wire segmentation + GRO trap)
+and `notes/tso_sha256_validation.md` (integrity + lossy run). Branch
+`tso-offload`, 2026-07-03.
+
+### Methodology
+
+Sender: this driver (`en9`, 172.18.0.20). Receiver: Linux peer
+(172.18.0.10), TCP port 5001, bulk transfers via `nc`. Engagement observed
+via `txDrainOne` Debug logs (`getTSOInfo` segsz/flags plus `dataLen` ≫ MTU);
+wire shape observed via `tcpdump` on the peer; integrity via SHA-256 of
+1 GiB random transfers.
+
+### Engagement (2026-07-03)
+
+With `kIOUserNetworkHWAssistTSO4/6` advertised and `getTSOOptions` reporting
+65535, the stack handed super-packets immediately: `TSO segsz=1448
+flags=0x100000 len=5858` (= 66 header bytes + exactly 4×1448 payload).
+Descriptor verified: `desc=000005a8000016e2` — MSS 1448 in bits 46:32,
+length 5858 in bits 20:0. Negative baseline: all TX logging prior to
+advertising the capability had never shown a super-MTU packet.
+
+### False negative: the Linux GRO capture trap (2026-07-03)
+
+The peer's `tcpdump` initially showed the transfer arriving as single
+5858-byte packets — indistinguishable from the device ignoring the MSS field
+and emitting jumbo frames. Two real-but-irrelevant fixes were made while
+chasing this (Linux-parity 8-byte TX padding + `DROP_PADD`, and BM/ARC
+link-up zeroing — the latter's readback probe showed the registers were
+already zero). The actual cause was **receiver-side software GRO**: the Linux
+kernel re-coalesces consecutive TCP segments before tcpdump's tap point.
+Proved by A/B: `ethtool -K <if> gro off` → same test captured normal
+1514-byte frames with 1448-byte payloads matching the descriptor MSS;
+`gro on` → the 5858-byte "jumbo" reappeared instantly. The hardware had been
+segmenting correctly the whole time.
+
+### Positive validation — integrity (2026-07-03)
+
+1 GiB of `/dev/urandom` sent through the TSO path: SHA-256 identical on both
+ends (`8b257a43…b0fe`), 414 MB/s (~3.3 Gbps) single-stream `nc`.
+
+### Positive validation — recovery under loss (2026-07-03)
+
+Second 1 GiB run with 0.5% induced ingress loss on the peer (IFB + netem;
+1,329 packets dropped). macOS sender counters: +3,593 retransmitted segments
+(all via RACK), +11,448 dup-acks, +12,982 SACK blocks. SHA-256 still matched.
+This exercises the segmenter on retransmit-boundary segment sizes, not just
+clean full-window bursts. Note: read retransmission counters on the *sender*;
+the receiver only observes its own induced drops.
+
+### Positive validation — TSO6/IPv6 (2026-07-03)
+
+Same bench pair on `fd00:111::/64`, peer GRO off. Engagement:
+`TSO segsz=1428 flags=0x200000 len=5798` — MSS correctly 20 bytes smaller
+than the v4 case (40-byte IPv6 header), descriptor
+`desc=00000594000016a6` (MSS 0x594=1428, len 0x16a6=5798), `usb_len=5808`
+showing the 8-byte descriptor + alignment padding. Wire: 1514-byte
+`ethertype IPv6` frames with 1428-byte TCP payloads
+(14 eth + 40 IPv6 + 32 TCP/opts + 1428 = 1514). 1 GiB SHA-256 matched.
+
+### Positive validation — TSO4 × software VLAN (2026-07-03)
+
+VLAN rig (`vlan0`/`en9` ↔ Linux `vlan1234`, VID 1234, 172.16.123.0/24).
+The stack hands VLAN-tagged TSO super-packets with the 802.1Q header INLINE
+in the frame template (`getVlanTag has=0` — no metadata path), e.g.
+`desc=000005a8000016e6` for an 18-byte L2 header + 5844-byte IPv4 packet
+= 4×1448 payload. The segmenter parsed past the inline tag and emitted
+1518-byte VLAN-tagged wire frames with correct checksums (verified by
+tcpdump `cksum ... (correct)` on the peer). 1 GiB SHA-256 matched.
+This confirms the replicate-and-patch model: the tag is just template bytes.
+
+### Conclusion
+
+TSO4, TSO6, and TSO4-over-software-VLAN are functionally correct:
+engagement, descriptor encoding, hardware segmentation on the wire (tagged
+and untagged), sustained integrity, and recovery under loss are all
+validated. Deferred TODOs, not M10 gates: strict per-burst pcap invariants
+(IP ID/seq/flags script — the clean/lossy/VLAN/v6 SHA-256 runs cover
+correctness in aggregate) and the iperf3+CPU comparison (general
+performance/benchmarking work item).
+
+---
+
 ## Reusable Methodology Notes
 
 - **To prove a packet was actually rejected, not just unlucky timing**:
@@ -784,3 +868,10 @@ detection → driver flag computation → `IOUserNetworkPacket` persistence
   corroborated by an independent check like Wireshark's own checksum
   validation on a capture taken at/near the remote, or by a working
   negative control proving the remote really does reject what it should.
+- **Linux receivers lie to tcpdump about packet sizes** — software GRO
+  coalesces consecutive TCP segments *before* the capture tap, so correct
+  sender-side TSO looks like oversized/jumbo wire frames. Disable
+  `gro` (and `rx-gro-hw`) via ethtool on the capture host before
+  interpreting packet lengths in any wire-level TX validation. Caught as a
+  false negative during M10 TSO bring-up: two speculative driver fixes were
+  made before an ethtool A/B proved the frames were fine.
