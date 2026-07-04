@@ -42,6 +42,11 @@
 #define kLogLevelVerbose    3
 static volatile uint8_t gLogLevel = kLogLevelInfo;
 
+// Statement macros, not functions: argument expressions expand INSIDE the
+// level check and are evaluated only when it passes — hot paths (txDrainOne,
+// OnRxComplete) rely on this to pass packet bytes as log arguments for free
+// at lower levels. Never compute log-prep data outside these macros (e.g. a
+// hex-string buffer); that work would run unconditionally on every packet.
 #define LogE(fmt, ...) do { if (gLogLevel >= kLogLevelError)   os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] Error(level=%u) - " fmt,   gLogLevel, ##__VA_ARGS__); } while (0)
 #define LogI(fmt, ...) do { if (gLogLevel >= kLogLevelInfo)    os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] Info(level=%u) - " fmt,    gLogLevel, ##__VA_ARGS__); } while (0)
 #define LogD(fmt, ...) do { if (gLogLevel >= kLogLevelDebug)   os_log(OS_LOG_DEFAULT, "AQC111-NIC [" __DATE__ " " __TIME__ "] Debug(level=%u) - " fmt,   gLogLevel, ##__VA_ARGS__); } while (0)
