@@ -1379,37 +1379,6 @@ txDrainOne(AQC111NIC_IVars *ivars)
 
     LogD("txDrainOne: pkt=%p offset=%u len=%u", pkt, (unsigned)dataOffset, dataLen);
 
-    // Diagnostic for IMPL_PLAN.md M6e VLAN investigation — does the OS deliver
-    // the 802.1Q tag inline in the buffer bytes (frame[12:13]==0x8100), as
-    // metadata via getVlanTag(), both, or neither? Dump enough bytes to see
-    // dst/src MAC + the ethertype/TPID position either way.
-    {
-        uint16_t vlanTag = 0;
-        bool hasVlanTag = pkt->getVlanTag(&vlanTag);
-        uint32_t dumpLen = dataLen < 20 ? dataLen : 20;
-        char hexbuf[64] = {0};
-        int hexoff = 0;
-        for (uint32_t i = 0; i < dumpLen && hexoff < (int)sizeof(hexbuf) - 3; i++) {
-            hexoff += snprintf(hexbuf + hexoff, sizeof(hexbuf) - (size_t)hexoff, "%02x ", frame[i]);
-        }
-        LogD("txDrainOne: getVlanTag has=%d tag=%u dataLen=%u first%u: %{public}s",
-            hasVlanTag, vlanTag, dataLen, dumpLen, hexbuf);
-    }
-
-    // Diagnostic only — the hardware auto-detects IP/TCP/UDP headers and
-    // fixes up the checksum itself once SFR_TXCOE_CTL is enabled, so we
-    // don't need start/stuff to do the work. Logging what the OS actually
-    // requested per-packet, mirroring the RX checksum readback pattern, for
-    // verification (see IMPL_PLAN.md TX checksum offload / TESTING.md).
-    {
-        IOUserNetworkPacketTxChecksumFlags txCsumFlags = 0;
-        uint16_t txCsumStart = 0;
-        uint16_t txCsumStuff = 0;
-        pkt->getTxChecksumInfo(&txCsumFlags, &txCsumStart, &txCsumStuff);
-        LogD("txDrainOne: getTxChecksumInfo flags=0x%x start=%u stuff=%u",
-            txCsumFlags, txCsumStart, txCsumStuff);
-    }
-
     // TSO (IMPL_PLAN.md M10): segsz > 0 marks a super-packet the device must
     // segment into MSS-sized frames; such packets legitimately exceed the MTU.
     uint16_t tsoSegsz = 0;
