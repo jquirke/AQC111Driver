@@ -342,6 +342,90 @@ This matters because the two triggers clear very differently in practice. The ex
 
 ---
 
+### M11 — Wake-on-LAN (magic packet) (planned, 2026-07-03, not started)
+
+Three stacked problems, easiest first:
+
+**Layer 1 — device arming (documented, low risk).** Linux `aqc111_suspend` is
+the complete recipe. WoL armed: quiesce RX, then leave a minimal RX path
+alive (`RX_CTL=AB|START`, `BM_INT_MASK=0`, `BMRX_DMA_CONTROL=0x80`
+[BMRX_DMA_EN — the suspend-path value], `ETH_MAC_PATH=RX_PATH_READY`, minimal
+bulk-in queue config, `MEDIUM_RECEIVE_EN`), write `wol_cfg` (MAC + flags,
+`AQ_WOL_FLAG_MP=0x2`) via `bRequest 0x60` (AQ_WOL_CFG), set `AQ_WOL` (bit 20)
+in phy_cfg via `bRequest 0x61` (our FWPhyAccess path). Resume: clear
+`SFR_MONITOR_MODE` wake bits (EPHYRW/RWLC/RWMP/RWWF/RW_FLAG). x86 kext
+corroborates and adds a key design fact (RE_LOG.md): on WoL resume,
+`AqUsbHal::enable()` short-circuits to `phyAccess->sleep(false)` — it does
+NOT re-run full `hwStart()`. Wake is not cold re-init.
+
+**RE gap to fill (scoped, symbols known):** the x86 arming half —
+`AqPacificDriver::setWakeOnMagicPacket(bool)` (0x2b5a),
+`AqPacificDriver::setPowerState` (0x2cd0) + `myPowerStates` table (0x4f10),
+`AqUsbHal::hwPrepareSleep` (0xf72) / `hwFinishSleep` (0xc46),
+`FWPhyAccess::sleep(bool)` (0x7ca). Same `xcrun llvm-objdump -d --demangle`
+technique that decoded `Tx::transmit` TSO handling. Findings → RE_LOG.md
+(x86 kext scope, so RE_LOG is the right home).
+
+**Layer 2 — DriverKit plumbing (the real unknown).** API surface exists:
+`SetWakeOnMagicPacketSupport(bool)` LOCALONLY (capability declaration),
+`SetWakeOnMagicPacketEnable(bool)` (deprecated-capital PURE VIRTUAL — stub
+owed regardless; likely another capital-vs-lowercase which-gets-called trap
+à la M6f/hwassists), `kIOUserNetworkFeatureFlagWOMP` (0x04000000), and
+`IOService::SetPowerState`/`ChangePowerState`. Open question nobody
+documents: what PM transitions a NIC dext actually receives on system sleep,
+and whether there's a hardware-access window for our EP0 arming writes
+before the USB device is suspended (Linux does this in `suspend()` with
+`_nopm` variants; the dext equivalent is unverified).
+
+**Layer 3 — platform reality (the fussy part).** USB remote-wakeup grant
+(`SetFeature(DEVICE_REMOTE_WAKEUP)` — presumably the USB family's job once
+wake interest is expressed; unverified), port power through sleep
+(dock/hub-dependent — kills WoL on many TB docks), Apple Silicon wake policy
+(`pmset womp`, AC-power conditions, DarkWake vs full wake).
+
+**Phase 0 RESULTS (2026-07-04, four genuine sleep/wake cycles captured via log collect):**
+- Sleep: `SetInterfaceEnable(false)` fires FIRST; `AQC111-A SetPowerState(Off)`
+  lands mid-disable; `AQC111-NIC SetPowerState(Off)` lands ~15ms later, AFTER
+  hwDisable completes. Every EP0 control transfer in the window succeeds
+  (whole hwOnLinkDown/hwDisable sequence returns 0x0) — the arming window
+  exists and is proven.
+- Wake: **SetPowerState(On) FIRES ON EVERY WAKE** — proven by cumulative
+  counters (2026-07-04 second capture: off/on stayed in lockstep across four
+  sleep/wake cycles, plus one initial On at attach), after the first capture
+  falsely suggested it never fired. Every single On LOG LINE was lost to
+  early-wake log loss (5 deliveries, 0 lines captured) — the counter carried
+  in later reliable lines was the only truthful witness. Wake ordering:
+  SetPowerState(On) → SetInterfaceEnable(true) → hwEnable → link-up (the
+  `pmCounters at enable` readout was already incremented). The PM hook pair
+  is fully symmetric; WoL disarm may use SetPowerState(On) or the existing
+  applyPhyAdvertise overwrite — both are available.
+- Design consequence: arm WoL in NIC `SetPowerState(Off)` (sleep-specific,
+  post-hwDisable; overwrite the just-written lowPower phy_cfg with AQ_WOL
+  per the x86 mutual-exclusivity finding + write WOL_CFG). Disarm needs no
+  new code: hwEnable's applyPhyAdvertise (0x032b000f, bit 20 clear) already
+  rewrites phy_cfg without AQ_WOL on every wake.
+- TCPKeepAlive maintenance DarkWakes fully cycle disable/enable — free
+  repeated stress of the arm/disarm path.
+- Capture methodology that worked: dext logs are stream-only (never persisted
+  to the log archive); `sudo log collect --last N` right after wake snapshots
+  the in-memory buffers. Validity gate: `pmset -g log` must show real
+  "Entering Sleep state" (not DarkWake bounce — first attempt was a 3-second
+  DarkWake killed by HID, a false negative).
+
+**Phasing:**
+0. **PM transparency (do first, pays twice):** instrument
+   `SetPowerState`/`Stop`/interface messages and log everything that fires
+   across a sleep/wake cycle, before writing any WoL code. This is also the
+   diagnostic infrastructure the open RX-stall-on-sleep/wake incident needs.
+1. x86 `hwPrepareSleep` RE + device-side arming from whatever hook phase 0
+   proves we get.
+2. Capability/toggle plumbing (Support + Enable stub + WOMP flag; verify
+   which API generation the OS calls).
+3. Bench validation: `pmset womp 1`, sleep on AC, `wakeonlan`/`etherwake`
+   from the peer, confirm wake + wake-reason via `pmset -g log` /
+   `log show` "Wake reason"; negative control with WoL disabled; direct-port
+   vs dock-port comparison.
+
 ## Log Level Strategy (implemented, on branch `log-level-strategy`)
 
 DriverKit's `os/log.h` only exposes `OS_LOG_TYPE_DEFAULT` (no `os_log_debug`/`info`/subsystem API), so verbosity filtering is done in our own code: four level-gated macros (`LogE`/`LogI`/`LogD`/`LogV`) backed by a single `gLogLevel`, replacing the single `Log()` macro that previously fired everything — including per-frame hex dumps — at full volume. All call sites in `AQC111NIC.cpp`/`AQC111.cpp` reclassified: hex dumps → Verbose, per-completion bookkeeping → Debug, lifecycle → Info (default), failures → Error (always on).

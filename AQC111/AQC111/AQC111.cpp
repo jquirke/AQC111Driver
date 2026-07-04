@@ -46,6 +46,11 @@ applyLogLevelFromDictionary(OSDictionary *dict)
 
 struct AQC111_IVars {
     IOUSBHostDevice *device;
+    // M11 phase 0: cumulative SetPowerState counters (see AQC111NIC.cpp).
+    uint32_t pmOffCount;
+    uint32_t pmOnCount;
+    uint32_t pmLowCount;
+    uint32_t pmOtherCount;
 };
 
 bool
@@ -126,3 +131,28 @@ IMPL(AQC111, Stop)
     }
     return Stop(provider, SUPERDISPATCH);
 }
+
+// M11 phase 0 PM transparency: pure observation, no behavior change. Both
+// personalities are provider-matched so they are in the PM tree already
+// (JoinPMTree is only needed for Create()'d services). Logs which power
+// transitions the USB-device personality actually receives across system
+// sleep/wake — the undocumented layer M11 (WoL) depends on. Decode:
+// 0x0=Off(system sleep) 0x2=On 0x10000=Low 0x20000=LPW.
+kern_return_t
+IMPL(AQC111, SetPowerState)
+{
+    switch (powerFlags) {
+    case kIOServicePowerCapabilityOff: ivars->pmOffCount++;   break;
+    case kIOServicePowerCapabilityOn:  ivars->pmOnCount++;    break;
+    case kIOServicePowerCapabilityLow: ivars->pmLowCount++;   break;
+    default:                           ivars->pmOtherCount++; break;
+    }
+    LogI("SetPowerState: powerFlags=0x%x (%{public}s) [off=%u on=%u low=%u other=%u]",
+        powerFlags,
+        powerFlags == kIOServicePowerCapabilityOff ? "Off/sleep" :
+        powerFlags == kIOServicePowerCapabilityOn  ? "On" :
+        powerFlags == kIOServicePowerCapabilityLow ? "Low" : "other",
+        ivars->pmOffCount, ivars->pmOnCount, ivars->pmLowCount, ivars->pmOtherCount);
+    return SetPowerState(powerFlags, SUPERDISPATCH);
+}
+

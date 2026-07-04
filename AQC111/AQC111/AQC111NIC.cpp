@@ -311,6 +311,13 @@ clampMtu(uint32_t mtu)
 }
 
 struct AQC111NIC_IVars {
+    // M11 phase 0: cumulative SetPowerState counters. Carried in the
+    // SetPowerState log line itself so a lost wake-side log still shows up
+    // as an incremented on-count in the NEXT sleep's (reliable) Off line.
+    uint32_t                            pmOffCount;
+    uint32_t                            pmOnCount;
+    uint32_t                            pmLowCount;
+    uint32_t                            pmOtherCount;
     IODispatchQueue                    *queue;
     IOUserNetworkPacketBufferPool      *pool;
     IOUserNetworkTxSubmissionQueue     *txsQueue;
@@ -1196,6 +1203,8 @@ hwOnLinkUp(AQC111NIC_IVars *ivars, uint8_t speedCode)
     rxCtl = 0x0288 | ivars->rxFilterBits;  // base: IPE | START | AB, plus any OS-requested filter bits
     r = aqWrite16(iface, 0x000B, rxCtl);
     LogI("hwOnLinkUp: RX_CTL=0x%04x -> 0x%x", rxCtl, r);
+    LogI("pmCounters at linkup: off=%u on=%u low=%u other=%u",
+        ivars->pmOffCount, ivars->pmOnCount, ivars->pmLowCount, ivars->pmOtherCount);
 }
 
 static void
@@ -1980,6 +1989,30 @@ doSetMulticastAddresses(AQC111NIC_IVars *ivars, const uint8_t *addresses, uint32
 
 // --- Dispatched overrides ---
 
+// M11 phase 0 PM transparency: pure observation, no behavior change — logs
+// which power transitions the NIC personality receives across system
+// sleep/wake, and how they order against SetInterfaceEnable/Stop/USB
+// completions (the undocumented layer M11 WoL arming depends on; also
+// diagnostic infra for the RX-stall-on-sleep/wake incident). Decode:
+// 0x0=Off(system sleep) 0x2=On 0x10000=Low 0x20000=LPW.
+kern_return_t
+IMPL(AQC111NIC, SetPowerState)
+{
+    switch (powerFlags) {
+    case kIOServicePowerCapabilityOff: ivars->pmOffCount++;   break;
+    case kIOServicePowerCapabilityOn:  ivars->pmOnCount++;    break;
+    case kIOServicePowerCapabilityLow: ivars->pmLowCount++;   break;
+    default:                           ivars->pmOtherCount++; break;
+    }
+    LogI("SetPowerState: powerFlags=0x%x (%{public}s) [off=%u on=%u low=%u other=%u]",
+        powerFlags,
+        powerFlags == kIOServicePowerCapabilityOff ? "Off/sleep" :
+        powerFlags == kIOServicePowerCapabilityOn  ? "On" :
+        powerFlags == kIOServicePowerCapabilityLow ? "Low" : "other",
+        ivars->pmOffCount, ivars->pmOnCount, ivars->pmLowCount, ivars->pmOtherCount);
+    return SetPowerState(powerFlags, SUPERDISPATCH);
+}
+
 // TODO: SetInterfaceEnable is the deprecated capital form (IOUserNetworkEthernet.iig:
 // "@deprecated, use setInterfaceEnable instead"); the lowercase setInterfaceEnable
 // (LOCALONLY NDK_21) is the documented modern replacement. Confirmed empirically this
@@ -2032,6 +2065,8 @@ IMPL(AQC111NIC, SetInterfaceEnable)
 
         kern_return_t armRet = armAsyncIO(ivars);
         LogI("SetInterfaceEnable: armAsyncIO -> 0x%x", armRet);
+        LogI("pmCounters at enable: off=%u on=%u low=%u other=%u",
+            ivars->pmOffCount, ivars->pmOnCount, ivars->pmLowCount, ivars->pmOtherCount);
     } else {
         ivars->interfaceEnabled = false;
         ensureRxStopped(ivars);

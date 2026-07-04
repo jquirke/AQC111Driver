@@ -145,6 +145,10 @@ public:
     // TSO limits (max super-packet size per family) — see IMPL_PLAN.md M10
     virtual kern_return_t
     getTSOOptions(IOUserNetworkTSOOptions *options) override LOCALONLY;
+
+    // M11 phase 0: PM transparency — log power transitions (IMPL_PLAN.md M11)
+    virtual kern_return_t
+    SetPowerState(uint32_t powerFlags) override;
 };
 
 #endif /* AQC111NIC_h */

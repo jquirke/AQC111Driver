@@ -28,6 +28,10 @@ public:
 
     virtual kern_return_t
     Stop(IOService * provider) override;
+
+    // M11 phase 0: PM transparency — log power transitions (IMPL_PLAN.md M11)
+    virtual kern_return_t
+    SetPowerState(uint32_t powerFlags) override;
 };
 
 #endif /* AQC111_h */

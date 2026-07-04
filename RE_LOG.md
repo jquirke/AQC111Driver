@@ -1872,3 +1872,88 @@ Implementation note: despite the kext passing the raw 16-bit tag, masking VID
 where appropriate remains defensible in this DriverKit implementation because
 Linux explicitly masks VID in `aqc111_rx_fixup`. The old kext behavior is now
 known, not inferred.
+
+## Wake-on-LAN / sleep path (Tx: AqUsbHal disable/hwPrepareSleep/hwStop, FWPhyAccess::sleep) — 2026-07-03
+
+Disassembled via `xcrun llvm-objdump -d --demangle` (resolves internal calls where
+r2 fails on kext relocations). Motivating question: what does the x86 kext
+actually write to arm magic-packet wake (M11)?
+
+### PM model: family enable/disable, not setPowerState
+
+`AqPacificDriver::setPowerState` (0x2cd0), `powerStateWillChangeTo` (0x2cc0),
+and `powerStateDidChangeTo` (0x2cc8) are ALL empty stubs (`return 0`). The
+kext rides IONetworkingFamily's enable/disable-around-sleep instead.
+
+### AqUsbHal::setWakeOnMagicPacket(bool) (0x1a7c)
+
+Pure latch, no hardware access:
+
+```
+hal[0x57] = flag; return true;
+```
+
+### AqUsbHal::disable() (0xf54)
+
+```
+hal[0x44] = 0; hal[0x43] = 0;          // enabled flags
+if (hal[0x57]) tail-call hwPrepareSleep();   // WoL armed
+else           tail-call hwStop();           // plain power-down
+```
+
+Symmetric with the previously-documented `AqUsbHal::enable()`:
+`if (hal[0x57]) phyAccess->sleep(false); else hwStart();` — WoL wake is NOT a
+cold re-init.
+
+### AqUsbHal::hwPrepareSleep() (0xf72) — the arming sequence
+
+Exactly two control transfers:
+
+1. Build 0x122 (290)-byte WOL_CFG on the stack: `{ MAC[6] (from hal[0x45..0x4a]),
+   flags = 0x02 (AQ_WOL_FLAG_MP), 0x11B zero bytes }`. Send via packed request
+   `40 60 00 00 00 00 22 01` = bmRequestType 0x40 (vendor OUT device),
+   bRequest 0x60 (AQ_WOL_CFG), wValue 0, wIndex 0, wLength 0x0122.
+2. `phyAccess->sleep(true)` (vtable[0x28]).
+
+That's it. NONE of the Linux `aqc111_suspend` minimal-RX-alive register dance
+(RX_CTL AB|START, BMRX_DMA_EN, RX_PATH_READY, bulk-in queue cfg,
+MEDIUM_RECEIVE_EN) — on the FWPhyAccess/newer-firmware path the firmware
+evidently handles wake-monitor plumbing itself once AQ_WOL + WOL_CFG are set.
+
+### FWPhyAccess::sleep(bool sleep) (0x7ca)
+
+```
+b = phy[0x12];                 // byte 2 of the 4-byte phy_cfg at phy+0x10
+b = (b & ~0x10) | (sleep << 4);  // fw[0x12] bit 4 = phy_cfg bit 20 = AQ_WOL
+phy[0x12] = b;
+vendorCmd(hal, bRequest=0x61, OUT, wValue=0, wIndex=0, wLength=4, phy+0x10);
+```
+
+So sleep(true) sets AQ_WOL and pushes the 4-byte firmware phy_cfg;
+sleep(false) (wake path) clears it and pushes again. Note it does NOT set
+AQ_LOW_POWER — WoL-armed sleep and low-power sleep are mutually exclusive
+firmware states.
+
+### AqUsbHal::hwStop() (0x1026) — the non-WoL branch
+
+1. Read16 SFR_MEDIUM_STATUS_MODE (0x0022) — packed req `c0 01 22 00 02 00 02 00`.
+2. Clear byte1 bit0 (= bit 8, RECEIVE_EN), write16 back (`40 01 22 00 ...`).
+3. `phyAccess->vtable[0x20](...)` then `lowPower(true)` (vtable[0x18]).
+
+Matches Linux's else-branch (AQ_LOW_POWER + clear RECEIVE_EN).
+
+### Implications for the DriverKit driver (M11)
+
+- Arming on our firmware (130.5.32, FWPhyAccess) should be just:
+  WOL_CFG (290 bytes, MAC + flags=0x02) via 0x60, then set bit 20 in our
+  cached phy_cfg and write it via 0x61. Wake: clear bit 20, rewrite phy_cfg,
+  and do NOT re-run full hw init.
+- The elaborate Linux register sequence is likely DirectPhyAccess/legacy
+  support or belt-and-braces; try the two-transfer recipe first.
+- Open question: the kext never appears to touch SFR_MONITOR_MODE (0x24) on
+  either path; Linux clears its wake bits in reset. Check monitor-mode state
+  empirically after a wake.
+
+Addendum: `AqUsbHal::hwFinishSleep()` (0xc46) is a thin wrapper —
+`jmp phyAccess->vtable[0x28](0)` = `sleep(false)` — i.e. it IS the WoL-wake
+path referenced from `enable()`. No additional logic.

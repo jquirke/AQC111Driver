@@ -875,3 +875,12 @@ performance/benchmarking work item).
   interpreting packet lengths in any wire-level TX validation. Caught as a
   false negative during M10 TSO bring-up: two speculative driver fixes were
   made before an ethtool A/B proved the frames were fine.
+- **Dext log lines emitted in the first moments of wake are silently and
+  consistently lost** — during M11 PM instrumentation, SetPowerState(On)
+  fired on 5/5 wakes (proven by cumulative counters read out from later,
+  reliable log points) while 0/5 of its log lines survived to capture; the
+  `SetInterfaceEnable: 1` entry line was likewise lost on every wake. A
+  wake-path event that "never logs" has NOT been shown to never happen.
+  Durable technique: bump a counter in the suspect callback and print it
+  from a later reliably-captured line (e.g. link-up) — cumulative counts
+  survive any log-loss window.
