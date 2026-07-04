@@ -1379,13 +1379,41 @@ txDrainOne(AQC111NIC_IVars *ivars)
 
     LogD("txDrainOne: pkt=%p offset=%u len=%u", pkt, (unsigned)dataOffset, dataLen);
 
-    // TSO (IMPL_PLAN.md M10): segsz > 0 marks a super-packet the device must
-    // segment into MSS-sized frames; such packets legitimately exceed the MTU.
+    // TSO (IMPL_PLAN.md M10): the flags are the offload REQUEST (BSD
+    // csum_flags passthrough; mbuf contract: flags=request, segsz=parameter —
+    // the x86 kext gates on the request word too). A requested packet must be
+    // offloaded or error-completed, never transmitted unsegmented: an
+    // unsegmented super-packet becomes an oversize wire frame that links
+    // silently drop. Unknown flag bits alone must NOT drop the packet
+    // (getTSOInfo's behavior for non-TSO packets is unverified; a stray-bit
+    // false positive would kill normal traffic) — they're canaried here, and
+    // a genuine unknown-variant super-packet still fails the length check
+    // below once its segsz is disregarded.
     uint16_t tsoSegsz = 0;
     IOUserNetworkPacketTSOFlags tsoFlags = 0;
     pkt->getTSOInfo(&tsoSegsz, &tsoFlags);
 
-    uint32_t maxFrameLen = (tsoSegsz > 0)
+    const IOUserNetworkPacketTSOFlags knownTsoFlags =
+        kIOUserNetworkPacketTSOIPV4 | kIOUserNetworkPacketTSOIPV6;
+    if ((tsoFlags & ~knownTsoFlags) != 0) {
+        LogE("txDrainOne: unrecognized TSO flag bits 0x%x (known=0x%x segsz=%u)",
+            tsoFlags, knownTsoFlags, tsoSegsz);
+    }
+    bool tsoRequested = (tsoFlags & knownTsoFlags) != 0;
+    if (tsoRequested && (tsoSegsz == 0 || tsoSegsz > AQ_TX_DESC_MSS_MASK)) {
+        LogE("txDrainOne: TSO requested (flags=0x%x) with invalid segsz=%u, dropping",
+            tsoFlags, tsoSegsz);
+        pkt->setCompletionStatus(kIOReturnBadArgument);
+        ivars->txcQueue->EnqueuePacket(pkt);
+        return;
+    }
+    if (!tsoRequested && tsoSegsz != 0) {
+        LogE("txDrainOne: segsz=%u without TSO request flags (flags=0x%x) — treating as non-TSO",
+            tsoSegsz, tsoFlags);
+        tsoSegsz = 0;
+    }
+
+    uint32_t maxFrameLen = tsoRequested
         ? AQC111_TSO_MAX_FRAME_LEN
         : ivars->currentMtu + AQC111_ETH_HEADER_LEN + AQC111_VLAN_TAG_LEN;
     if (dataLen == 0 || dataLen > maxFrameLen) {
@@ -1403,7 +1431,7 @@ txDrainOne(AQC111NIC_IVars *ivars)
     ivars->txBuf->GetAddressRange(&range);
     uint8_t *txp = (uint8_t *)range.address;
     uint64_t txDesc = (uint64_t)dataLen;  // bits 20:0 = length
-    if (tsoSegsz > 0) {
+    if (tsoRequested) {
         txDesc |= ((uint64_t)tsoSegsz & AQ_TX_DESC_MSS_MASK) << AQ_TX_DESC_MSS_SHIFT;
         LogD("txDrainOne: TSO segsz=%u flags=0x%x len=%u", tsoSegsz, tsoFlags, dataLen);
     }
