@@ -344,7 +344,7 @@ This matters because the two triggers clear very differently in practice. The ex
 
 ---
 
-### M11 — Wake-on-LAN (magic packet) (planned, 2026-07-03, not started)
+### M11 — Wake-on-LAN (magic packet) (mechanism VALIDATED 2026-07-05; latch plumbing blocked on OS — see Phase 1 RESULTS)
 
 Three stacked problems, easiest first:
 
@@ -413,6 +413,72 @@ wake interest is expressed; unverified), port power through sleep
   the in-memory buffers. Validity gate: `pmset -g log` must show real
   "Entering Sleep state" (not DarkWake bounce — first attempt was a 3-second
   DarkWake killed by HID, a false negative).
+
+**Phase 1 baseline (2026-07-05, pre-WoL build — the control run):**
+1. `pmset -a womp 1` triggers a `GetHardwareAssists` probe on the driver
+   (readback 0x20620007, no WOMP bit) and `SetWakeOnMagicPacketEnable` is
+   NOT called — consistent with "OS checked capabilities, found none".
+   Design consequence: WOMP must be visible in the hwAssistMask readback,
+   not only getFeatureFlags (self-init updated accordingly).
+2. Peer ethtool reports NO CARRIER for the entire sleep (hwDisable withdraws
+   advertise + lowPower), link renegotiates 1G FD on wake. Therefore
+   post-arming "link up at the peer during sleep" is a clean hardware-level
+   arming-success signal, readable without waking anything.
+3. Magic-packet-while-asleep untested at baseline (degenerate: undeliverable
+   with link down) — baseline wake path provably does not exist.
+
+**Phase 1 RESULTS (2026-07-05, forced-latch bench build — MECHANISM VALIDATED END-TO-END):**
+
+Implementation: `armWolMagicPacket()` = the x86 kext's two-transfer recipe
+(290-byte WOL_CFG {MAC, flags=MP} via bRequest 0x60, then
+`applyPhyAdvertise(advertiseMask, AQ_PHY_WOL bit 20)` via 0x61), called from
+NIC `SetPowerState(Off)` behind a `wolMagicPacketEnabled` latch;
+`SetWakeOnMagicPacketSupport(true)` + WOMP flag in getFeatureFlags AND the
+hwAssistMask self-init. Disarm is free: hwEnable's applyPhyAdvertise
+(0x032b000f, bit 20 clear) on every wake.
+
+1. **The OS never sets the latch.** `SetWakeOnMagicPacketEnable` was called
+   ZERO times across `pmset womp 1` toggles, sleep entries, and deep-idle
+   transitions over many cycles — despite Support(true) accepted, WOMP
+   (0x04000000) visible in both readbacks (0x24620007), and rootDomain
+   listing WakeOnMagicPacket providers. `pmset womp 1` only probes
+   GetHardwareAssists. Same genre as the hardware-VLAN finding: the API
+   surface exists but the OS-side control plane is not wired to dexts.
+   Feedback candidate.
+2. **With the latch forced on (temporary bench build), everything below the
+   latch works.** Arming logs `-> 0x0` at every SetPowerState(Off) —
+   including the second Off pass at the deep-idle transition, so every
+   DarkWake cycle re-arms automatically.
+3. **PHY holds link through real sleep when armed.** Baseline: peer sees
+   link death ~1s after every genuine "Entering Sleep state" (verified by
+   pm-log correlation; earlier "link stayed up in sleep" observations were
+   TCPKeepAlive DarkWakes re-enabling the interface — every remote
+   transition mapped 1:1 to pm-log edges). Armed: link HELD at 1G through a
+   continuous 190-second Deep Idle sleep with zero DarkWakes.
+4. **Magic packets wake the machine.** Peer `etherwake` every 10s: ~25
+   consecutive sleep entries each terminated 5-15s later by
+   `DarkWake from Deep Idle due to ATC2.USBWakeup` (Apple Type-C controller
+   reporting USB remote wake from our port). Dose-response: switching to a
+   20s interval produced wakes grid-locked to :03/:23/:43 to the second,
+   with the machine sleeping undisturbed through ambient segment traffic
+   between grid points (implicit negative control — the firmware MP filter
+   ignores non-magic frames). Works on AC and battery.
+5. **Network wakes are DarkWakes BY DESIGN on macOS** — the screen stays
+   off; only HID promotes to FullWake ("DarkWake to FullWake ...
+   UserActivity"). A dark, network-reachable machine is the success
+   condition (identical to Apple's Wake-on-Demand behavior). Do not read
+   "screen stayed off" as a failed wake — read `pmset -g log` wake reasons.
+6. **USB precondition:** Config 1 `bmAttributes=0xa0` — remote wakeup
+   supported (Config 2 is 0x80, NOT wake-capable — one more reason the
+   vendor config matters). The ATC2 wakes prove the host arms the port
+   (SetFeature(DEVICE_REMOTE_WAKEUP)) without any action from us.
+
+Status: forced latch REVERTED (unwired) after validation, and the unwired
+negative control PASSED (2026-07-05): same etherwake cadence, peer-confirmed
+link down, one continuous 584s Deep Idle sleep, ZERO ATC2.USBWakeup / zero
+DarkWakes — causation closed in both directions. Remaining: production latch
+policy (OS never calls Enable — default-arm-when-supported vs own toggle);
+optional wrong-MAC control; FB for the dead Enable plumbing.
 
 **Phasing:**
 0. **PM transparency (do first, pays twice):** instrument

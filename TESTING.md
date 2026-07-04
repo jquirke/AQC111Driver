@@ -818,6 +818,67 @@ performance/benchmarking work item).
 
 ---
 
+## Wake-on-LAN (magic packet) — M11 phase 1
+
+### Baseline (2026-07-05, pre-arming build): wake path provably absent
+
+`pmset -a womp 1` probed `GetHardwareAssists` only; `SetWakeOnMagicPacketEnable`
+was never called. Peer-side polling + `pmset -g log` correlation showed the
+link dies ~1s after every genuine "Entering Sleep state" (hwDisable withdraws
+advertise + lowPower). Earlier "PHY stayed up during sleep" observations were
+disambiguated as TCPKeepAlive DarkWakes: every remote link transition mapped
+1:1 to pm-log Sleep/DarkWake edges (e.g. 02:31:23 sleep → +4s peer sees link
+dying, 02:31:24 DarkWake → +9s peer back at 1G, 02:32:08 maintenance sleep →
+02:32:10 peer link down). With the link down, a magic packet is undeliverable —
+baseline wake path does not exist.
+
+### The latch problem: OS never calls SetWakeOnMagicPacketEnable
+
+Zero calls observed across womp toggles, sleep entries, and deep-idle
+transitions over many cycles — despite `SetWakeOnMagicPacketSupport(true)`
+accepted in Start, WOMP (0x04000000) in both `getFeatureFlags` and the
+`GetHardwareAssists` readback (0x24620007), and IOPMrootDomain listing
+WakeOnMagicPacket providers. The arming code below the latch is only
+reachable by forcing the latch (temporary bench build) — production latch
+policy TBD; likely Feedback Assistant material.
+
+### Positive validation (2026-07-05, forced-latch build): end-to-end wake proven
+
+- **Arming:** both transfers (290-byte WOL_CFG via 0x60; phy_cfg =
+  advertise|AQ_WOL = 0x033b000f via 0x61) returned 0x0 at every
+  `SetPowerState(Off)`, including the second Off pass at the deep-idle
+  transition — every DarkWake cycle re-arms automatically.
+- **Link persistence:** armed PHY held 1G through a continuous 190-second
+  Deep Idle sleep with zero DarkWakes (baseline: dead in ~1s).
+- **Wake:** peer `sudo etherwake -i <if> <our MAC>` every 10s → ~25
+  consecutive sleep entries each terminated 5-15s later by
+  `DarkWake from Deep Idle due to ATC2.USBWakeup`.
+- **Dose-response:** interval changed to 20s → wakes grid-locked to
+  :03/:23/:43 to the second; machine slept undisturbed through ambient
+  traffic between grid points (implicit negative control: firmware MP filter
+  ignores non-magic frames). Reproduced on AC and battery.
+- **USB precondition:** Config 1 `bmAttributes=0xa0` (remote wakeup
+  supported; Config 2 is 0x80 — not). ATC2 wakes prove the host arms the
+  port without driver involvement.
+
+### Key insight: macOS network wakes are DarkWakes by design
+
+The screen never turns on for a WoL wake — the machine comes up dark and
+network-reachable (Wake-on-Demand semantics); only HID activity promotes to
+FullWake. "It never woke" while `pmset -g log` shows ATC2.USBWakeup DarkWakes
+IS the success condition. Attribute wakes by reason string
+(`ATC2.USBWakeup` = our USB port, `wifibt` = WLAN/BT maintenance,
+`trackpadkeyboard` = user).
+
+### Negative control (2026-07-05): PASSED on the unwired build
+
+Forced latch reverted; same bench + etherwake cadence. Peer confirmed link
+down throughout. `pmset -g log`: one continuous 584-second Deep Idle sleep
+(06:11:24), zero ATC2.USBWakeup, zero DarkWakes of any kind, terminated only
+by user HID at 06:21:08. The identical packet stream that produced ~35 wakes
+when armed produced none unarmed — causation closed in both directions.
+Optional gold-standard remains: wrong-MAC etherwake against a re-armed build.
+
 ## Reusable Methodology Notes
 
 - **To prove a packet was actually rejected, not just unlucky timing**:
@@ -884,3 +945,12 @@ performance/benchmarking work item).
   Durable technique: bump a counter in the suspect callback and print it
   from a later reliably-captured line (e.g. link-up) — cumulative counts
   survive any log-loss window.
+
+- **Peer-observed link state cannot distinguish armed-sleep, DarkWake, and
+  awake** (2026-07-05, M11): "the PHY stayed up during sleep" may be a
+  TCPKeepAlive DarkWake that re-enabled the interface. Always correlate
+  remote observations against `pmset -g log` edges (Entering Sleep /
+  DarkWake / Wake + reason string) before attributing link behavior to
+  arming or hardware. Wake attribution: reason `ATC2.USBWakeup` = USB
+  remote wake from our port; network wakes are DarkWakes by design (screen
+  off ≠ no wake).

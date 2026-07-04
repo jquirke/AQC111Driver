@@ -122,6 +122,17 @@ applyLogLevelFromDictionary(OSDictionary *dict)
 // Bulk OUT endpoint max packet size (SuperSpeed) — the DROP_PADD boundary.
 #define AQC111_BULK_OUT_MAXPACKET 1024
 
+// Wake-on-LAN magic-packet arming (IMPL_PLAN.md M11; recipe from Linux
+// aqc111_suspend and the x86 kext hwPrepareSleep RE — two control transfers):
+// wol_cfg {MAC[6], flags, rsvd[283]} via bRequest 0x60, then phy_cfg with
+// AQ_WOL (bit 20) set via bRequest 0x61. No SFR register writes needed on
+// the FWPhyAccess firmware path. Disarm on wake is implicit: hwEnable's
+// applyPhyAdvertise rewrites phy_cfg without bit 20.
+#define AQ_WOL_CFG_REQUEST      0x60
+#define AQ_WOL_CFG_SIZE         290        // 0x122 — Linux struct aqc111_wol_cfg / x86 kext wLength
+#define AQ_WOL_FLAG_MP          0x02       // magic packet
+#define AQ_PHY_WOL              (1u << 20) // phy_cfg bit 20 (fw byte 2 bit 4)
+
 // SFR_RXCOE_CTL: per-protocol RX checksum offload enable (see IMPL_PLAN.md M6a).
 // TODO: most other SFR register addresses in this file are still raw hex
 // literals (e.g. 0x000B, 0x0022, 0x00B7) — refactor to named constants
@@ -346,6 +357,9 @@ struct AQC111NIC_IVars {
     bool                                lastLinkUp;
     uint8_t                             lastSpeedCode;   // cached from ITR; 0 = never seen
     bool                                interfaceEnabled;
+    // M11: OS-requested magic-packet wake ("Wake for network access"),
+    // latched by SetWakeOnMagicPacketEnable; armed in SetPowerState(Off).
+    bool                                wolMagicPacketEnabled;
     bool                                rxStarted;
     bool                                ioArmed;
     IOUserNetworkMACAddress             macAddress;
@@ -415,7 +429,11 @@ AQC111NIC::init()
     // uses that to change state later (e.g. `ifconfig -rxcsum`). Confirmed
     // empirically: SetHardwareAssists never fires during Start(), only
     // GetHardwareAssists. See IMPL_PLAN.md M6a.
-    ivars->hwAssistMask = AQC111_HWASSIST_MASK;
+    // WOMP included: baseline observation (2026-07-05) showed `pmset womp 1`
+    // probing GetHardwareAssists, so the wake capability must be visible in
+    // this mask, not only in getFeatureFlags (M6a lesson: self-init must
+    // match what we advertise).
+    ivars->hwAssistMask = AQC111_HWASSIST_MASK | kIOUserNetworkFeatureFlagWOMP;
     ivars->currentMtu = AQC111_MIN_MTU;
     ivars->phyAdvertiseMask = 0x0000000Fu;  // AQ_ADV_MASK: advertise 100M, 1G, 2.5G, 5G (autoneg all rates)
     return true;
@@ -632,6 +650,12 @@ IMPL(AQC111NIC, Start)
     ret = SelectMediaType(kIOUserNetworkMediaEthernetNone, nullptr);
     LogI("Start: SelectMediaType(None=0x%x) -> 0x%x", kIOUserNetworkMediaEthernetNone, ret);
     if (ret != kIOReturnSuccess) goto fail;
+
+    // M11: declare magic-packet wake capability (LOCALONLY; pairs with the
+    // WOMP feature flag in getFeatureFlags). The OS requests arming via the
+    // SetWakeOnMagicPacketEnable callback. Log-only: no downstream dependency.
+    ret = SetWakeOnMagicPacketSupport(true);
+    LogI("Start: SetWakeOnMagicPacketSupport(true) -> 0x%x", ret);
 
     ret = RegisterEthernetInterface(macAddress, ivars->pool, queues, 4);
     if (ret != kIOReturnSuccess) {
@@ -939,9 +963,9 @@ disarmAsyncIO(AQC111NIC_IVars *ivars)
 // paths can't drift. Matches Linux aqc111_set_phy_speed()'s pause/downshift
 // defaults; Retries=3 per Linux default.
 static kern_return_t
-applyPhyAdvertise(IOUSBHostInterface *iface, uint32_t advertiseMask)
+applyPhyAdvertise(IOUSBHostInterface *iface, uint32_t advertiseMask, uint32_t extraPhyFlags = 0)
 {
-    uint32_t phyFlags = 0;
+    uint32_t phyFlags = extraPhyFlags;
     phyFlags |= (advertiseMask & 0x0000000Fu);  // AQ_ADV_MASK
     phyFlags |= 1u << 16;     // AQ_PAUSE
     phyFlags |= 1u << 17;     // AQ_ASYM_PAUSE
@@ -951,6 +975,24 @@ applyPhyAdvertise(IOUSBHostInterface *iface, uint32_t advertiseMask)
     kern_return_t ret = aqVendorOut32(iface, 0x61, phyFlags);
     LogI("applyPhyAdvertise: AQ_PHY_OPS flags=0x%08x -> 0x%x", phyFlags, ret);
     return ret;
+}
+
+// M11: arm firmware magic-packet wake. Called from SetPowerState(Off) —
+// phase 0 proved EP0 works throughout that window and that hwDisable has
+// already run (advertise withdrawn, PHY in low power), so the phy_cfg write
+// restores the advertise mask WITH AQ_WOL set: the PHY must keep link up
+// through sleep to see the magic packet, and low-power/WoL are mutually
+// exclusive firmware states (x86 kext: WoL disable() path skips hwStop).
+static void
+armWolMagicPacket(AQC111NIC_IVars *ivars)
+{
+    uint8_t wolCfg[AQ_WOL_CFG_SIZE] = {};
+    memcpy(wolCfg, ivars->macAddress.octet, 6);
+    wolCfg[6] = AQ_WOL_FLAG_MP;
+    kern_return_t r = aqVendorOut(ivars->interface, AQ_WOL_CFG_REQUEST, wolCfg, sizeof(wolCfg));
+    LogI("armWolMagicPacket: WOL_CFG mac+MP (%u bytes) -> 0x%x", (unsigned)sizeof(wolCfg), r);
+    r = applyPhyAdvertise(ivars->interface, ivars->phyAdvertiseMask, AQ_PHY_WOL);
+    LogI("armWolMagicPacket: phy_cfg |= AQ_WOL -> 0x%x", r);
 }
 
 // Minimal PHY-only bring-up sequence derived from Linux aqc111.c and the x86
@@ -1816,8 +1858,12 @@ IMPL(AQC111NIC, GetHardwareAssists)
 uint32_t
 AQC111NIC::getFeatureFlags()
 {
-    LogI("getFeatureFlags -> 0x%x", AQC111_HWASSIST_MASK);
-    return AQC111_HWASSIST_MASK;
+    // hwAssist capabilities plus WOMP (magic-packet wake); WOMP is also
+    // self-initialized into ivars->hwAssistMask — the OS probes
+    // GetHardwareAssists on pmset womp changes (observed 2026-07-05).
+    uint32_t flags = AQC111_HWASSIST_MASK | kIOUserNetworkFeatureFlagWOMP;
+    LogI("getFeatureFlags -> 0x%x", flags);
+    return flags;
 }
 
 kern_return_t
@@ -2012,6 +2058,9 @@ IMPL(AQC111NIC, SetPowerState)
         powerFlags == kIOServicePowerCapabilityOn  ? "On" :
         powerFlags == kIOServicePowerCapabilityLow ? "Low" : "other",
         ivars->pmOffCount, ivars->pmOnCount, ivars->pmLowCount, ivars->pmOtherCount);
+    if (powerFlags == kIOServicePowerCapabilityOff && ivars->wolMagicPacketEnabled) {
+        armWolMagicPacket(ivars);
+    }
     return SetPowerState(powerFlags, SUPERDISPATCH);
 }
 
@@ -2147,6 +2196,7 @@ kern_return_t
 IMPL(AQC111NIC, SetWakeOnMagicPacketEnable)
 {
     LogI("SetWakeOnMagicPacketEnable: %d", enable);
+    ivars->wolMagicPacketEnabled = enable;
     return kIOReturnSuccess;
 }
 
